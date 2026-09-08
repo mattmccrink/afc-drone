@@ -131,7 +131,7 @@ void setup() {
   Serial.println(F("RP2350 valve/sensor node -- ALPHA"));
   Serial.println(F("type 'help' for the bench console"));
 
-  //watchdog_setup();   // arm the hardware watchdog LAST
+  watchdog_setup();   // arm the hardware watchdog LAST
 }
 
 // User button edge -> toggle simulated primary presence (simulate Pi loss).

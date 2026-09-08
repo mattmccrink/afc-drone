@@ -122,7 +122,7 @@
 #elif MS5837_OSR == 8192
   #define MS_D1_CMD 0x4A
   #define MS_D2_CMD 0x5A
-  #define CONV_LATENCY_TICKS 2     // ~18 ms > 10 ms tick -> read 2 ticks after the kick
+  #define CONV_LATENCY_TICKS 3     // ~18 ms > 10 ms tick -> read 2 ticks after the kick
 #else
   #error "MS5837_OSR must be 256/512/1024/2048/4096/8192"
 #endif
