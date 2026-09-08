@@ -1,0 +1,48 @@
+# ---- OS / editor junk ----
+.DS_Store
+Thumbs.db
+desktop.ini
+*~
+*.swp
+.vscode/
+.idea/
+
+# ---- cloud-sync conflict droppings (defensive) ----
+*conflicted copy*
+*-DESKTOP-*
+
+# ---- Arduino IDE 2.x build output ----
+/build/
+**/build/
+*.hex
+*.elf
+*.map
+*.lst
+*.d
+.theia/
+
+# ---- PlatformIO (if used for RP2350 / micro-ROS) ----
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# ---- Python (host_tools, rpi_ros2) ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ---- ROS2 / colcon (rpi_ros2) ----
+/rpi_ros2/build/
+/rpi_ros2/install/
+/rpi_ros2/log/
+
+# ---- misc build artifacts ----
+*.o
+*.a
+*.bin
+# NOTE: if you ever commit a prebuilt UF2/firmware image on purpose,
+# add an explicit  !path/to/keep.uf2  exception below.
+*.uf2
