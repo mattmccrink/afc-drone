@@ -29,6 +29,11 @@
 SpscPublisher<SensorFrame> g_sensor_pub;   // core 1 -> core 0
 SpscPublisher<ValveCmd>    g_valve_pub;    // core 0 -> core 1
 
+
+volatile uint32_t g_i2c_rc_hist[8]   = {0};  // endTransmission rc; [5]=timeout, [2]=addr NACK
+volatile uint32_t g_loop1_overruns   = 0;    // ticks that blew the 10 ms deadline
+volatile uint32_t g_i2c_last_fail_tk = 0;    // core-1 tick of the most recent nonzero rc
+
 volatile uint32_t g_core1_heartbeat = 0;   // core 1 tick counter (liveness)
 uint16_t g_servo_us_echo[SERVO_COUNT] = { 0 };   // resolved servo us (core 1 only)
 
@@ -202,6 +207,7 @@ void setup1() {
   Wire.setSCL(PIN_I2C_SCL);
   Wire.begin();
   Wire.setClock(400000);      // scanner proved 400 kHz stable on this bus
+  Wire.setTimeout(25 /*ms*/, true);   // 2nd arg = reset the peripheral on timeout
 #endif
   sensors_setup();
   servos_setup();

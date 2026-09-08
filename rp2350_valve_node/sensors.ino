@@ -31,20 +31,20 @@
 // ---------------------------------------------------------------------------
 static const SensorSlot SENSOR_MAP[] = {
   //Left wing
-  { 0x70, 0, 0, ROLE_UP },
-  { 0x70, 1, 0, ROLE_LO },
-  { 0x70, 2, 1, ROLE_UP },
-  { 0x70, 3, 1, ROLE_LO },
+  { ADDR_PCA9545_A, 0, 0, ROLE_UP },
+  { ADDR_PCA9545_A, 1, 0, ROLE_LO },
+  { ADDR_PCA9545_A, 2, 1, ROLE_UP },
+  { ADDR_PCA9545_A, 3, 1, ROLE_LO },
   //Right wing
-  { 0x71, 0, 2, ROLE_UP },
-  { 0x71, 1, 2, ROLE_LO },
-  { 0x71, 2, 3, ROLE_UP },
-  { 0x71, 3, 3, ROLE_LO },
+  { ADDR_PCA9545_B, 0, 2, ROLE_UP },
+  { ADDR_PCA9545_B, 1, 2, ROLE_LO },
+  { ADDR_PCA9545_B, 2, 3, ROLE_UP },
+  { ADDR_PCA9545_B, 3, 3, ROLE_LO },
   //Canard
-  { 0x72, 0, 4, ROLE_UP },
-  { 0x72, 1, 4, ROLE_LO },
-  { 0x72, 2, 5, ROLE_UP },
-  { 0x72, 3, 5, ROLE_LO },
+  { ADDR_PCA9545_C, 0, 4, ROLE_UP },
+  { ADDR_PCA9545_C, 1, 4, ROLE_LO },
+  { ADDR_PCA9545_C, 2, 5, ROLE_UP },
+  { ADDR_PCA9545_C, 3, 5, ROLE_LO },
   // ---- example once fully populated (adjacent pairs, up = lower channel) ----
   // { 0x70, 2, 1, ROLE_UP }, { 0x70, 3, 1, ROLE_LO },
   // { 0x70, 4, 2, ROLE_UP }, { 0x70, 5, 2, ROLE_LO },

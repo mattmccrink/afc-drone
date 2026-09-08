@@ -72,6 +72,7 @@ static bool pca_write8(uint8_t addr, uint8_t reg, uint8_t val) {
   Wire.write(reg);
   Wire.write(val);
   return Wire.endTransmission() == 0;
+  
 }
 
 // Init one PCA9685: 50 Hz, auto-increment, totem-pole. Prescale must be set

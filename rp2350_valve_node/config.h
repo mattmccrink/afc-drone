@@ -57,9 +57,9 @@
 //      we keep the muxes off them anyway).
 //    => PCA9545 switches use 0x74/0x75/0x77 -- clear of 0x70, 0x71-73, and 0x76.
 #define ADDR_MS5837        0x76
-#define ADDR_PCA9545_A     0x74
-#define ADDR_PCA9545_B     0x75
-#define ADDR_PCA9545_C     0x77
+#define ADDR_PCA9545_A     0x71
+#define ADDR_PCA9545_B     0x72
+#define ADDR_PCA9545_C     0x74
 #define ADDR_PCA9685_0     0x42   // servo driver "A"
 #define ADDR_PCA9685_1     0x44   // servo driver "B"
 #define ADDR_PCA9685_2     0x48   // servo driver "C"
