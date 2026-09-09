@@ -116,6 +116,9 @@ void setup() {
   led_setup();
   framing_setup();
   cal_load();                 // curve-fit coefficients: flash cal or compiled defaults
+  #if USE_REAL_SBUS
+  sbus_real_setup();
+  #endif
 
   // Teensy (compressor) link on uart1 / Serial2, GP4 TX / GP5 RX.
   Serial2.setTX(PIN_TEENSY_TX);
@@ -162,8 +165,11 @@ void loop() {
   poll_user_button(now);
 
   primary_sim_update(now);      // simulated Pi command + arm token
+  #if !USE_REAL_SBUS
   sbus_sim_update(now);         // simulated reversionary SBUS
-
+  #else
+  sbus_real_update(now);
+  #endif
   arbitration_update(now);      // choose source; enforce arm-token liveness
   allocation_update(now);       // mixing matrix -> 6 valves -> publish to core 1
   compressor_update(now);       // outer loop / direct / fallback -> Teensy stream
