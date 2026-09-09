@@ -101,7 +101,9 @@ static void pca9685_write_board(uint8_t addr, const uint16_t* counts, int nch) {
     Wire.write(counts[c] & 0xFF);              // OFF_L
     Wire.write((counts[c] >> 8) & 0x0F);       // OFF_H
   }
-  Wire.endTransmission();
+  uint8_t rc = Wire.endTransmission();
+  if (rc < 8) g_i2c_rc_hist[rc]++;
+  //if (rc)     g_i2c_last_fail_tk = tick;      // pass tick in, or read g_core1_heartbeat
 }
 
 // Single-channel write (manual bring-up).
@@ -111,7 +113,9 @@ static void pca9685_write_one(uint8_t addr, uint8_t ch, uint16_t us) {
   Wire.write(PCA_LED0_ON_L + 4 * ch);
   Wire.write(0x00); Wire.write(0x00);
   Wire.write(count & 0xFF); Wire.write((count >> 8) & 0x0F);
-  Wire.endTransmission();
+  uint8_t rc = Wire.endTransmission();
+  if (rc < 8) g_i2c_rc_hist[rc]++;
+  //if (rc)     g_i2c_last_fail_tk = tick;      // pass tick in, or read g_core1_heartbeat
 }
 
 #if USE_SERVO_ALLCALL_FAILSAFE
@@ -209,8 +213,9 @@ void servos_service(uint32_t tick) {
     const ServoOut& o = SERVO_OUT_MAP[s];
     if (o.dev < PCA9685_COUNT && o.ch < PCA9685_MAX_CH) counts[o.dev][o.ch] = us_to_count(us[s]);
   }
-  for (int d = 0; d < PCA9685_COUNT; ++d)
+  for (int d = 0; d < PCA9685_COUNT; ++d) {
     if (s_pca_ok[d]) pca9685_write_board(PCA_ADDRS[d], counts[d], PCA9685_MAX_CH);
+  }
 #endif
 
   coanda_oe(true);

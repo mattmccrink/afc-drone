@@ -130,6 +130,14 @@ static bool ms_read_adc(uint32_t& out) {
   return true;
 }
 
+static void mux_close_all() {
+  for (int i = 0; i < s_nmux; ++i) {
+    Wire.beginTransmission(s_mux[i]);
+    Wire.write(0x00);              // all channels off
+    Wire.endTransmission();
+  }
+}
+
 static uint8_t ms_crc4(uint16_t prom[8]) {
   uint16_t rem = 0, saved0 = prom[0];
   prom[0] &= 0x0FFF; prom[7] = 0;
@@ -213,6 +221,7 @@ void sensors_tick(uint32_t tick) {
       }
     }
     s_conv_pending = false;
+    mux_close_all();
   }
 
   // ---- 2) assemble + publish per-valve frame (every tick; holds between updates) ----

@@ -239,5 +239,6 @@ void loop1() {
   // If we ever overran badly, resync the deadline so we don't spiral.
   if ((int32_t)(micros() - next_deadline_us) > (int32_t)TICK_US) {
     next_deadline_us = micros() + TICK_US;
+    g_loop1_overruns++;
   }
 }

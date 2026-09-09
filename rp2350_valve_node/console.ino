@@ -184,9 +184,8 @@ static void dispatch(char* line) {
         (double)g_dp_zero[v], (double)dpcorr, (double)fr.t_die[v],
         (double)fr.mdot[v], fr.valid[v] ? "OK" : "--");
     }
-    Serial.printf("[sens] total=%.3f g/s  nvalid=%u\n", (double)fr.mdot_total, fr.n_valid);
-    Serial.printf("[i2c] ok=%lu len=%lu addrNAK=%lu dataNAK=%lu other=%lu TIMEOUT=%lu\n",
-  }
+    Serial.printf("[sens] total=%.3f g/s  nvalid=%u\n", (double)fr.mdot_total, fr.n_valid); 
+  }           
   else if (eq(tok[0], "save")) { Serial.println(cal_save() ? F("[cal] saved") : F("[cal] SAVE FAILED")); }
   else if (eq(tok[0], "zero")) {
     // Capture the current no-flow (p_up - p_lo) per valve as the offset. MUST be
