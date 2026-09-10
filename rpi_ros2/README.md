@@ -1,12 +1,94 @@
-# Raspberry Pi / ROS2 Hub
+# AFC Pi ROS2 Bridge — `afc_bridge`
 
-Supervisor + telemetry bridge (NOT an in-loop relay): feeds the RP2350 over USB
-serial, relays the Pixhawk arm token, and publishes valve/pressure/temp/mass-flow
-telemetry. The RP2350 commands the Teensy directly; the Pi is out of the fast loop.
+Supervisor/bridge node between MAVROS and the RP2350 valve/sensor node over
+USB-CDC. Forwards pre-mix control demand + the arm token to the tiny, and
+republishes the tiny's `CTRL_TLM`/`SENSOR_TLM` as typed messages for rosbag.
 
-**Status:** not started (design only). First tasks: ROS2 node owning the serial +
-magic-resync reader, demux by frame `type`, subscribe to Pixhawk command topics,
-relay the arm token (1 Hz heartbeat + on-change, never latch stale). Reuse the
-`host_tools` framing as the starting point.
+This is `rpi_ros2/` in the monorepo. Two packages:
 
-Colcon `build/`, `install/`, `log/` are gitignored.
+| Package | Type | Contents |
+|---|---|---|
+| `afc_bridge_msgs` | `ament_cmake` | `ValveNodeCtrl`, `ValveNodeSensor` |
+| `afc_bridge` | `ament_python` | the node + `framing.py` / `arm_token.py` |
+
+## Build
+
+```bash
+cd ~/ros2_ws                       # your workspace
+cp -r afc_bridge_msgs afc_bridge src/   # or drop this src/ in place
+colcon build --packages-select afc_bridge_msgs afc_bridge
+source install/setup.bash
+```
+
+`afc_bridge_msgs` builds first (the node depends on it). Runtime deps:
+`rclpy`, `std_msgs`, `mavros_msgs`, `python3-serial`. Install the last two if
+missing: `sudo apt install ros-$ROS_DISTRO-mavros-msgs python3-serial`.
+
+## Run
+
+```bash
+ros2 launch afc_bridge bridge.launch.py serial_port:=/dev/ttyACM0
+# with a correlation rosbag:
+ros2 launch afc_bridge bridge.launch.py record:=true bag_uri:=afc_$(date +%F_%H%M)
+```
+
+Or the node directly:
+
+```bash
+ros2 run afc_bridge bridge_node --ros-args -p serial_port:=/dev/ttyACM0
+```
+
+Published: `/afc/ctrl_tlm` (`ValveNodeCtrl`), `/afc/sensor_tlm`
+(`ValveNodeSensor`). The bag records those two plus the MAVROS command and arm
+inputs, so post-flight you have both what was sent and what came back.
+
+## Two things to confirm on the vehicle
+
+1. **CMD topic.** Default is `mavros/target_actuator_control`
+   (`ActuatorControl`, `group_mix 0`, `controls[0:4] = roll,pitch,yaw,thrust`).
+   Confirm it's actually publishing on your PX4 build:
+   `ros2 topic echo /mavros/target_actuator_control`. If that message is dead on
+   a newer PX4, repoint with `-p cmd_topic:=... -p cmd_group_mix:=...` — it's a
+   param, not a code change. `thrust_lo/hi` default to `[0,1]`; widen to
+   `[-1,1]` for reversible thrust.
+
+2. **Binary handshake.** The node sends `tlm on\n` on connect to flip the tiny
+   into binary frame mode (alpha boots in text/console mode). If your flight
+   firmware boots straight into binary, set `-p send_tlm_handshake:=false`.
+
+## Key parameters
+
+| Param | Default | Note |
+|---|---|---|
+| `serial_port` | `/dev/ttyACM0` | USB-CDC to the tiny |
+| `cmd_topic` | `/mavros/target_actuator_control` | pre-mix control demand |
+| `cmd_group_mix` | `0` | PX4 flight-control group |
+| `cmd_rate_hz` | `50.0` | CMD forward rate |
+| `cmd_stale_after_s` | `0.1` | stop forwarding if MAVROS control ages past this (→ tiny reverts to SBUS) |
+| `mdot_target_gps` | `40.0` | constant for now; future airspeed-driven CMU input |
+| `arm_heartbeat_hz` | `1.0` | FT_ARM cadence (+ on-change) |
+| `arm_stale_after_s` | `0.5` | stop advancing the arm counter if `/mavros/state` ages past this |
+| `send_tlm_handshake` | `true` | send `tlm on\n` on connect |
+
+## Off-hardware wire test
+
+`framing.py` and `arm_token.py` are ROS-free and unit-tested against a
+byte-accurate mirror of the tiny (`parse_byte`/`on_frame`/`tlm_service`):
+
+```bash
+cd afc_bridge && PYTHONPATH=. python3 test/test_wire.py
+```
+
+Covers CMD/ARM out, CTRL_TLM/SENSOR_TLM in, magic resync, CRC-drop recovery,
+and the arm-token fresh / on-change / stale→10 s-window→disarm behavior.
+
+## Safety notes baked in
+
+- **CMD forwarded only while the MAVROS control input is fresh** — a stale
+  primary stops the stream so the tiny's `USB_CMD_TIMEOUT_MS` reverts to SBUS.
+- **Arm counter advances only while `/mavros/state` is fresh** — never
+  frozen-and-resent through an FCU dropout; the tiny rides the 10 s
+  powered-reversion window then disarms.
+- The tiny counts that window from the **last counter advance**, so at 1 Hz the
+  usable window after a dropout is 10 s minus up to one heartbeat. Bump
+  `arm_heartbeat_hz` to 2–5 if you ever want it tight to 10 s.
