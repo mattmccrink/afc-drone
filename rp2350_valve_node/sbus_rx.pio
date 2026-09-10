@@ -1,0 +1,56 @@
+; =============================================================================
+;  sbus_rx.pio  --  Inverted-UART (SBUS) byte receiver for RP2350
+;
+;  SBUS wire format: 100000 baud, 8 data bits LSB-first, EVEN parity, 2 stop
+;  bits, and the whole line is INVERTED (idle low, start bit high).
+;
+;  Inversion is handled in software by gpio_set_inover() in the init helper
+;  below -- so THIS program sees a NORMAL uart (idle high, start = low). That
+;  lets the timing follow the well-worn pico-examples 8N1 uart_rx pattern
+;  instead of a bespoke inverted program (less novel PIO to get wrong).
+;
+;  We sample only the 8 DATA bits and ignore parity (SBUS has no use for it at
+;  decode time; frame integrity comes from header + footer + resync). The one
+;  subtlety vs plain 8N1: after 8 data bits the next bit is the EVEN-PARITY
+;  bit, which can be LOW -- so we must NOT hunt for the next start bit until we
+;  are safely past parity and into the (high) stop region, or a low parity bit
+;  is mistaken for a start. The push [7] + `wait 1` handles exactly that.
+;
+;  Clock: run the SM at 8 * baud (8 cycles per bit). Set via clkdiv below.
+; =============================================================================
+.program sbus_rx
+.wrap_target
+    wait 0 pin 0            ; stall for start bit (line low, post-inversion)
+    set x, 7        [10]    ; ~1.5-bit delay -> centre of data bit 0
+bitloop:
+    in pins, 1              ; sample one data bit (LSB-first, shift right)
+    jmp x-- bitloop [6]     ; 8 samples, 8 SM cycles each
+    push            [7]     ; push the 8 bits; delay across the parity bit
+    wait 1 pin 0            ; line high (stop region) before hunting next start
+.wrap
+
+% c-sdk {
+#include "hardware/clocks.h"
+#include "hardware/gpio.h"
+
+// pin = the SBUS RX GPIO (GP6). baud = 100000.
+static inline void sbus_rx_program_init(PIO pio, uint sm, uint offset,
+                                        uint pin, float baud) {
+    pio_gpio_init(pio, pin);
+    // ---- SOFTWARE INVERSION: invert the pad input so PIO sees normal uart ----
+    gpio_set_inover(pin, GPIO_OVERRIDE_INVERT);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, false);  // pin = input
+
+    pio_sm_config c = sbus_rx_program_get_default_config(offset);
+    sm_config_set_in_pins(&c, pin);              // IN + WAIT read this pin
+    sm_config_set_in_shift(&c, true, false, 8);  // shift RIGHT, manual push, thresh 8
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);  // 8-deep RX FIFO
+
+    // 8 SM cycles per bit.
+    float div = (float)clock_get_hz(clk_sys) / (8.0f * baud);
+    sm_config_set_clkdiv(&c, div);
+
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}

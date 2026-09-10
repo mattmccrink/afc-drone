@@ -18,7 +18,7 @@
 // required). Flip these to 1 as real hardware arrives; the interfaces do not
 // change, only the backend behind them.
 #define USE_REAL_I2C     1     // 0 = simulated sensors/servos, no Wire traffic
-#define USE_REAL_SBUS    0     // 0 = simulated SBUS source, PIO program stubbed
+#define USE_REAL_SBUS    1     // 0 = simulated SBUS source, PIO program stubbed
 #define USE_REAL_TEENSY  1     // 1 = actually emit Host_comm frames on Serial2
                                //     (harmless with nothing attached)
 

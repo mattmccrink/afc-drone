@@ -47,6 +47,7 @@ static void print_help() {
     "  prim on|off             simulate primary (Pi) presence\n"
     "  sbusfs on|off           simulate SBUS failsafe flag\n"
     "  sbuslost on|off         simulate SBUS frame-lost flag\n"
+    "  sbus                    Write real SBUS if available"
     "  stick R P Y T           set SBUS sticks (floats: roll pitch yaw throttle)\n"
     "  fault valve N on|off    inject per-valve sensor fault (N=0..5)\n"
     "  fault agg on|off        inject aggregate flow fault\n"
@@ -211,6 +212,13 @@ static void dispatch(char* line) {
     for (int v = 0; v < VALVE_COUNT; ++v) Serial.printf(" %.2f", (double)g_dp_zero[v]);
     Serial.println(" mbar");
   }
+   else if (eq(tok[0], "sbus")) {
+#if USE_REAL_SBUS
+    sbus_real_print();
+#else
+    Serial.println(F("[sbus] USE_REAL_SBUS=0 (simulated); use 'stick' / 'st'"));
+#endif
+}
   else { Serial.printf("? %s (try 'help')\n", tok[0]); }
 }
 
