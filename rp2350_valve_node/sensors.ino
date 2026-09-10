@@ -66,8 +66,9 @@ static bool     s_ema_init[SENSOR_COUNT];
 static int8_t   s_up[VALVE_COUNT], s_lo[VALVE_COUNT];
 
 // ---- Valve constants ----
-static float K_VENTURI[6] =   {0.8963f,0.8963f,0.8963f,0.8963f,0.8963f,0.8963f};  // PROVISIONAL from bench venturi (~8 g/s @ ~850 Pa,
-//Test commit
+//ET and MMC calibration using Alicat mass flow sensor, 9/10/2026
+static float K_VENTURI[6] =   {0.8963f,0.8425f,0.876f,0.8425f,0.8705f,0.8496f}; //~31 mBar at 400 SLPM
+
 // ---- unique mux list ----
 static uint8_t  s_mux[8]; static int s_nmux = 0;
 
@@ -248,7 +249,7 @@ void sensors_tick(uint32_t tick) {
 
  //float pu_adjusted =  pu - g_dp_zero[v];
 
-    float dp = -((pu - pl) - g_dp_zero[v]);          // zero-corrected differential (mbar)
+    float dp = ((pu - pl) - g_dp_zero[v]);          // zero-corrected differential (mbar)
 //float dp = pl - pu_adjusted; // - g_dp_zero[v];          // zero-corrected differential (mbar)
 
     float mdot = 0.0f;
