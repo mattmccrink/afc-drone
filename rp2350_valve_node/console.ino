@@ -15,6 +15,12 @@ static uint16_t sweep_min = 1000, sweep_max = 2000;
 static uint32_t sweep_ms = 2000, sweep_t0 = 0;
 static char    con_line[96];
 static uint8_t con_len = 0;
+// servo step state (core0 computes staircase; core1 writes via the man table)
+static bool     step_active = false;
+static uint16_t step_begin = 1000, step_end = 2000;
+static int32_t  step_size  = 100;      // us per step (sign set from begin/end)
+static uint32_t step_dwell = 200;      // ms held at each step
+static uint32_t step_t0    = 0;
 
 static const char* src_name(Source s) {
   switch (s) { case SRC_PRIMARY: return "PRIMARY"; case SRC_SBUS: return "SBUS"; default: return "SAFE"; }
@@ -56,6 +62,7 @@ static void print_help() {
     "  pstream on|off          2 Hz LabVIEW stream: !A=12 pressures, !B=12 temps\n"
     "  servo <A|B|C> <ch> <us> drive one PCA9685 channel (bring-up); servo off to stop\n"
     "  sweep <A|B|C> <ch> [min max ms]  triangle-sweep one channel (default 1000 2000 2000)\n"
+    "  step <A|B|C> <ch> [min max step_us hold_ms]  step one channel (default 1000 2000 100 200)\n"
     "  save                    persist current calibration to LittleFS\n"
     "  zero                    capture no-flow dp offset per valve, then save\n"
     "  calshow                 show calibration source + servo0 coeffs + dp_zero"));
@@ -76,11 +83,19 @@ static bool onoff(const char* s, bool& out) {
   return false;
 }
 
+// Triangle sweep position for the elapsed time in the period: min..max..min.
+static uint16_t sweep_us_at(uint32_t now) {
+  uint32_t p    = (now - sweep_t0) % sweep_ms;
+  float    ph   = (float)p / (float)sweep_ms;                    // 0..1
+  float    frac = (ph < 0.5f) ? (2.0f * ph) : (2.0f - 2.0f * ph); // 0..1..0
+  return sweep_min + (uint16_t)lroundf(frac * (float)(sweep_max - sweep_min));
+}
+
 static void dispatch(char* line) {
   // tokenize on spaces
-  char* tok[6]; int n = 0;
+  char* tok[8]; int n = 0;
   char* p = strtok(line, " \t");
-  while (p && n < 6) { tok[n++] = p; p = strtok(nullptr, " \t"); }
+  while (p && n < 8) { tok[n++] = p; p = strtok(nullptr, " \t"); }
   if (n == 0) return;
 
   if (eq(tok[0], "help"))        { print_help(); }
@@ -143,6 +158,8 @@ static void dispatch(char* line) {
   else if (eq(tok[0], "servo")) {
     if (n >= 2 && eq(tok[1], "off")) {
       g_servo_manual = false; sweep_active = false;
+        for (int d = 0; d < PCA9685_COUNT; ++d)
+        for (int c = 0; c < PCA9685_MAX_CH; ++c) g_servo_man_tbl[d][c] = 0;
       Serial.println(F("[servo] manual OFF (back to curve-fit path)"));
     } else if (n >= 4) {
       int d = dev_index(tok[1]); int ch = atoi(tok[2]); int us = atoi(tok[3]);
@@ -151,9 +168,10 @@ static void dispatch(char* line) {
       else if (us < SERVO_US_MIN || us > SERVO_US_MAX) Serial.printf("[servo] bad us (%d..%d)\n", SERVO_US_MIN, SERVO_US_MAX);
       else {
         sweep_active = false;
-        g_servo_man_dev = d; g_servo_man_ch = ch; g_servo_man_us = us; g_servo_manual = true;
-        Serial.printf("[servo] manual dev%c ch%d = %d us\n", 'A'+d, ch, us);
-      }
+        //g_servo_man_dev = d; g_servo_man_ch = ch; g_servo_man_us = us; g_servo_manual = true;
+        g_servo_man_tbl[d][ch] = (uint16_t)us;   // latch this channel; others untouched
+        g_servo_manual = true;
+        Serial.printf("[servo] hold dev%c ch%d = %d us\n", 'A'+d, ch, us);      }
     } else Serial.println(F("[servo] usage: servo <A|B|C> <ch> <us> | servo off"));
   }
   else if (eq(tok[0], "sweep") && n >= 3) {
@@ -161,15 +179,43 @@ static void dispatch(char* line) {
     uint16_t mn = (n >= 4) ? atoi(tok[3]) : 1000;
     uint16_t mx = (n >= 5) ? atoi(tok[4]) : 2000;
     uint32_t ms = (n >= 6) ? (uint32_t)atoi(tok[5]) : 2000;
-    if (d < 0)                               Serial.println(F("[sweep] bad device (A/B/C)"));
-    else if (ch < 0 || ch >= PCA9685_MAX_CH) Serial.printf("[sweep] bad ch (0..%d)\n", PCA9685_MAX_CH-1);
+    if (d < 0)                                Serial.println(F("[sweep] bad device (A/B/C)"));
+    else if (ch < 0 || ch >= PCA9685_MAX_CH)  Serial.printf("[sweep] bad ch (0..%d)\n", PCA9685_MAX_CH-1);
     else if (mn < SERVO_US_MIN || mx > SERVO_US_MAX || mn >= mx || ms < 100)
-                                             Serial.println(F("[sweep] bad range/period"));
+                                              Serial.println(F("[sweep] bad range/period (min<max, in us limits, ms>=100)"));
     else {
       sweep_min = mn; sweep_max = mx; sweep_ms = ms; sweep_t0 = millis();
-      g_servo_man_dev = d; g_servo_man_ch = ch; g_servo_manual = true; sweep_active = true;
+      step_active  = false;                    // sweep and step are mutually exclusive
+      sweep_active = true;
+      g_servo_wave_dev = (uint8_t)d; g_servo_wave_ch = (uint8_t)ch;
+      g_servo_man_tbl[d][ch] = mn;             // seat start position in the table
+      g_servo_manual = true;
       Serial.printf("[sweep] dev%c ch%d %u..%u us over %lu ms (servo off to stop)\n",
                     'A'+d, ch, mn, mx, (unsigned long)ms);
+    }
+  }
+  else if (eq(tok[0], "step") && n >= 3) {
+    int d = dev_index(tok[1]); int ch = atoi(tok[2]);
+    uint16_t b  = (n >= 4) ? atoi(tok[3]) : 1000;   // begin us
+    uint16_t e  = (n >= 5) ? atoi(tok[4]) : 2000;   // end us
+    uint16_t sz = (n >= 6) ? atoi(tok[5]) : 100;    // step size us (magnitude)
+    uint32_t dw = (n >= 7) ? (uint32_t)atoi(tok[6]) : 200;  // dwell ms per step
+    if (d < 0)                                Serial.println(F("[step] bad device (A/B/C)"));
+    else if (ch < 0 || ch >= PCA9685_MAX_CH)  Serial.printf("[step] bad ch (0..%d)\n", PCA9685_MAX_CH-1);
+    else if (b < SERVO_US_MIN || b > SERVO_US_MAX ||
+             e < SERVO_US_MIN || e > SERVO_US_MAX)  Serial.printf("[step] bad us (%d..%d)\n", SERVO_US_MIN, SERVO_US_MAX);
+    else if (sz == 0 || dw < 20)              Serial.println(F("[step] bad size/dwell (size>0, dwell>=20ms)"));
+    else {
+      step_begin = b; step_end = e;
+      step_size  = (e >= b) ? (int32_t)sz : -(int32_t)sz;   // sign toward end
+      step_dwell = dw; step_t0 = millis();
+      sweep_active = false;                    // step and sweep are mutually exclusive
+      step_active  = true;
+      g_servo_wave_dev = (uint8_t)d; g_servo_wave_ch = (uint8_t)ch;
+      g_servo_man_tbl[d][ch] = b;              // seat the first step immediately
+      g_servo_manual = true;
+      Serial.printf("[step] dev%c ch%d %u->%u us, %ld us/step, %lu ms dwell (servo off to stop)\n",
+                    'A'+d, ch, b, e, (long)step_size, (unsigned long)dw);
     }
   }
   else if (eq(tok[0], "mdot") && n >= 2) { g_status.mdot_target = atof(tok[1]); Serial.printf("[mdot] target=%.1f\n",(double)g_status.mdot_target); }
@@ -231,11 +277,19 @@ void console_feed_char(uint8_t c) {
 
 void console_service(uint32_t now) {
   // servo sweep waveform: triangle min->max->min over sweep_ms; core 1 writes it
-  if (sweep_active && g_servo_manual) {
-    uint32_t p = (now - sweep_t0) % sweep_ms;
-    float ph = (float)p / (float)sweep_ms;                 // 0..1
-    float frac = (ph < 0.5f) ? (2.0f * ph) : (2.0f - 2.0f * ph);   // triangle 0..1..0
-    g_servo_man_us = sweep_min + (uint16_t)lroundf(frac * (sweep_max - sweep_min));
+  if (g_servo_manual && sweep_active) {
+  if (g_servo_manual && sweep_active)
+    g_servo_man_tbl[g_servo_wave_dev][g_servo_wave_ch] = sweep_us_at(now);
+  }
+  else if (g_servo_manual && step_active) {
+    uint32_t elapsed = now - step_t0;
+    uint32_t nsteps  = elapsed / step_dwell;                 // how many dwell periods elapsed
+    int32_t  us      = (int32_t)step_begin + (int32_t)nsteps * step_size;
+    // clamp to the end and stop advancing once reached
+    if (step_size > 0 && us >= (int32_t)step_end) us = step_end;
+    if (step_size < 0 && us <= (int32_t)step_end) us = step_end;
+    g_servo_man_tbl[g_servo_wave_dev][g_servo_wave_ch] = (uint16_t)us;
+    // (leave step_active set so it HOLDS at step_end; 'servo off' to release)
   }
 
   // 2 Hz calibration stream for LabVIEW (text mode only): all 12 pressures (!A)

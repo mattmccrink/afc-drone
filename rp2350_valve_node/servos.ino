@@ -173,12 +173,24 @@ static uint16_t curve_us(int servo, float x_norm) {
 void servos_service(uint32_t tick) {
   // ---- manual bring-up override (bench): drive one posted channel ----
   if (g_servo_manual) {
-    uint8_t d = g_servo_man_dev; if (d >= PCA9685_COUNT) d = 0;
 #if USE_REAL_I2C
-    if (s_pca_ok[d]) pca9685_write_one(PCA_ADDRS[d], g_servo_man_ch, g_servo_man_us);
+    for (int d = 0; d < PCA9685_COUNT; ++d) {
+      if (!s_pca_ok[d]) continue;
+      // find the highest populated channel on this device
+      int nch = 0;
+      for (int c = 0; c < PCA9685_MAX_CH; ++c)
+        if (g_servo_man_tbl[d][c] != 0) nch = c + 1;
+      if (nch == 0) continue;                       // nothing held on this board
+      uint16_t counts[PCA9685_MAX_CH];
+      for (int c = 0; c < nch; ++c) {
+        uint16_t us = g_servo_man_tbl[d][c];
+        counts[c] = us ? us_to_count(us) : us_to_count(SERVO_US_NEUTRAL);
+      }
+      pca9685_write_board(PCA_ADDRS[d], counts, nch);   // burst, actively re-asserted
+    }
 #endif
-    coanda_oe(true);                           // enable so the servo actually moves
-    return;                                    // NB: bypasses the staleness failsafe
+    coanda_oe(true);
+    return;   // NB: still bypasses the staleness failsafe -- bench only
   }
 
   // ---- normal path: curve-fit all 12, burst per device ----
