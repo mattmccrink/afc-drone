@@ -8,6 +8,7 @@ find_package(std_msgs REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ValveNodeCtrl.msg"
   "msg/ValveNodeSensor.msg"
+  "msg/ValveNodeHealth.msg"
   DEPENDENCIES std_msgs
 )
 

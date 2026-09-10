@@ -50,7 +50,7 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
-        DeclareLaunchArgument("serial_port", default_value="/dev/ttyACM0"),
+        DeclareLaunchArgument("serial_port", default_value="/dev/ttyACM1"),
         DeclareLaunchArgument("cmd_topic", default_value="/mavros/target_actuator_control"),
         DeclareLaunchArgument("state_topic", default_value="/mavros/state"),
         DeclareLaunchArgument("ctrl_topic", default_value="/afc/ctrl_tlm"),

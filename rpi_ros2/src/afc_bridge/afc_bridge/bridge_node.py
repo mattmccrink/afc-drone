@@ -38,7 +38,7 @@ try:
 except Exception:  # pragma: no cover - present at runtime on a MAVROS system
     State = ActuatorControl = None
 
-from afc_bridge_msgs.msg import ValveNodeCtrl, ValveNodeSensor
+from afc_bridge_msgs.msg import ValveNodeCtrl, ValveNodeSensor, ValveNodeHealth
 
 try:
     import serial  # pyserial
@@ -52,7 +52,7 @@ class BridgeNode(Node):
 
         # ---- parameters ----
         p = self.declare_parameter
-        self.port_name = p("serial_port", "/dev/ttyACM0").value
+        self.port_name = p("serial_port", "/dev/ttyACM1").value
         self.cmd_topic = p("cmd_topic", "/mavros/target_actuator_control").value
         self.state_topic = p("state_topic", "/mavros/state").value
         self.cmd_group = int(p("cmd_group_mix", 0).value)     # PX4 group 0 = r/p/y/thrust
@@ -78,10 +78,24 @@ class BridgeNode(Node):
             stale_after_s=self.arm_stale_s,
         )
         self._tlm_offset_ms = None       # est. (node_ms - ros_ms), for logging
+        self.health_out = p("health_topic", "/afc/health").value
+
+        # ---- health/observability counters ----
+        # With the console gone, a silent framing desync looks identical to
+        # "no data" -- these make the difference visible. crc_errors lives on
+        # the reader; the rest are tallied here and rolled into a 1 Hz rate.
+        self._ctrl_count = 0             # CTRL_TLM frames since last health tick
+        self._sensor_count = 0           # SENSOR_TLM frames since last health tick
+        self._frames_ok = 0             # cumulative good frames
+        self._last_source = 255          # from most recent CTRL_TLM (255 = none yet)
+        self._last_armed = False
+        self._health_t = time.monotonic()
+        self._tlm_offset0_ms = None
 
         # ---- publishers ----
         self._ctrl_pub = self.create_publisher(ValveNodeCtrl, self.ctrl_out, 10)
         self._sensor_pub = self.create_publisher(ValveNodeSensor, self.sensor_out, 10)
+        self._health_pub = self.create_publisher(ValveNodeHealth, self.health_out, 10)
 
         # ---- subscribers (sensor QoS: best-effort, matches MAVROS) ----
         sensor_qos = QoSPresetProfiles.SENSOR_DATA.value
@@ -99,6 +113,7 @@ class BridgeNode(Node):
         self.create_timer(0.05, self._arm_timer)          # 20 Hz drive; TX self-paces
         self.create_timer(0.002, self._rx_timer)          # ~500 Hz serial drain
         self.create_timer(1.0, self._reconnect_timer)     # port keepalive
+        self.create_timer(1.0, self._health_timer)        # 1 Hz health + rosout
 
         self._open_serial()
         self.get_logger().info(
@@ -206,6 +221,10 @@ class BridgeNode(Node):
         m.valve = d["valve"]
         m.servo_us = d["servo_us"]
         self._ctrl_pub.publish(m)
+        self._ctrl_count += 1
+        self._frames_ok += 1
+        self._last_source = d["source"]     # tiny's readback of our CMD path
+        self._last_armed = d["armed"]       # tiny's readback of our arm token
 
     def _publish_sensor(self, payload: bytes):
         try:
@@ -224,9 +243,55 @@ class BridgeNode(Node):
         m.valid = d["valid"]
         self._sensor_pub.publish(m)
 
-        # running node<->ROS offset estimate (telemetry sanity / logging only).
+        self._sensor_count += 1
+        self._frames_ok += 1
+
+        # node<->ROS offset RELATIVE to a baseline latched on the first frame.
+        # Absolute (node millis since boot) - (ROS epoch ms) is meaningless; the
+        # diagnostic value is drift from startup, which sits near zero.
         ros_ms = m.header.stamp.sec * 1000 + m.header.stamp.nanosec // 1_000_000
-        self._tlm_offset_ms = int(d["node_stamp_ms"]) - ros_ms
+        raw = int(d["node_stamp_ms"]) - ros_ms
+        if self._tlm_offset0_ms is None:
+            self._tlm_offset0_ms = raw
+        self._tlm_offset_ms = raw - self._tlm_offset0_ms
+
+    # ---------------------------------------------------------------- health
+    def _health_timer(self):
+        now = time.monotonic()
+        dt = max(now - self._health_t, 1e-3)
+        ctrl_hz = self._ctrl_count / dt
+        sensor_hz = self._sensor_count / dt
+        self._ctrl_count = 0
+        self._sensor_count = 0
+        self._health_t = now
+
+        cmd_fresh = (self._ctrl_rx_mono is not None
+                     and (now - self._ctrl_rx_mono) < self.cmd_stale_s)
+        arm_fresh = not self._armtx.frozen
+
+        m = ValveNodeHealth()
+        m.header = self._stamp()
+        m.serial_connected = self._ser is not None
+        m.ctrl_hz = float(ctrl_hz)
+        m.sensor_hz = float(sensor_hz)
+        m.crc_errors = int(self._reader.crc_errors)
+        m.frames_ok = int(self._frames_ok)
+        m.last_source = int(self._last_source) if self._last_source != 255 else 255
+        m.last_armed = bool(self._last_armed)
+        m.cmd_fresh = bool(cmd_fresh)
+        m.arm_fresh = bool(arm_fresh)
+        m.arm_counter = int(self._armtx.counter)
+        m.tlm_offset_ms = int(self._tlm_offset_ms) if self._tlm_offset_ms is not None else 0
+        self._health_pub.publish(m)
+
+        # human-readable 1 Hz line -- the 'health' console you lost, on rosout.
+        src = {0: "PRIMARY", 1: "SBUS", 2: "SAFE", 255: "--"}.get(self._last_source, "?")
+        self.get_logger().info(
+            f"[health] ser={'up' if m.serial_connected else 'DOWN'} "
+            f"ctrl={ctrl_hz:4.1f}Hz sens={sensor_hz:4.1f}Hz crc={m.crc_errors} "
+            f"src={src} armed={m.last_armed} "
+            f"cmd_fresh={m.cmd_fresh} arm_fresh={m.arm_fresh} "
+            f"armctr={m.arm_counter} off={m.tlm_offset_ms}ms")
 
 
 def main(args=None):
