@@ -7,14 +7,23 @@ valve/sensor node over USB-CDC.
   RP2350  --serial(CTRL_TLM,SENSOR_TLM)--> [THIS NODE] --> ROS2 topics --> rosbag
 
 The node is a supervisor + bridge, NOT an in-loop controller: it forwards
-pre-mix control demand, relays the arm token with correct liveness semantics,
-and republishes the tiny's telemetry as typed messages. All wire handling lives
-in framing.py (byte-compatible with the tiny) and the arm-token safety logic in
+pre-allocation control demand, relays the arm token with correct liveness
+semantics, and republishes the tiny's telemetry as typed messages. Allocation
+stays on the RP2350 (coanda-slot effectiveness + independent reversion); the FC
+only supplies the normalised torque/thrust demand. All wire handling lives in
+framing.py (byte-compatible with the tiny) and the arm-token safety logic in
 arm_token.py; both are unit-tested off-hardware.
 
+Command source (PX4 1.14+ control allocation, dual-stack):
+  * CMD demand comes from uXRCE-DDS: vehicle_torque_setpoint (xyz = roll/pitch/
+    yaw) + vehicle_thrust_setpoint (z = thrust), both normalised [-1,1] body FRD,
+    ~250 Hz. These are the rate-controller output PRE-allocation -- exactly what
+    the tiny's FT_CMD expects, since the tiny does its own allocation.
+  * ARM stays on MAVROS (/mavros/state.armed) -- the working, validated path.
+
 Fail-safe intent preserved on the Pi side:
-  * CMD is forwarded ONLY while the MAVROS control input is fresh -- if it goes
-    stale we stop sending, letting the tiny's USB_CMD_TIMEOUT_MS revert to SBUS.
+  * CMD is forwarded ONLY while the setpoint stream is fresh -- if it goes stale
+    we stop sending, letting the tiny's USB_CMD_TIMEOUT_MS revert to SBUS.
   * the arm token advances ONLY while /mavros/state is fresh (see arm_token.py).
 Both degrade toward the tiny's own reversion rather than freezing a last value.
 """
@@ -31,12 +40,18 @@ from std_msgs.msg import Header
 from afc_bridge import framing as F
 from afc_bridge.arm_token import ArmTokenTx
 
-# MAVROS message types are resolved lazily in main() so `colcon build` of this
-# package doesn't hard-require mavros_msgs at build time (only at run time).
+# MAVROS (arm path) and px4_msgs (command path) are resolved lazily so a plain
+# `colcon build` of this package doesn't hard-require either at build time --
+# they only need to be present/built at run time.
 try:
-    from mavros_msgs.msg import State, ActuatorControl
+    from mavros_msgs.msg import State
 except Exception:  # pragma: no cover - present at runtime on a MAVROS system
-    State = ActuatorControl = None
+    State = None
+
+try:
+    from px4_msgs.msg import VehicleTorqueSetpoint, VehicleThrustSetpoint
+except Exception:  # pragma: no cover - present at runtime once px4_msgs is built
+    VehicleTorqueSetpoint = VehicleThrustSetpoint = None
 
 from afc_bridge_msgs.msg import ValveNodeCtrl, ValveNodeSensor, ValveNodeHealth
 
@@ -52,10 +67,14 @@ class BridgeNode(Node):
 
         # ---- parameters ----
         p = self.declare_parameter
-        self.port_name = p("serial_port", "/dev/ttyACM1").value
-        self.cmd_topic = p("cmd_topic", "/mavros/target_actuator_control").value
+        self.port_name = p("serial_port", "/dev/ttyACM0").value
+        self.torque_topic = p("torque_topic", "/fmu/out/vehicle_torque_setpoint").value
+        self.thrust_topic = p("thrust_topic", "/fmu/out/vehicle_thrust_setpoint").value
         self.state_topic = p("state_topic", "/mavros/state").value
-        self.cmd_group = int(p("cmd_group_mix", 0).value)     # PX4 group 0 = r/p/y/thrust
+        # FRD z is down, so a multicopter's climb thrust is NEGATIVE in
+        # thrust_setpoint.xyz[2]; the CMD throttle slot wants a positive
+        # magnitude. Default -1 flips it; CONFIRM against live data before trust.
+        self.thrust_sign = float(p("thrust_sign", -1.0).value)
         self.cmd_rate_hz = float(p("cmd_rate_hz", 50.0).value)
         self.cmd_stale_s = float(p("cmd_stale_after_s", 0.1).value)
         self.mdot_target = float(p("mdot_target_gps", 40.0).value)
@@ -70,8 +89,13 @@ class BridgeNode(Node):
         # ---- state ----
         self._ser = None
         self._reader = F.FrameReader()
-        self._ctrl = None                # latest [roll,pitch,yaw,thrust]
-        self._ctrl_rx_mono = None        # monotonic time of last control msg
+        self._torque = None              # latest (x,y,z) = roll,pitch,yaw demand
+        self._thrust = None              # latest (x,y,z); z is the thrust axis
+        # Freshness keyed on the NEWER of the two setpoints: any setpoint arriving
+        # refreshes the command. Both ride the same DDS client at ~250 Hz, so a
+        # partial (one-topic) stall is unlikely; if you want strict both-fresh,
+        # track the two rx times separately and test the older one instead.
+        self._cmd_rx_mono = None         # monotonic time of the most recent setpoint
         self._armtx = ArmTokenTx(
             send=self._send_arm,
             heartbeat_s=1.0 / self.arm_hb_hz,
@@ -90,23 +114,30 @@ class BridgeNode(Node):
         self._last_source = 255          # from most recent CTRL_TLM (255 = none yet)
         self._last_armed = False
         self._health_t = time.monotonic()
-        self._tlm_offset0_ms = None
 
         # ---- publishers ----
         self._ctrl_pub = self.create_publisher(ValveNodeCtrl, self.ctrl_out, 10)
         self._sensor_pub = self.create_publisher(ValveNodeSensor, self.sensor_out, 10)
         self._health_pub = self.create_publisher(ValveNodeHealth, self.health_out, 10)
 
-        # ---- subscribers (sensor QoS: best-effort, matches MAVROS) ----
+        # ---- subscribers ----
+        # SENSOR_DATA QoS = best-effort/volatile/keep-last, which matches BOTH
+        # MAVROS and PX4's uXRCE-DDS publishers. A default (reliable) QoS here is
+        # the classic "topic exists but no messages arrive" trap against PX4.
         sensor_qos = QoSPresetProfiles.SENSOR_DATA.value
         if State is not None:
             self.create_subscription(State, self.state_topic, self._on_state, sensor_qos)
-            self.create_subscription(ActuatorControl, self.cmd_topic,
-                                     self._on_actuator, sensor_qos)
         else:
             self.get_logger().error(
-                "mavros_msgs not importable; CMD/ARM inputs are disabled. "
-                "Install mavros_msgs and restart.")
+                "mavros_msgs not importable; ARM input disabled. Source MAVROS.")
+        if VehicleTorqueSetpoint is not None:
+            self.create_subscription(VehicleTorqueSetpoint, self.torque_topic,
+                                     self._on_torque, sensor_qos)
+            self.create_subscription(VehicleThrustSetpoint, self.thrust_topic,
+                                     self._on_thrust, sensor_qos)
+        else:
+            self.get_logger().error(
+                "px4_msgs not importable; CMD input disabled. Build px4_msgs.")
 
         # ---- timers ----
         self.create_timer(1.0 / self.cmd_rate_hz, self._cmd_timer)
@@ -117,9 +148,11 @@ class BridgeNode(Node):
 
         self._open_serial()
         self.get_logger().info(
-            f"afc_bridge up: port={self.port_name} cmd<={self.cmd_topic} "
-            f"(group {self.cmd_group}) cmd_rate={self.cmd_rate_hz}Hz "
-            f"arm_hb={self.arm_hb_hz}Hz mdot={self.mdot_target}g/s")
+            f"afc_bridge up: port={self.port_name} "
+            f"cmd<=torque({self.torque_topic})+thrust({self.thrust_topic}) "
+            f"arm<={self.state_topic} cmd_rate={self.cmd_rate_hz}Hz "
+            f"arm_hb={self.arm_hb_hz}Hz mdot={self.mdot_target}g/s "
+            f"thrust_sign={self.thrust_sign:+.0f}")
 
     # ---------------------------------------------------------------- serial
     def _open_serial(self):
@@ -155,22 +188,26 @@ class BridgeNode(Node):
         # arm token liveness keys on receipt time, not the FCU header stamp.
         self._armtx.note_state(bool(msg.armed), time.monotonic())
 
-    def _on_actuator(self, msg):
-        if int(msg.group_mix) != self.cmd_group:
-            return
-        c = msg.controls
-        if len(c) < 4:
-            return
-        self._ctrl = (float(c[0]), float(c[1]), float(c[2]), float(c[3]))
-        self._ctrl_rx_mono = time.monotonic()
+    def _on_torque(self, msg):
+        self._torque = (float(msg.xyz[0]), float(msg.xyz[1]), float(msg.xyz[2]))
+        self._cmd_rx_mono = time.monotonic()
+
+    def _on_thrust(self, msg):
+        self._thrust = (float(msg.xyz[0]), float(msg.xyz[1]), float(msg.xyz[2]))
+        self._cmd_rx_mono = time.monotonic()
+
+    def _cmd_fresh(self, now: float) -> bool:
+        # need one of each setpoint, and the newer arrival within the window.
+        return (self._torque is not None and self._thrust is not None
+                and self._cmd_rx_mono is not None
+                and (now - self._cmd_rx_mono) < self.cmd_stale_s)
 
     # ----------------------------------------------------------------- timers
     def _cmd_timer(self):
-        if self._ctrl is None or self._ctrl_rx_mono is None:
-            return
-        if (time.monotonic() - self._ctrl_rx_mono) >= self.cmd_stale_s:
-            return  # stale primary -> stop forwarding, let the tiny revert
-        roll, pitch, yaw, thrust = self._ctrl
+        if not self._cmd_fresh(time.monotonic()):
+            return  # stale/incomplete setpoints -> stop forwarding, tiny reverts
+        roll, pitch, yaw = self._torque          # torque xyz -> r/p/y demand
+        thrust = self.thrust_sign * self._thrust[2]   # thrust axis, sign-corrected
         self._write(F.build_cmd(roll, pitch, yaw, thrust, self.mdot_target,
                                 thrust_lo=self.thrust_lo, thrust_hi=self.thrust_hi))
 
@@ -246,14 +283,10 @@ class BridgeNode(Node):
         self._sensor_count += 1
         self._frames_ok += 1
 
-        # node<->ROS offset RELATIVE to a baseline latched on the first frame.
-        # Absolute (node millis since boot) - (ROS epoch ms) is meaningless; the
-        # diagnostic value is drift from startup, which sits near zero.
+        # running node<->ROS offset estimate (telemetry sanity / logging only).
         ros_ms = m.header.stamp.sec * 1000 + m.header.stamp.nanosec // 1_000_000
-        raw = int(d["node_stamp_ms"]) - ros_ms
-        if self._tlm_offset0_ms is None:
-            self._tlm_offset0_ms = raw
-        self._tlm_offset_ms = raw - self._tlm_offset0_ms
+        self._tlm_offset_ms = int(d["node_stamp_ms"]) - ros_ms
+
 
     # ---------------------------------------------------------------- health
     def _health_timer(self):
@@ -265,8 +298,7 @@ class BridgeNode(Node):
         self._sensor_count = 0
         self._health_t = now
 
-        cmd_fresh = (self._ctrl_rx_mono is not None
-                     and (now - self._ctrl_rx_mono) < self.cmd_stale_s)
+        cmd_fresh = self._cmd_fresh(now)
         arm_fresh = not self._armtx.frozen
 
         m = ValveNodeHealth()

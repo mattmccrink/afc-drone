@@ -19,7 +19,8 @@ from launch_ros.actions import Node
 
 def generate_launch_description():
     serial_port = LaunchConfiguration("serial_port")
-    cmd_topic = LaunchConfiguration("cmd_topic")
+    torque_topic = LaunchConfiguration("torque_topic")
+    thrust_topic = LaunchConfiguration("thrust_topic")
     state_topic = LaunchConfiguration("state_topic")
     ctrl_topic = LaunchConfiguration("ctrl_topic")
     sensor_topic = LaunchConfiguration("sensor_topic")
@@ -33,25 +34,31 @@ def generate_launch_description():
         output="screen",
         parameters=[{
             "serial_port": serial_port,
-            "cmd_topic": cmd_topic,
+            "torque_topic": torque_topic,
+            "thrust_topic": thrust_topic,
             "state_topic": state_topic,
             "ctrl_topic": ctrl_topic,
             "sensor_topic": sensor_topic,
         }],
     )
 
+    # Bag the command demand (torque+thrust), the arm input, and both telemetry
+    # streams -- everything needed for post-flight cause/effect.
     bag = GroupAction(
         condition=IfCondition(record),
         actions=[ExecuteProcess(
             cmd=["ros2", "bag", "record", "-o", bag_uri,
-                 cmd_topic, state_topic, ctrl_topic, sensor_topic],
+                 torque_topic, thrust_topic, state_topic, ctrl_topic, sensor_topic],
             output="screen",
         )],
     )
 
     return LaunchDescription([
-        DeclareLaunchArgument("serial_port", default_value="/dev/ttyACM1"),
-        DeclareLaunchArgument("cmd_topic", default_value="/mavros/target_actuator_control"),
+        DeclareLaunchArgument("serial_port", default_value="/dev/ttyACM0"),
+        DeclareLaunchArgument("torque_topic",
+                              default_value="/fmu/out/vehicle_torque_setpoint"),
+        DeclareLaunchArgument("thrust_topic",
+                              default_value="/fmu/out/vehicle_thrust_setpoint"),
         DeclareLaunchArgument("state_topic", default_value="/mavros/state"),
         DeclareLaunchArgument("ctrl_topic", default_value="/afc/ctrl_tlm"),
         DeclareLaunchArgument("sensor_topic", default_value="/afc/sensor_tlm"),

@@ -1,0 +1,6 @@
+[submodule "rpi_ros2/rpi_ros2/src/px4_msgs"]
+	path = rpi_ros2/rpi_ros2/src/px4_msgs
+	url = https://github.com/PX4/px4_msgs
+[submodule "rpi_ros2/src/px4_msgs"]
+	path = rpi_ros2/src/px4_msgs
+	url = https://github.com/PX4/px4_msgs
