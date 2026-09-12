@@ -62,9 +62,9 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
-        DeclareLaunchArgument("fcu_url", default_value="udp://:14550@"),
+        DeclareLaunchArgument("fcu_url", default_value="/dev/ttyAMA0"),
         DeclareLaunchArgument("gcs_url", default_value=""),
-        DeclareLaunchArgument("serial_port", default_value="/dev/ttyACM1"),
+        DeclareLaunchArgument("serial_port", default_value="/dev/ttyAMA1"),
         DeclareLaunchArgument("start_agent", default_value="false"),
         DeclareLaunchArgument("agent_udp_port", default_value="8888"),
         agent,

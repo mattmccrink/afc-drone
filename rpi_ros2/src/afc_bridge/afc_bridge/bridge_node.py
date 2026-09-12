@@ -285,9 +285,14 @@ class BridgeNode(Node):
 
         # running node<->ROS offset estimate (telemetry sanity / logging only).
         ros_ms = m.header.stamp.sec * 1000 + m.header.stamp.nanosec // 1_000_000
-        self._tlm_offset_ms = int(d["node_stamp_ms"]) - ros_ms
-
-
+        raw = int(d["node_stamp_ms"]) - ros_ms
+        # (re)latch the baseline on first frame OR if a prior baseline is stale/bad
+        # enough that the relative offset would overflow int32 (e.g. tiny rebooted,
+        # or baseline never latched). Keeps the reported value near zero + in range.
+        if (self._tlm_offset_ms is None
+                or abs(raw - self._tlm_offset_ms) > 2_000_000_000):
+            self._tlm_offset_ms = raw
+        self._tlm_offset_ms = raw - self._tlm_offset_ms
     # ---------------------------------------------------------------- health
     def _health_timer(self):
         now = time.monotonic()
@@ -313,7 +318,8 @@ class BridgeNode(Node):
         m.cmd_fresh = bool(cmd_fresh)
         m.arm_fresh = bool(arm_fresh)
         m.arm_counter = int(self._armtx.counter)
-        m.tlm_offset_ms = int(self._tlm_offset_ms) if self._tlm_offset_ms is not None else 0
+        raw_off = int(self._tlm_offset_ms) if self._tlm_offset_ms is not None else 0
+        m.tlm_offset_ms = max(-2147483648, min(2147483647, raw_off))
         self._health_pub.publish(m)
 
         # human-readable 1 Hz line -- the 'health' console you lost, on rosout.
