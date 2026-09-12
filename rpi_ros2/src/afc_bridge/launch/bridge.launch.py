@@ -21,7 +21,7 @@ def generate_launch_description():
     serial_port = LaunchConfiguration("serial_port")
     torque_topic = LaunchConfiguration("torque_topic")
     thrust_topic = LaunchConfiguration("thrust_topic")
-    state_topic = LaunchConfiguration("state_topic")
+    status_topic = LaunchConfiguration("status_topic")
     ctrl_topic = LaunchConfiguration("ctrl_topic")
     sensor_topic = LaunchConfiguration("sensor_topic")
     record = LaunchConfiguration("record")
@@ -36,7 +36,7 @@ def generate_launch_description():
             "serial_port": serial_port,
             "torque_topic": torque_topic,
             "thrust_topic": thrust_topic,
-            "state_topic": state_topic,
+            "status_topic": status_topic,
             "ctrl_topic": ctrl_topic,
             "sensor_topic": sensor_topic,
         }],
@@ -48,18 +48,18 @@ def generate_launch_description():
         condition=IfCondition(record),
         actions=[ExecuteProcess(
             cmd=["ros2", "bag", "record", "-o", bag_uri,
-                 torque_topic, thrust_topic, state_topic, ctrl_topic, sensor_topic],
+                 torque_topic, thrust_topic, status_topic, ctrl_topic, sensor_topic],
             output="screen",
         )],
     )
 
     return LaunchDescription([
-        DeclareLaunchArgument("serial_port", default_value="/dev/ttyACM1"),
+        DeclareLaunchArgument("serial_port", default_value="/dev/ttyACM0"),
         DeclareLaunchArgument("torque_topic",
                               default_value="/fmu/out/vehicle_torque_setpoint"),
         DeclareLaunchArgument("thrust_topic",
                               default_value="/fmu/out/vehicle_thrust_setpoint"),
-        DeclareLaunchArgument("state_topic", default_value="/mavros/state"),
+        DeclareLaunchArgument("status_topic", default_value="/fmu/out/vehicle_status"),
         DeclareLaunchArgument("ctrl_topic", default_value="/afc/ctrl_tlm"),
         DeclareLaunchArgument("sensor_topic", default_value="/afc/sensor_tlm"),
         DeclareLaunchArgument("record", default_value="false"),
