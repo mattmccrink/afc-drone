@@ -1,7 +1,0 @@
-[0.000000] (-) TimerEvent: {}
-[0.000404] (-) JobUnselected: {'identifier': 'afc_bridge_msgs'}
-[0.000458] (-) JobUnselected: {'identifier': 'px4_msgs'}
-[0.000506] (afc_bridge) JobQueued: {'identifier': 'afc_bridge', 'dependencies': OrderedDict({'afc_bridge_msgs': '/home/mattmccrink/afc-drone/install/afc_bridge_msgs', 'px4_msgs': '/home/mattmccrink/afc-drone/install/px4_msgs'})}
-[0.001213] (afc_bridge) JobStarted: {'identifier': 'afc_bridge'}
-[0.012975] (afc_bridge) JobEnded: {'identifier': 'afc_bridge', 'rc': 1}
-[0.023327] (-) EventReactorShutdown: {}
