@@ -54,7 +54,7 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
-        DeclareLaunchArgument("serial_port", default_value="/dev/ttyACM0"),
+        DeclareLaunchArgument("serial_port", default_value="/dev/ttyACM1"),
         DeclareLaunchArgument("torque_topic",
                               default_value="/fmu/out/vehicle_torque_setpoint"),
         DeclareLaunchArgument("thrust_topic",
