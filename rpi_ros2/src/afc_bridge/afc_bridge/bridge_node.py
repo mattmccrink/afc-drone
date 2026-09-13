@@ -100,6 +100,7 @@ class BridgeNode(Node):
             stale_after_s=self.arm_stale_s,
         )
         self._tlm_offset_ms = None       # est. (node_ms - ros_ms), for logging
+        self._tlm_offset0_ms = None
         self.health_out = p("health_topic", "/afc/health").value
 
         # ---- health/observability counters ----
@@ -283,8 +284,11 @@ class BridgeNode(Node):
 
         # running node<->ROS offset estimate (telemetry sanity / logging only).
         ros_ms = m.header.stamp.sec * 1000 + m.header.stamp.nanosec // 1_000_000
-        self._tlm_offset_ms = int(d["node_stamp_ms"]) - ros_ms
-
+        raw = int(d["node_stamp_ms"]) - ros_ms
+        if (self._tlm_offset0_ms is None
+                or abs(raw - self._tlm_offset0_ms) > 2_000_000_000):
+            self._tlm_offset0_ms = raw
+        self._tlm_offset_ms = raw - self._tlm_offset0_ms
 
     # ---------------------------------------------------------------- health
     def _health_timer(self):
@@ -311,7 +315,8 @@ class BridgeNode(Node):
         m.cmd_fresh = bool(cmd_fresh)
         m.arm_fresh = bool(arm_fresh)
         m.arm_counter = int(self._armtx.counter)
-        m.tlm_offset_ms = int(self._tlm_offset_ms) if self._tlm_offset_ms is not None else 0
+        raw_off = int(self._tlm_offset_ms) if self._tlm_offset_ms is not None else 0
+        m.tlm_offset_ms = max(-2147483648, min(2147483647, raw_off))
         self._health_pub.publish(m)
 
         # human-readable 1 Hz line -- the 'health' console you lost, on rosout.
