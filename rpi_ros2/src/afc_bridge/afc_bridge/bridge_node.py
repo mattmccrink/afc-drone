@@ -47,9 +47,9 @@ from afc_bridge.arm_token import ArmTokenTx
 # plain `colcon build` doesn't hard-require px4_msgs at build time.
 try:
     from px4_msgs.msg import (VehicleTorqueSetpoint, VehicleThrustSetpoint,
-                              VehicleStatus)
+                              VehicleStatus, OffboardControlMode)
 except Exception:  # pragma: no cover - present at runtime once px4_msgs is built
-    VehicleTorqueSetpoint = VehicleThrustSetpoint = VehicleStatus = None
+    VehicleTorqueSetpoint = VehicleThrustSetpoint = VehicleStatus = OffboardControlMode = None
 
 from afc_bridge_msgs.msg import ValveNodeCtrl, ValveNodeSensor, ValveNodeHealth
 
@@ -118,6 +118,7 @@ class BridgeNode(Node):
         self._ctrl_pub = self.create_publisher(ValveNodeCtrl, self.ctrl_out, 10)
         self._sensor_pub = self.create_publisher(ValveNodeSensor, self.sensor_out, 10)
         self._health_pub = self.create_publisher(ValveNodeHealth, self.health_out, 10)
+        self._keepalive_pub = self.create_publisher(OffboardControlMode, "/fmu/in/offboard_control_mode",QoSPresetProfiles.SENSOR_DATA.value)
 
         # ---- subscribers ----
         # SENSOR_DATA QoS = best-effort/volatile/keep-last, which matches BOTH
@@ -149,7 +150,24 @@ class BridgeNode(Node):
             f"arm<={self.status_topic} cmd_rate={self.cmd_rate_hz}Hz "
             f"arm_hb={self.arm_hb_hz}Hz mdot={self.mdot_target}g/s "
             f"thrust_sign={self.thrust_sign:+.0f}")
+        self.create_timer(0.2, self._keepalive_timer)   # 5 Hz -- just keeps FC rx != 0
 
+    def _keepalive_timer(self):
+        # Inert message purely to keep uxrce_dds_client's Payload rx > 0, which
+        # avoids the 1 s blocking ping (PX4 #25873). All fields false: commands
+        # nothing. Real command authority is torque/thrust READ from the FC;
+        # allocation is on the RP2350. This is a workaround for a firmware bug --
+        # remove once the client is patched to gate connectivity on TX alone.
+        m = OffboardControlMode()
+        m.timestamp = int(self.get_clock().now().nanoseconds / 1000)  # PX4 wants microseconds
+        m.position = False
+        m.velocity = False
+        m.acceleration = False
+        m.attitude = False
+        m.body_rate = False
+        m.thrust_and_torque = False
+        m.direct_actuator = False
+        self._keepalive_pub.publish(m)
     # ---------------------------------------------------------------- serial
     def _open_serial(self):
         if serial is None:
