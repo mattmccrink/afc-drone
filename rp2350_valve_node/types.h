@@ -56,6 +56,7 @@ struct NodeStatus {
   uint8_t  n_valid         = 0;
   bool     flow_fallback   = false;
   bool     sensor_stale    = false;
+  bool     terminated      = false;      // latched flight-termination (total comms loss)
 };
 
 // One physical MS5837 behind the mux tree: its mux, channel, and which

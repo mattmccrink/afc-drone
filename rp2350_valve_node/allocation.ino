@@ -1,30 +1,39 @@
 // =============================================================================
 //  allocation.ino  --  Control allocation  (core 0)
 //
-//  Roll/pitch/yaw (+ collective) -> 6 valve positions via a fixed mixing matrix.
-//  The SAME allocator serves both sources; SBUS reversion is an alternate input,
-//  not an alternate allocator (spec section 6). In DEFINED-SAFE, valves go to the
-//  <<OPEN #4>> placeholder pose. Result is published to core 1 as a ValveCmd.
+//  PX4-style allocation: author the EFFECTIVENESS matrix B (moment produced per
+//  unit valve travel), and allocate by its pseudo-inverse -- the same math as
+//  PX4's ControlAllocationPseudoInverse, with a coanda B instead of a rotor one.
 //
-//  Note: arm gates the COMPRESSOR only. Valves still move when disarmed (harmless
-//  without air; useful for ground checks) -- so allocation runs regardless of arm.
+//      tau = B u                         (forward physics, B is 3x6)
+//      u   = collective*1 + Binv * tau   (Binv = B^T (B B^T)^-1, min-norm, 6x3)
+//
+//  Collective is common-mode (all valves): for a symmetric layout 1 ~ null(B),
+//  so it adds mass-flow without a net moment and rides under the allocation.
+//  Saturation: yaw-priority sequential desaturation (roll/pitch preserved first).
+//
+//  Sources: the SAME allocator serves PRIMARY and SBUS (spec section 6).
+//  SAFE (or a latched termination) -> defined-safe pose; arm gates the compressor.
 // -----------------------------------------------------------------------------
 #include "config.h"
+#include <math.h>
 
-// Mixing matrix  <<PLACEHOLDER -- replace with the real force/moment map>>.
-// Columns: {roll, pitch, yaw, collective}. Rows: the 6 valves. Units: fraction of
-// full valve travel per unit stick. Kept modest so combined demand rarely rails.
-static const float ALLOC_MIX[VALVE_COUNT][4] = {
-  //  roll    pitch    yaw    collective
-  {  0.60f,  0.30f,  0.20f,  0.50f },   // valve 0
-  { -0.60f,  0.30f, -0.20f,  0.50f },   // valve 1
-  {  0.60f, -0.30f, -0.20f,  0.50f },   // valve 2
-  { -0.60f, -0.30f,  0.20f,  0.50f },   // valve 3
-  {  0.00f,  0.45f,  0.35f,  0.50f },   // valve 4
-  {  0.00f, -0.45f, -0.35f,  0.50f },   // valve 5
+// --- Effectiveness matrix B (rows: roll,pitch,yaw; cols: valves 0..5) ---------
+//  Signs from geometry (valves 0-3 outboard, 4-5 canards).
+//  <<POPULATE MAGNITUDES from CFD / wind-tunnel / flight system-ID.>>  The values
+//  below carry the sign pattern of the old hand mix as a PLACEHOLDER so the
+//  pseudo-inverse is exercised end-to-end; they are NOT physically calibrated.
+static const float B_EFF[3][VALVE_COUNT] = {
+  //  v0      v1      v2      v3      v4      v5
+  { +0.60f, -0.60f, +0.60f, -0.60f,  0.00f,  0.00f },   // roll
+  { +0.30f, +0.30f, -0.30f, -0.30f, +0.45f, -0.45f },   // pitch
+  { +0.20f, -0.20f, -0.20f, +0.20f, +0.35f, -0.35f },   // yaw
 };
 
+static float Binv[VALVE_COUNT][3];      // pseudo-inverse (6x3), computed at boot
 static const int16_t ALLOC_SAFE_POSE[VALVE_COUNT] = DEFINED_SAFE_VALVE_POSE;
+
+static inline float clampf(float v, float lo, float hi){ return v<lo?lo:(v>hi?hi:v); }
 
 static inline int16_t clamp_valve(float v) {
   if (v < VALVE_POS_MIN) v = VALVE_POS_MIN;
@@ -32,24 +41,55 @@ static inline int16_t clamp_valve(float v) {
   return (int16_t)lroundf(v);
 }
 
-void allocation_update(uint32_t now) {
-  ValveCmd& out = g_valve_pub.begin_write();
-
-  if (g_status.source == SRC_SAFE) {
-    // Terminal no-command state: hold the defined-safe pose.
-    for (int v = 0; v < VALVE_COUNT; ++v) out.valve[v] = ALLOC_SAFE_POSE[v];
-  } else {
-    const StickInput& in = (g_status.source == SRC_PRIMARY) ? g_primary_in : g_sbus_in;
-    float collective = in.throttle;                 // [0,1]
-    for (int v = 0; v < VALVE_COUNT; ++v) {
-      float f = ALLOC_MIX[v][0] * in.roll
-              + ALLOC_MIX[v][1] * in.pitch
-              + ALLOC_MIX[v][2] * in.yaw
-              + ALLOC_MIX[v][3] * collective;
-      out.valve[v] = clamp_valve(f * VALVE_POS_MAX);
-    }
-  }
-
-  out.stamp_ms = now;                 // core 1 uses this for staleness -> failsafe
-  g_valve_pub.end_write();
+// 3x3 inverse (B B^T is small and well-conditioned for a sane B).
+static bool inv3(const float m[3][3], float o[3][3]) {
+  float det = m[0][0]*(m[1][1]*m[2][2]-m[1][2]*m[2][1])
+            - m[0][1]*(m[1][0]*m[2][2]-m[1][2]*m[2][0])
+            + m[0][2]*(m[1][0]*m[2][1]-m[1][1]*m[2][0]);
+  if (fabsf(det) < 1e-9f) return false;
+  float id = 1.0f/det;
+  o[0][0]= (m[1][1]*m[2][2]-m[1][2]*m[2][1])*id;
+  o[0][1]=-(m[0][1]*m[2][2]-m[0][2]*m[2][1])*id;
+  o[0][2]= (m[0][1]*m[1][2]-m[0][2]*m[1][1])*id;
+  o[1][0]=-(m[1][0]*m[2][2]-m[1][2]*m[2][0])*id;
+  o[1][1]= (m[0][0]*m[2][2]-m[0][2]*m[2][0])*id;
+  o[1][2]=-(m[0][0]*m[1][2]-m[0][2]*m[1][0])*id;
+  o[2][0]= (m[1][0]*m[2][1]-m[1][1]*m[2][0])*id;
+  o[2][1]=-(m[0][0]*m[2][1]-m[0][1]*m[2][0])*id;
+  o[2][2]= (m[0][0]*m[1][1]-m[0][1]*m[1][0])*id;
+  return true;
 }
+
+// Compute Binv = B^T (B B^T)^-1 once at boot.
+void allocation_setup() {
+  float BBt[3][3];
+  for (int i=0;i<3;i++) for (int j=0;j<3;j++){
+    float s=0; for (int k=0;k<VALVE_COUNT;k++) s+=B_EFF[i][k]*B_EFF[j][k];
+    BBt[i][j]=s;
+  }
+  float inv[3][3];
+  if (!inv3(BBt, inv)) {                 // singular B -> zero authority (safe)
+    for (int v=0;v<VALVE_COUNT;v++) for(int i=0;i<3;i++) Binv[v][i]=0.0f;
+    Serial.println(F("[alloc] WARNING: B B^T singular; check B_EFF"));
+    return;
+  }
+  for (int v=0;v<VALVE_COUNT;v++)
+    for (int i=0;i<3;i++){
+      float s=0; for (int k=0;k<3;k++) s+=B_EFF[k][v]*inv[k][i];
+      Binv[v][i]=s;
+    }
+}
+
+// Control-authority schedule hook: coanda effectiveness scales with dynamic
+// pressure / jet momentum.  Return normalized authority (1.0 = design point).
+// Since B = authority*B0, Binv scales as 1/authority -> just divide the moment
+// part below.  <<HOOK>> replace with clampf(k * qbar_or_mdot, AUTH_MIN, 1.0f).
+static inline float alloc_authority() {
+  return 1.0f;
+}
+
+// Largest s in [0,1] keeping base[v] + s*delta[v] within [0,1] for every valve.
+// A pre-existing base violation forces s -> 0: a lower-priority axis must not
+// paper over a higher-priority axis's saturation.
+static float feasible_scale(const float base[VALVE_COUNT], const float delta[VALVE_COUNT]) {
+  float s = 1.0f;

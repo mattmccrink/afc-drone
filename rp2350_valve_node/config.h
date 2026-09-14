@@ -165,8 +165,14 @@
 #define SBUS_TO_PRIMARY_HOLD_MS 200   // ...and fresh this long before switching back
 
 #define ARM_HEARTBEAT_MS       1000   // expected arm-token cadence (1 Hz)
-#define ARM_LOSS_TIMEOUT_MS   10000   // powered-reversion window, then disarm
+#define ARM_LOSS_TIMEOUT_MS   10000   // FC-token liveness window (reversion, not disarm)
                                       //   <<default per spec; configurable>>
+
+// Total-comms-loss flight termination: how long BOTH sources may be dead (SRC_SAFE)
+// before the node cuts air and comes down. Debounce against a transient double
+// dropout -- long enough that a real reversion (~150 ms) always wins, short enough
+// that the airframe doesn't fly far uncontrolled. <<TUNE to airframe/risk.>>
+#define SAFE_TERMINATE_MS      3000
 
 // -----------------------------------------------------------------------------
 //  Teensy (compressor) link -- reuse teensyshot Host_comm format & magic

@@ -24,6 +24,7 @@ static uint32_t arb_last_arm_counter = 0;
 static uint32_t arb_last_advance_ms  = 0;
 static bool     arb_seen_disarmed    = false;
 static bool     arb_arm_init         = false;
+static uint32_t arb_safe_since       = 0;     // when SRC_SAFE began (0 = not in SAFE)
 
 // Console hook: force a source, or pass "auto" (SRC_SAFE sentinel => release).
 void arbitration_force(Source s, bool force) {
@@ -118,29 +119,48 @@ void arbitration_update(uint32_t now) {
   bool token_live = (now - arb_last_advance_ms) < ARM_LOSS_TIMEOUT_MS;
   g_status.arm_live = token_live;
 
+  if (g_status.source != SRC_SAFE) arb_safe_since = 0;   // reset the terminate debounce
+
   switch (g_status.source) {
     case SRC_PRIMARY:
       // FC token governs. Requires having seen a clean disarm first (no power-up
       // into a hot switch). A STALE token does not reach here as a disarm -- we
       // simply hold the last state until the ladder reverts us.
       if (token_live && arb_seen_disarmed) {
-        g_status.armed = (g_arm_state == 1);
+        bool a = (g_arm_state == 1);
+        if (a && !g_status.armed) g_status.terminated = false;  // positive re-arm clears termination
+        g_status.armed = a;
       }
       break;
 
     case SRC_SBUS:
-      // Pilot's SBUS arm switch governs, once that switch has been seen disarmed
-      // once on a clean frame. If we reverted here with the switch already up and
-      // never-seen-disarmed, HOLD the last state so a reversion cannot disarm us
-      // mid-flight; the pilot cycling the switch low then arms authority to SBUS.
+      // Pilot's SBUS arm switch governs, once seen disarmed once on a clean frame.
+      // A stale FC token is expected here and must not disarm.
       if (g_sbus_arm_seen_disarmed) {
-        g_status.armed = g_sbus_arm;
+        bool a = g_sbus_arm;
+        if (a && !g_status.armed) g_status.terminated = false;  // positive re-arm clears termination
+        g_status.armed = a;
       }
       break;
 
     case SRC_SAFE:
     default:
-      // hold last armed
+      // TOTAL command loss -- neither PRIMARY nor SBUS is live. Single-source loss
+      // never reaches here (the ladder reverts to the surviving source). Debounce
+      // against a transient double-dropout, then TERMINATE: cut air and come down.
+      // An uncontrolled powered aircraft ("ghost") is worse than a de-powered one
+      // descending. Termination LATCHES; recovery requires a positive disarm->arm
+      // from whoever regains control (the seen-disarmed latches are reset so a
+      // still-armed source that reconnects cannot silently re-power us mid-fall).
+      if (arb_safe_since == 0) arb_safe_since = now;
+      if (!g_status.terminated && (now - arb_safe_since) >= SAFE_TERMINATE_MS) {
+        g_status.terminated      = true;    // latched
+        g_status.armed           = false;   // arm gates the compressor -> air OFF
+        arb_seen_disarmed        = false;   // recovery needs a fresh positive disarm->arm
+        g_sbus_arm_seen_disarmed = false;
+      }
+      // Before the timeout: hold last armed so the compressor FALLBACK keeps air
+      // through the debounce -- only a SUSTAINED total loss terminates.
       break;
   }
 }

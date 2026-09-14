@@ -100,6 +100,7 @@ void primary_sim_update(uint32_t now);
 void sbus_sim_update(uint32_t now);
 
 void arbitration_update(uint32_t now);     // -> g_status.source, .armed, .arm_live
+void allocation_setup();                   // precompute the pseudo-inverse (core 0)
 void allocation_update(uint32_t now);      // -> publishes ValveCmd
 void compressor_update(uint32_t now);      // -> rpm, Teensy stream, g_current_rpm_cmd
 
@@ -121,6 +122,7 @@ void setup() {
   led_setup();
   framing_setup();
   cal_load();                 // curve-fit coefficients: flash cal or compiled defaults
+  allocation_setup();         // precompute B^+ from the effectiveness matrix
   #if USE_REAL_SBUS
   sbus_real_setup();
   #endif
