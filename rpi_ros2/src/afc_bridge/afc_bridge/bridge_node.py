@@ -68,7 +68,10 @@ class BridgeNode(Node):
         self.port_name = p("serial_port", "/dev/ttyACM0").value
         self.torque_topic = p("torque_topic", "/fmu/out/vehicle_torque_setpoint").value
         self.thrust_topic = p("thrust_topic", "/fmu/out/vehicle_thrust_setpoint").value
-        self.status_topic = p("status_topic", "/fmu/out/vehicle_status").value
+	# PX4 1.16+ publishes versioned messages under a _v1 suffix. vehicle_status
+        # is a DEFAULT DDS publication so it carries the suffix; the setpoints below
+        # are plain because they're hand-added to dds_topics.yaml under those names.
+        self.status_topic = p("status_topic", "/fmu/out/vehicle_status_v1").value 
         # FRD z is down, so a multicopter's climb thrust is NEGATIVE in
         # thrust_setpoint.xyz[2]; the CMD throttle slot wants a positive
         # magnitude. Default -1 flips it; CONFIRM against live data before trust.
