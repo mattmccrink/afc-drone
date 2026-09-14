@@ -64,6 +64,8 @@ bool g_sim_arm_intent = false;         // simulated Pixhawk arm channel (console
 
 bool g_sbus_failsafe  = false;         // simulated SBUS failsafe flag
 bool g_sbus_framelost = false;         // simulated SBUS frame-lost flag
+bool g_sbus_arm       = false;         // SBUS arm-switch state (clean-frame gated; SBUS source only)
+bool g_sbus_arm_seen_disarmed = false; // per-source boot latch: seen a clean disarmed SBUS frame once
 
 // Fault injection (console-set on core 0; read by the core-1 sensor sim).
 volatile bool g_fault_valve[VALVE_COUNT] = { false };

@@ -44,6 +44,7 @@
 #define SBUS_CH_PITCH        1
 #define SBUS_CH_THROTTLE     2
 #define SBUS_CH_YAW          3
+#define SBUS_CH_ARM          4    // VALIDATE: 2-position arm switch; high (> MID) = arm intent
 
 // SBUS raw endpoints (standard Futaba scaling).
 #define SBUS_RAW_MIN  172
@@ -116,6 +117,15 @@ static void sbus_decode(const uint8_t* f) {
         g_sbus_in.valid    = true;
         g_sbus_in.stamp_ms = millis();
         s_last_good_ms     = millis();
+
+        // Arm switch (2-position): high = arm intent. Trusted only on clean frames
+        // (same gate as the sticks above). The "seen disarmed once" latch is
+        // per-source and independent of the FC token, so standalone-SBUS ground
+        // arming works without the FC present, while still refusing to power up (or
+        // revert) into an already-hot switch.
+        bool sw_armed = (ch[SBUS_CH_ARM] > SBUS_RAW_MID);
+        if (!sw_armed) g_sbus_arm_seen_disarmed = true;
+        g_sbus_arm = sw_armed;
     }
 }
 
@@ -148,6 +158,8 @@ void sbus_real_print() {
     Serial.printf("[sbus] map: R=%.3f P=%.3f Y=%.3f T=%.3f (ch R%d P%d Y%d T%d)\n",
         g_sbus_in.roll, g_sbus_in.pitch, g_sbus_in.yaw, g_sbus_in.throttle,
         SBUS_CH_ROLL, SBUS_CH_PITCH, SBUS_CH_YAW, SBUS_CH_THROTTLE);
+    Serial.printf("[sbus] arm: sw=%d seen_disarmed=%d (ch %d raw %u)\n",
+        g_sbus_arm, g_sbus_arm_seen_disarmed, SBUS_CH_ARM, s_ch[SBUS_CH_ARM]);
 }
 
 void sbus_real_setup() {
@@ -176,6 +188,8 @@ void sbus_real_setup() {
     g_sbus_failsafe  = true;      // start untrusted until a good frame arrives
     g_sbus_framelost = true;
     g_sbus_in.valid  = false;
+    g_sbus_arm               = false;  // boot disarmed on the SBUS path
+    g_sbus_arm_seen_disarmed = false;  // must observe a clean disarmed frame first
 }
 
 // Call from the CORE 0 loop, where sbus_sim_update() used to be called.

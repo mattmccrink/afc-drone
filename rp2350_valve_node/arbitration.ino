@@ -32,7 +32,10 @@ void arbitration_force(Source s, bool force) {
 }
 
 static void arm_update(uint32_t now) {
-  // Snapshot the (volatile) token inbox.
+  // Track FC arm-token liveness + the "seen disarmed once" latch ONLY. This no
+  // longer decides g_status.armed: arm authority is resolved per ACTIVE SOURCE at
+  // the end of arbitration_update(), so a stale FC token triggers reversion, never
+  // a disarm.
   uint32_t counter = g_arm_counter;
   uint8_t  state   = g_arm_state;
 
@@ -44,14 +47,10 @@ static void arm_update(uint32_t now) {
     arb_last_advance_ms  = now;
     if (state == 0) arb_seen_disarmed = true;   // observed a clean disarmed token
   }
-  bool live = (now - arb_last_advance_ms) < ARM_LOSS_TIMEOUT_MS;
-
-  // Armed only if: token live AND reports armed AND we've seen disarmed once.
-  bool armed = live && (state == 1) && arb_seen_disarmed;
-
-  g_status.arm_live = live;
-  g_status.armed    = armed;
 }
+
+// Expose the FC-side "seen disarmed once" latch for console/telemetry.
+bool arb_fc_seen_disarmed() { return arb_seen_disarmed; }
 
 void arbitration_update(uint32_t now) {
   arm_update(now);
@@ -71,36 +70,77 @@ void arbitration_update(uint32_t now) {
     arb_primary_fresh_since = 0;
   }
 
-  if (arb_forced) { g_status.source = arb_forced_src; return; }
+  // ---- pick the active source: console override, else the hysteretic ladder ---
+  Source next;
+  if (arb_forced) {
+    next = arb_forced_src;
+  } else {
+    Source cur = g_status.source;
+    next = cur;
+    switch (cur) {
+      case SRC_PRIMARY:
+        // Leave PRIMARY only after it has been stale long enough (debounce).
+        if (!primary_fresh &&
+            arb_primary_stale_since && (now - arb_primary_stale_since) >= PRIMARY_TO_SBUS_HOLD_MS) {
+          next = sbus_ok ? SRC_SBUS : SRC_SAFE;
+        }
+        break;
 
-  Source cur = g_status.source;
-  Source next = cur;
+      case SRC_SBUS:
+        // Return to PRIMARY only after it has been fresh long enough.
+        if (primary_fresh &&
+            arb_primary_fresh_since && (now - arb_primary_fresh_since) >= SBUS_TO_PRIMARY_HOLD_MS) {
+          next = SRC_PRIMARY;
+        } else if (!sbus_ok) {
+          next = SRC_SAFE;
+        }
+        break;
 
-  switch (cur) {
+      case SRC_SAFE:
+      default:
+        if (primary_fresh)      next = SRC_PRIMARY;   // primary recovers immediately from SAFE
+        else if (sbus_ok)       next = SRC_SBUS;
+        break;
+    }
+  }
+
+  g_status.source = next;
+
+  // ---- arm authority FOLLOWS the active source --------------------------------
+  // Principle: FC-token staleness is a REVERSION trigger, never a disarm. armed
+  // clears ONLY on a positive disarm from whoever currently holds control:
+  //   PRIMARY -> a live FC token reporting disarmed
+  //   SBUS    -> the pilot's SBUS arm switch going low
+  //   SAFE    -> no live command source; the node cannot safely auto-disarm in the
+  //              air, so HOLD the last armed state (compressor FALLBACK keeps air).
+  //              Ground disarm is a positive act (FC returns & disarms, SBUS switch,
+  //              or power-off) -- a stale link alone will not cut airflow.
+  bool token_live = (now - arb_last_advance_ms) < ARM_LOSS_TIMEOUT_MS;
+  g_status.arm_live = token_live;
+
+  switch (g_status.source) {
     case SRC_PRIMARY:
-      // Leave PRIMARY only after it has been stale long enough (debounce).
-      if (!primary_fresh &&
-          arb_primary_stale_since && (now - arb_primary_stale_since) >= PRIMARY_TO_SBUS_HOLD_MS) {
-        next = sbus_ok ? SRC_SBUS : SRC_SAFE;
+      // FC token governs. Requires having seen a clean disarm first (no power-up
+      // into a hot switch). A STALE token does not reach here as a disarm -- we
+      // simply hold the last state until the ladder reverts us.
+      if (token_live && arb_seen_disarmed) {
+        g_status.armed = (g_arm_state == 1);
       }
       break;
 
     case SRC_SBUS:
-      // Return to PRIMARY only after it has been fresh long enough.
-      if (primary_fresh &&
-          arb_primary_fresh_since && (now - arb_primary_fresh_since) >= SBUS_TO_PRIMARY_HOLD_MS) {
-        next = SRC_PRIMARY;
-      } else if (!sbus_ok) {
-        next = SRC_SAFE;
+      // Pilot's SBUS arm switch governs, once that switch has been seen disarmed
+      // once on a clean frame. If we reverted here with the switch already up and
+      // never-seen-disarmed, HOLD the last state so a reversion cannot disarm us
+      // mid-flight; the pilot cycling the switch low then arms authority to SBUS.
+      if (g_sbus_arm_seen_disarmed) {
+        g_status.armed = g_sbus_arm;
       }
       break;
 
     case SRC_SAFE:
     default:
-      if (primary_fresh)      next = SRC_PRIMARY;   // primary recovers immediately from SAFE
-      else if (sbus_ok)       next = SRC_SBUS;
+      // hold last armed
       break;
   }
-
-  g_status.source = next;
 }
