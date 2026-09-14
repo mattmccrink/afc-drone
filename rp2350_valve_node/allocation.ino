@@ -93,3 +93,53 @@ static inline float alloc_authority() {
 // paper over a higher-priority axis's saturation.
 static float feasible_scale(const float base[VALVE_COUNT], const float delta[VALVE_COUNT]) {
   float s = 1.0f;
+  for (int v = 0; v < VALVE_COUNT; ++v) {
+    float b = base[v], d = delta[v];
+    if (b > 1.0f + 1e-5f || b < -1e-5f) { s = 0.0f; continue; }
+    if (d > 1e-6f) {                 // rising toward the upper limit (1)
+      if (b + d > 1.0f) s = fminf(s, (1.0f - b) / d);
+    } else if (d < -1e-6f) {         // falling toward the lower limit (0)
+      if (b + d < 0.0f) s = fminf(s, (0.0f - b) / d);
+    }
+  }
+  return s < 0.0f ? 0.0f : s;
+}
+
+void allocation_update(uint32_t now) {
+  ValveCmd& out = g_valve_pub.begin_write();
+
+  if (g_status.source == SRC_SAFE || g_status.terminated) {
+    // No live command source, or a latched termination: park at the safe pose.
+    for (int v = 0; v < VALVE_COUNT; ++v) out.valve[v] = ALLOC_SAFE_POSE[v];
+  } else {
+    const StickInput& in = (g_status.source == SRC_PRIMARY) ? g_primary_in : g_sbus_in;
+    const float tau[3]     = { in.roll, in.pitch, in.yaw };   // [-1,1]
+    const float collective = clampf(in.throttle, 0.0f, 1.0f); // common-mode bias
+    const float inv_auth   = 1.0f / alloc_authority();
+
+    // --- Yaw-priority sequential desaturation (PX4 sequential-desaturation style).
+    //     Roll+pitch (attitude) are highest priority: preserved first and scaled
+    //     TOGETHER so their ratio (the attitude command direction) is kept. Yaw is
+    //     lowest priority and only fills remaining headroom. Collective is fixed.
+    float cbase[VALVE_COUNT], rpdelta[VALVE_COUNT], ydelta[VALVE_COUNT];
+    for (int v = 0; v < VALVE_COUNT; ++v) {
+      cbase[v]   = collective;
+      rpdelta[v] = inv_auth * (Binv[v][0]*tau[0] + Binv[v][1]*tau[1]);  // roll + pitch
+      ydelta[v]  = inv_auth * (Binv[v][2]*tau[2]);                      // yaw
+    }
+    // Step 1: maximum attitude with yaw = 0 (roll & pitch scaled together).
+    float s_rp = feasible_scale(cbase, rpdelta);
+    // Step 2: give yaw whatever headroom is left once attitude is placed.
+    float rpbase[VALVE_COUNT];
+    for (int v = 0; v < VALVE_COUNT; ++v) rpbase[v] = collective + s_rp*rpdelta[v];
+    float s_yaw = feasible_scale(rpbase, ydelta);
+
+    for (int v = 0; v < VALVE_COUNT; ++v) {
+      float cmd = clampf(collective + s_rp*rpdelta[v] + s_yaw*ydelta[v], 0.0f, 1.0f);
+      out.valve[v] = clamp_valve(cmd * VALVE_POS_MAX);
+    }
+  }
+
+  out.stamp_ms = now;                 // core 1 uses this for staleness -> failsafe
+  g_valve_pub.end_write();
+}
