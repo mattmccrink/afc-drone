@@ -17,6 +17,7 @@
 // ALPHA runs entirely on simulated hardware leaves (no sensors/servos/SBUS RX
 // required). Flip these to 1 as real hardware arrives; the interfaces do not
 // change, only the backend behind them.
+#define USE_REAL_PRIMARY 1   // 0 = simulated Pi command+arm (sweep), 1 = real FT_CMD/FT_ARM only
 #define USE_REAL_I2C     1     // 0 = simulated sensors/servos, no Wire traffic
 #define USE_REAL_SBUS    1     // 0 = simulated SBUS source, PIO program stubbed
 #define USE_REAL_TEENSY  1     // 1 = actually emit Host_comm frames on Serial2

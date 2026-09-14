@@ -167,7 +167,9 @@ void loop() {
   framing_pump();               // ingest USB (binary frames and/or text commands)
   poll_user_button(now);
 
+  #if !USE_REAL_PRIMARY
   primary_sim_update(now);      // simulated Pi command + arm token
+  #endif  
   #if !USE_REAL_SBUS
   sbus_sim_update(now);         // simulated reversionary SBUS
   #else
