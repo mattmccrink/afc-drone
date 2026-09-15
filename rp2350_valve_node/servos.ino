@@ -194,9 +194,18 @@ void servos_service(uint32_t tick) {
   }
 
   // ---- normal path: curve-fit all 12, burst per device ----
+  // Hold the last good valve command across transient cross-core read misses. A
+  // single dropped snapshot must NOT slam servos/valves to neutral -- that's a
+  // control disturbance, not a safe state. Failsafe only on SUSTAINED staleness,
+  // i.e. core 0 genuinely stopped updating (stamp older than CMD_TIMEOUT_MS).
+  static ValveCmd s_last = {};                 // 0-init: valves centered, stamp 0
+  static bool     s_have = false;
+
   ValveCmd cmd;
-  bool got = g_valve_pub.snapshot(cmd);
-  bool stale = !got || (millis() - cmd.stamp_ms) > CMD_TIMEOUT_MS;
+  if (g_valve_pub.snapshot(cmd)) { s_last = cmd; s_have = true; }  // refresh only on a clean read
+  // else: transient miss -> keep s_last (its stamp still measures core-0 liveness)
+
+  bool stale = !s_have || (millis() - s_last.stamp_ms) > CMD_TIMEOUT_MS;
 
   if (stale) {
     coanda_oe(false);                          // primary kill: hardware output-disable
@@ -206,6 +215,8 @@ void servos_service(uint32_t tick) {
     for (int s = 0; s < SERVO_COUNT; ++s) g_servo_us_echo[s] = SERVO_US_NEUTRAL;
     return;
   }
+
+  cmd = s_last;                                // drive from the last good command
 
   uint16_t us[SERVO_COUNT];
   for (int s = 0; s < SERVO_COUNT; ++s) {

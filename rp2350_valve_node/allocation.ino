@@ -107,7 +107,8 @@ static float feasible_scale(const float base[VALVE_COUNT], const float delta[VAL
 }
 
 void allocation_update(uint32_t now) {
-  ValveCmd& out = g_valve_pub.begin_write();
+  ValveCmd out;                       // compute fully into a local, then publish
+                                      // (keeps the seqlock write window tiny)
 
   if (g_status.source == SRC_SAFE || g_status.terminated) {
     // No live command source, or a latched termination: park at the safe pose.
@@ -141,8 +142,11 @@ void allocation_update(uint32_t now) {
     }  
   }
   for (int v = 0; v < VALVE_COUNT; ++v) g_valve_dbg[v] = out.valve[v];  // core-0 console copy
-  out.stamp_ms = now;
-  g_valve_pub.end_write();
   out.stamp_ms = now;                 // core 1 uses this for staleness -> failsafe
+
+  // Publish in one short odd-seq window (single struct copy), so core 1's
+  // snapshot() almost never catches the buffer mid-write -> no servo neutral-bounce.
+  ValveCmd& dst = g_valve_pub.begin_write();
+  dst = out;
   g_valve_pub.end_write();
 }
