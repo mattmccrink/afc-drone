@@ -139,6 +139,22 @@ void tlm_service(uint32_t now) {
     fput_u8 (pl, i, g_status.n_valid);
     for (int v = 0; v < VALVE_COUNT; ++v) fput_i16(pl, i, g_valve_dbg[v]);
     for (int s = 0; s < SERVO_COUNT; ++s) fput_u16(pl, i, got ? fr.servo_us[s] : 0);
+    // ---- fault-tree extras (APPENDED; base offsets above unchanged) ----
+    uint8_t mode = g_status.terminated            ? MODE_TERMINATED
+                 : !g_status.armed                ? MODE_DISARMED
+                 : g_status.source == SRC_PRIMARY ? MODE_PRIMARY_ARMED
+                 : g_status.source == SRC_SBUS    ? MODE_SBUS_REVERSION
+                 :                                  MODE_SAFE_HOLD;
+    fput_u8(pl, i, mode);
+    uint8_t flags = (g_status.terminated       ? 0x01 : 0)   // bit0 terminated
+                  | (arb_fc_seen_disarmed()    ? 0x02 : 0)   // bit1 FC arm eligible
+                  | (g_sbus_arm_seen_disarmed  ? 0x04 : 0)   // bit2 SBUS arm eligible
+                  | (g_sbus_arm                ? 0x08 : 0);  // bit3 SBUS switch now
+    fput_u8(pl, i, flags);
+    float srp  = g_alloc_s_rp  < 0.f ? 0.f : (g_alloc_s_rp  > 1.f ? 1.f : g_alloc_s_rp);
+    float syaw = g_alloc_s_yaw < 0.f ? 0.f : (g_alloc_s_yaw > 1.f ? 1.f : g_alloc_s_yaw);
+    fput_u8(pl, i, (uint8_t)(srp  * 100.f + 0.5f));          // desat scales, %*100
+    fput_u8(pl, i, (uint8_t)(syaw * 100.f + 0.5f));
     send_frame(FT_CTRL_TLM, pl, (uint8_t)i);
   } else {
     i = 0;

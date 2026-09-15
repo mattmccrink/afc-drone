@@ -36,6 +36,17 @@ struct SensorFrame {
 enum Source   { SRC_PRIMARY = 0, SRC_SBUS = 1, SRC_SAFE = 2 };
 enum CompMode { COMP_STOPPED = 0, COMP_TRACK, COMP_DIRECT, COMP_FALLBACK };
 
+// Derived operating mode for the fault-tree dashboard (single source of truth on
+// the tiny; mirrored into CTRL_TLM -> /afc/health). Precedence: terminated wins,
+// then disarmed, then the active source.
+enum NodeMode : uint8_t {
+  MODE_DISARMED       = 0,
+  MODE_PRIMARY_ARMED  = 1,
+  MODE_SBUS_REVERSION = 2,
+  MODE_SAFE_HOLD      = 3,   // armed, no live source (pre-termination debounce)
+  MODE_TERMINATED     = 4,
+};
+
 // A normalized command input; shared shape for every source.
 struct StickInput {
   float    roll, pitch, yaw, throttle;   // roll/pitch/yaw in [-1,1], throttle [0,1]
