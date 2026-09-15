@@ -53,6 +53,9 @@ except Exception:  # pragma: no cover - present at runtime once px4_msgs is buil
 
 from afc_bridge_msgs.msg import ValveNodeCtrl, ValveNodeSensor, ValveNodeHealth
 
+_MODE_STR = {0: "DISARMED", 1: "PRIMARY_ARMED", 2: "SBUS_REVERSION",
+             3: "SAFE_HOLD", 4: "TERMINATED"}
+
 try:
     import serial  # pyserial
 except Exception:  # pragma: no cover
@@ -115,6 +118,14 @@ class BridgeNode(Node):
         self._frames_ok = 0             # cumulative good frames
         self._last_source = 255          # from most recent CTRL_TLM (255 = none yet)
         self._last_armed = False
+        # fault-tree fields from the tiny (CTRL_TLM ext; default = pre-update firmware)
+        self._last_mode = 0
+        self._last_term = False
+        self._last_elig_fc = False
+        self._last_elig_sbus = False
+        self._last_sbus_sw = False
+        self._last_desat_rp = 1.0
+        self._last_desat_yaw = 1.0
         self._health_t = time.monotonic()
 
         # ---- publishers ----
@@ -282,6 +293,13 @@ class BridgeNode(Node):
         self._frames_ok += 1
         self._last_source = d["source"]     # tiny's readback of our CMD path
         self._last_armed = d["armed"]       # tiny's readback of our arm token
+        self._last_mode = d["mode"]         # fault-tree extras (0 on pre-update fw)
+        self._last_term = d["terminated"]
+        self._last_elig_fc = d["elig_fc"]
+        self._last_elig_sbus = d["elig_sbus"]
+        self._last_sbus_sw = d["sbus_sw"]
+        self._last_desat_rp = d["desat_rp"]
+        self._last_desat_yaw = d["desat_yaw"]
 
     def _publish_sensor(self, payload: bytes):
         try:
@@ -333,6 +351,14 @@ class BridgeNode(Node):
         m.frames_ok = int(self._frames_ok)
         m.last_source = int(self._last_source) if self._last_source != 255 else 255
         m.last_armed = bool(self._last_armed)
+        m.mode = int(self._last_mode)
+        m.mode_str = _MODE_STR.get(self._last_mode, "?")
+        m.terminated = bool(self._last_term)
+        m.elig_fc = bool(self._last_elig_fc)
+        m.elig_sbus = bool(self._last_elig_sbus)
+        m.sbus_sw = bool(self._last_sbus_sw)
+        m.desat_rp = float(self._last_desat_rp)
+        m.desat_yaw = float(self._last_desat_yaw)
         m.cmd_fresh = bool(cmd_fresh)
         m.arm_fresh = bool(arm_fresh)
         m.arm_counter = int(self._armtx.counter)
@@ -345,8 +371,10 @@ class BridgeNode(Node):
         self.get_logger().info(
             f"[health] ser={'up' if m.serial_connected else 'DOWN'} "
             f"ctrl={ctrl_hz:4.1f}Hz sens={sensor_hz:4.1f}Hz crc={m.crc_errors} "
-            f"src={src} armed={m.last_armed} "
+            f"mode={m.mode_str} src={src} armed={m.last_armed} term={m.terminated} "
+            f"elig[fc={m.elig_fc} sbus={m.elig_sbus} sw={m.sbus_sw}] "
             f"cmd_fresh={m.cmd_fresh} arm_fresh={m.arm_fresh} "
+            f"desat={m.desat_rp:.2f}/{m.desat_yaw:.2f} "
             f"armctr={m.arm_counter} off={m.tlm_offset_ms}ms")
 
 

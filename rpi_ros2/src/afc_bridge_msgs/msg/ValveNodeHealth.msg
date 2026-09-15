@@ -23,3 +23,19 @@ bool cmd_fresh              # node is currently forwarding CMD (control input fr
 bool arm_fresh             # arm token is advancing (/mavros/state fresh)
 uint32 arm_counter         # current monotonic arm-token value
 int32 tlm_offset_ms        # est. (node millis - ROS ms); jumps = clock issue
+
+# ---- fault-tree / mode (from the tiny's own state, via CTRL_TLM) ----
+uint8 MODE_DISARMED       = 0
+uint8 MODE_PRIMARY_ARMED  = 1
+uint8 MODE_SBUS_REVERSION = 2
+uint8 MODE_SAFE_HOLD      = 3   # armed, no live source (pre-termination debounce)
+uint8 MODE_TERMINATED     = 4
+uint8 mode                     # derived operating mode (single source of truth = tiny)
+string mode_str                # human-readable mode, for echo/dashboards
+
+bool terminated                # latched flight-termination (total comms loss)
+bool elig_fc                   # FC arm path eligible (seen disarmed once)
+bool elig_sbus                 # SBUS arm path eligible (seen disarmed once)
+bool sbus_sw                   # current SBUS arm-switch state
+float32 desat_rp               # roll/pitch desaturation scale (1.0 = not clipping)
+float32 desat_yaw              # yaw desaturation scale (1.0 = not clipping)

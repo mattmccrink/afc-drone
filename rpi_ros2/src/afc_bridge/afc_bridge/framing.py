@@ -167,11 +167,14 @@ SERVO_COUNT = 12
 
 # ---- inbound telemetry decoders (CTRL_TLM 0x81, SENSOR_TLM 0x82) ------------
 # Mirror tlm_service() in framing.ino. Payload layouts:
-#   CTRL_TLM   (43 B): B source, B armed, B comp_mode, B flow_fallback,
+#   CTRL_TLM   (43 B base): B source, B armed, B comp_mode, B flow_fallback,
 #                      H rpm_target, B n_valid, 6h valve[], 12H servo_us[]
+#   CTRL_TLM  (+4 B ext, 47 total): B mode, B flags(bit0 term,1 elig_fc,2 elig_sbus,
+#                      3 sbus_sw), B desat_rp*100, B desat_yaw*100
 #   SENSOR_TLM (56 B): 6h p_up*10, 6h p_lo*10, 6h t_die*100, 6h mdot*10,
 #                      1h mdot_total*10, H valid_mask, I node_stamp_ms
 CTRL_TLM_LEN = 43
+CTRL_TLM_LEN_EXT = 47
 SENSOR_TLM_LEN = 56
 
 
@@ -182,9 +185,19 @@ def decode_ctrl_tlm(payload: bytes) -> dict:
         struct.unpack_from("<BBBBHB", payload, 0)
     valve = list(struct.unpack_from("<6h", payload, 7))
     servo_us = list(struct.unpack_from("<12H", payload, 19))
-    return dict(source=source, armed=bool(armed), comp_mode=comp_mode,
-                flow_fallback=bool(flow_fb), rpm_target=rpm_target,
-                n_valid=n_valid, valve=valve, servo_us=servo_us)
+    d = dict(source=source, armed=bool(armed), comp_mode=comp_mode,
+             flow_fallback=bool(flow_fb), rpm_target=rpm_target,
+             n_valid=n_valid, valve=valve, servo_us=servo_us,
+             # defaults for pre-update firmware (43-byte frames):
+             mode=0, terminated=False, elig_fc=False, elig_sbus=False,
+             sbus_sw=False, desat_rp=1.0, desat_yaw=1.0)
+    if len(payload) >= CTRL_TLM_LEN_EXT:
+        mode, flags, drp, dyaw = struct.unpack_from("<BBBB", payload, 43)
+        d.update(mode=mode, terminated=bool(flags & 0x01),
+                 elig_fc=bool(flags & 0x02), elig_sbus=bool(flags & 0x04),
+                 sbus_sw=bool(flags & 0x08),
+                 desat_rp=drp / 100.0, desat_yaw=dyaw / 100.0)
+    return d
 
 
 def decode_sensor_tlm(payload: bytes) -> dict:
