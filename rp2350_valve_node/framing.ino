@@ -126,7 +126,7 @@ void tlm_service(uint32_t now) {
   last = now;
 
   SensorFrame fr; bool got = g_sensor_pub.snapshot(fr);
-  ValveCmd vc;    g_valve_pub.snapshot(vc);
+  if (!got) g_tlm_dropped++;              // contended cross-core SensorFrame read
 
   uint8_t pl[128]; int i;
   if (which == 0) {
@@ -137,7 +137,7 @@ void tlm_service(uint32_t now) {
     fput_u8 (pl, i, g_status.flow_fallback ? 1 : 0);
     fput_u16(pl, i, g_status.rpm_target);
     fput_u8 (pl, i, g_status.n_valid);
-    for (int v = 0; v < VALVE_COUNT; ++v) fput_i16(pl, i, vc.valve[v]);
+    for (int v = 0; v < VALVE_COUNT; ++v) fput_i16(pl, i, g_valve_dbg[v]);
     for (int s = 0; s < SERVO_COUNT; ++s) fput_u16(pl, i, got ? fr.servo_us[s] : 0);
     send_frame(FT_CTRL_TLM, pl, (uint8_t)i);
   } else {

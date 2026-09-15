@@ -32,6 +32,7 @@ static const float B_EFF[3][VALVE_COUNT] = {
 
 static float Binv[VALVE_COUNT][3];      // pseudo-inverse (6x3), computed at boot
 static const int16_t ALLOC_SAFE_POSE[VALVE_COUNT] = DEFINED_SAFE_VALVE_POSE;
+static const float u_trim[VALVE_COUNT] = VALVE_TRIM_NORM;
 
 static inline float clampf(float v, float lo, float hi){ return v<lo?lo:(v>hi?hi:v); }
 
@@ -95,11 +96,11 @@ static float feasible_scale(const float base[VALVE_COUNT], const float delta[VAL
   float s = 1.0f;
   for (int v = 0; v < VALVE_COUNT; ++v) {
     float b = base[v], d = delta[v];
-    if (b > 1.0f + 1e-5f || b < -1e-5f) { s = 0.0f; continue; }
-    if (d > 1e-6f) {                 // rising toward the upper limit (1)
+    if (b > 1.0f + 1e-5f || b < -1.0f - 1e-5f) { s = 0.0f; continue; }   // was: b < -1e-5f
+    if (d > 1e-6f) {                 // rising toward the upper limit (+1)
       if (b + d > 1.0f) s = fminf(s, (1.0f - b) / d);
-    } else if (d < -1e-6f) {         // falling toward the lower limit (0)
-      if (b + d < 0.0f) s = fminf(s, (0.0f - b) / d);
+    } else if (d < -1e-6f) {         // falling toward the lower limit (-1)
+      if (b + d < -1.0f) s = fminf(s, (-1.0f - b) / d);                  // was: < 0.0f, (0.0f - b)/d
     }
   }
   return s < 0.0f ? 0.0f : s;
@@ -115,7 +116,6 @@ void allocation_update(uint32_t now) {
   } else {
     const StickInput& in = (g_status.source == SRC_PRIMARY) ? g_primary_in : g_sbus_in;
     const float tau[3]     = { in.roll, in.pitch, in.yaw };   // [-1,1]
-    const float collective = clampf(in.throttle, 0.0f, 1.0f); // common-mode bias
     const float inv_auth   = 1.0f / alloc_authority();
 
     // --- Yaw-priority sequential desaturation (PX4 sequential-desaturation style).
@@ -124,7 +124,7 @@ void allocation_update(uint32_t now) {
     //     lowest priority and only fills remaining headroom. Collective is fixed.
     float cbase[VALVE_COUNT], rpdelta[VALVE_COUNT], ydelta[VALVE_COUNT];
     for (int v = 0; v < VALVE_COUNT; ++v) {
-      cbase[v]   = collective;
+      cbase[v]   = u_trim[v];
       rpdelta[v] = inv_auth * (Binv[v][0]*tau[0] + Binv[v][1]*tau[1]);  // roll + pitch
       ydelta[v]  = inv_auth * (Binv[v][2]*tau[2]);                      // yaw
     }
@@ -132,11 +132,11 @@ void allocation_update(uint32_t now) {
     float s_rp = feasible_scale(cbase, rpdelta);
     // Step 2: give yaw whatever headroom is left once attitude is placed.
     float rpbase[VALVE_COUNT];
-    for (int v = 0; v < VALVE_COUNT; ++v) rpbase[v] = collective + s_rp*rpdelta[v];
+    for (int v = 0; v < VALVE_COUNT; ++v) rpbase[v] = u_trim[v] + s_rp*rpdelta[v];
     float s_yaw = feasible_scale(rpbase, ydelta);
 
     for (int v = 0; v < VALVE_COUNT; ++v) {
-      float cmd = clampf(collective + s_rp*rpdelta[v] + s_yaw*ydelta[v], 0.0f, 1.0f);
+      float cmd = clampf(u_trim[v] + s_rp*rpdelta[v] + s_yaw*ydelta[v], -1.0f, 1.0f);
       out.valve[v] = clamp_valve(cmd * VALVE_POS_MAX);
     }  
   }

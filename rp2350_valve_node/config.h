@@ -208,6 +208,7 @@
 #define FLOW_PI_KP           50.0f  // rpm per (g/s) error
 #define FLOW_PI_KI           20.0f  // rpm per (g/s * s)
 #define FLOW_FALLBACK_HOLD_MS 250   // hysteresis into/out of fallback (anti-chatter)
+#define COMP_MDOT_LOOP        0   // 0 = stub (armed -> RPM_FALLBACK); 1 = re-enable mdot PI (needs venturi-loss handling)
 
 // Direct-rpm mapping for SBUS manual reversion  <<OPEN #5 -- direct rpm>>
 #define SBUS_RPM_MIN          0
@@ -227,6 +228,7 @@
 // preserve coanda authority in the terminal no-command state, NOT geometric zero.
 // Do not fly this placeholder.
 #define DEFINED_SAFE_VALVE_POSE { 0, 0, 0, 0, 0, 0 }
+#define VALVE_TRIM_NORM { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f }   // per-valve neutral, NORMALIZED [-1,1], 0=center. <<POPULATE>>
 
 // -----------------------------------------------------------------------------
 //  Pi link (USB CDC) binary framing

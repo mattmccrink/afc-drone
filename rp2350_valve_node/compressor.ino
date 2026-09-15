@@ -95,12 +95,13 @@ void compressor_update(uint32_t now) {
   if (!want_run) {
     mode   = COMP_STOPPED;
     target = 0.0f;
-  } else if (g_status.source == SRC_SBUS) {
-    // Manual reversion -> DIRECT rpm (open decision #5), flow-sensor-independent.
-    float thr = g_sbus_in.throttle; if (thr < 0) thr = 0; if (thr > 1) thr = 1;
-    target = SBUS_RPM_MIN + thr * (SBUS_RPM_MAX - SBUS_RPM_MIN);
-    mode   = COMP_DIRECT;
-  } else if (g_status.source == SRC_PRIMARY && comp_flow_ok) {
+  }
+#if COMP_MDOT_LOOP
+  // <<STUBBED OFF via COMP_MDOT_LOOP=0>> Mass-flow tracking PI. Do NOT re-enable
+  // until dead-venturi handling exists: gate on sensor health and hold RPM_FALLBACK
+  // when n_valid is too low -- never track a mdot estimate from too few valid
+  // venturis. See tracker (compressor mdot loop / venturi-loss).
+  else if (g_status.source == SRC_PRIMARY && comp_flow_ok) {
     // Track the mass-flow target with a gentle PI (anti-windup below).
     float err = g_status.mdot_target - mdot_total;
     float integ_try = comp_integ + FLOW_PI_KI * err * dt;
@@ -112,8 +113,12 @@ void compressor_update(uint32_t now) {
     else                  comp_integ = clamped - FLOW_PI_KP*err;  // back-calc anti-windup
     target = clamped;
     mode   = COMP_TRACK;
-  } else {
-    // PRIMARY-with-bad-flow, or DEFINED-SAFE while still armed: fail toward airflow.
+  }
+#endif
+  else {
+    // STUB: throttle controls nothing and the mdot loop is off, so every armed
+    // source holds a fixed RPM. PRIMARY and SBUS both land here -> RPM_FALLBACK
+    // (30k). Reports FALLBACK = "fixed RPM, not tracking flow" (honest telemetry).
     target = RPM_FALLBACK;
     mode   = COMP_FALLBACK;
   }

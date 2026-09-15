@@ -50,6 +50,7 @@ volatile uint16_t g_servo_man_us  = SERVO_US_NEUTRAL;
 volatile uint32_t g_current_rpm_cmd = 0;   // core 0 -> core 1 (closes sim flow loop)
 volatile bool     g_core0_ready = false;
 volatile bool     g_core1_ready = false;
+uint32_t          g_tlm_dropped = 0;            // count of contended SensorFrame telemetry reads
 
 // -----------------------------------------------------------------------------
 //  Command / arm "inboxes" -- written by the sim OR by real binary frames,

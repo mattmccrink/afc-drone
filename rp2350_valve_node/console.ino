@@ -32,7 +32,7 @@ static const char* mode_name(CompMode m) {
 
 static void print_status() {
   Serial.printf(
-    "[st] src=%-7s arm=%d(live=%d) term=%d prim=%d | elig fc=%d sbus=%d sw=%d | comp=%-8s rpm=%5u | mdot=%.1f/%.1f g/s nvalid=%u%s%s | v=[%d %d %d %d %d %d] desat=%.2f/%.2f | cal=%s | hb=%lu\n",
+    "[st] src=%-7s arm=%d(live=%d) term=%d prim=%d | elig fc=%d sbus=%d sw=%d | comp=%-8s rpm=%5u | mdot=%.1f/%.1f g/s nvalid=%u%s%s | v=[%d %d %d %d %d %d] desat=%.2f/%.2f | cal=%s | hb=%lu drop=%lu\n",
     src_name(g_status.source), g_status.armed?1:0, g_status.arm_live?1:0, g_status.terminated?1:0, g_status.primary_present?1:0,
     arb_fc_seen_disarmed()?1:0, g_sbus_arm_seen_disarmed?1:0, g_sbus_arm?1:0,
     mode_name(g_status.comp_mode), g_status.rpm_target,
@@ -40,7 +40,7 @@ static void print_status() {
     g_status.flow_fallback ? " FALLBACK" : "", g_status.sensor_stale ? " STALE" : "",
     g_valve_dbg[0], g_valve_dbg[1], g_valve_dbg[2], g_valve_dbg[3], g_valve_dbg[4], g_valve_dbg[5],
     (double)g_alloc_s_rp, (double)g_alloc_s_yaw,
-    g_cal_from_flash ? "flash" : "default", (unsigned long)g_core1_heartbeat);
+    g_cal_from_flash ? "flash" : "default", (unsigned long)g_core1_heartbeat),(unsigned long)g_tlm_dropped;
 }
 
 static void print_help() {
