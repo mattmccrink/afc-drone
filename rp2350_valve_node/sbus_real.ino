@@ -44,7 +44,7 @@
 #define SBUS_CH_PITCH        1
 #define SBUS_CH_THROTTLE     2
 #define SBUS_CH_YAW          3
-#define SBUS_CH_ARM          4    // VALIDATE: 2-position arm switch; high (> MID) = arm intent
+#define SBUS_CH_ARM          7    // VALIDATE: 2-position arm switch; high (> MID) = arm intent
 
 // SBUS raw endpoints (standard Futaba scaling).
 #define SBUS_RAW_MIN  172

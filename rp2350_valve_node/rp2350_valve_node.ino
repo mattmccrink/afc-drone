@@ -66,6 +66,9 @@ bool g_sbus_failsafe  = false;         // simulated SBUS failsafe flag
 bool g_sbus_framelost = false;         // simulated SBUS frame-lost flag
 bool g_sbus_arm       = false;         // SBUS arm-switch state (clean-frame gated; SBUS source only)
 bool g_sbus_arm_seen_disarmed = false; // per-source boot latch: seen a clean disarmed SBUS frame once
+int16_t g_valve_dbg[VALVE_COUNT] = {0}; // last published valve poses (core-0 console/debug)
+float   g_alloc_s_rp  = 1.0f;          // last roll/pitch desaturation scale (1.0 = no clip)
+float   g_alloc_s_yaw = 1.0f;          // last yaw desaturation scale (1.0 = no clip)
 
 // Fault injection (console-set on core 0; read by the core-1 sensor sim).
 volatile bool g_fault_valve[VALVE_COUNT] = { false };

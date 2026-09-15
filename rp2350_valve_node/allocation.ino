@@ -111,6 +111,7 @@ void allocation_update(uint32_t now) {
   if (g_status.source == SRC_SAFE || g_status.terminated) {
     // No live command source, or a latched termination: park at the safe pose.
     for (int v = 0; v < VALVE_COUNT; ++v) out.valve[v] = ALLOC_SAFE_POSE[v];
+    g_alloc_s_rp = g_alloc_s_yaw = 1.0f;     // desaturation n/a in SAFE
   } else {
     const StickInput& in = (g_status.source == SRC_PRIMARY) ? g_primary_in : g_sbus_in;
     const float tau[3]     = { in.roll, in.pitch, in.yaw };   // [-1,1]
@@ -137,9 +138,11 @@ void allocation_update(uint32_t now) {
     for (int v = 0; v < VALVE_COUNT; ++v) {
       float cmd = clampf(collective + s_rp*rpdelta[v] + s_yaw*ydelta[v], 0.0f, 1.0f);
       out.valve[v] = clamp_valve(cmd * VALVE_POS_MAX);
-    }
+    }  
   }
-
+  for (int v = 0; v < VALVE_COUNT; ++v) g_valve_dbg[v] = out.valve[v];  // core-0 console copy
+  out.stamp_ms = now;
+  g_valve_pub.end_write();
   out.stamp_ms = now;                 // core 1 uses this for staleness -> failsafe
   g_valve_pub.end_write();
 }
