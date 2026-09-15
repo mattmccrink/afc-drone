@@ -25,6 +25,7 @@ static uint32_t arb_last_advance_ms  = 0;
 static bool     arb_seen_disarmed    = false;
 static bool     arb_arm_init         = false;
 static uint32_t arb_safe_since       = 0;     // when SRC_SAFE began (0 = not in SAFE)
+static bool     s_ever_armed         = false; // armed at least once since boot -> gates terminate
 
 // Console hook: force a source, or pass "auto" (SRC_SAFE sentinel => release).
 void arbitration_force(Source s, bool force) {
@@ -153,7 +154,10 @@ void arbitration_update(uint32_t now) {
       // from whoever regains control (the seen-disarmed latches are reset so a
       // still-armed source that reconnects cannot silently re-power us mid-fall).
       if (arb_safe_since == 0) arb_safe_since = now;
-      if (!g_status.terminated && (now - arb_safe_since) >= SAFE_TERMINATE_MS) {
+      // Only terminate if we were EVER armed. A cold boot sitting in SAFE waiting
+      // for PRIMARY to come up has not "lost everything" -- it just hasn't started
+      // yet -- so it must NOT self-terminate before the FC link is even established.
+      if (s_ever_armed && !g_status.terminated && (now - arb_safe_since) >= SAFE_TERMINATE_MS) {
         g_status.terminated      = true;    // latched
         g_status.armed           = false;   // arm gates the compressor -> air OFF
         arb_seen_disarmed        = false;   // recovery needs a fresh positive disarm->arm
@@ -163,4 +167,6 @@ void arbitration_update(uint32_t now) {
       // through the debounce -- only a SUSTAINED total loss terminates.
       break;
   }
+
+  if (g_status.armed) s_ever_armed = true;   // latch: once armed, terminate is armed
 }
