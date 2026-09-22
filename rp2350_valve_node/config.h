@@ -30,6 +30,10 @@
 #define PIN_I2C_SDA        12   // Qwiic SDA  (RP2350 I2C0 SDA)
 #define PIN_I2C_SCL        13   // Qwiic SCL  (RP2350 I2C0 SCL)
 
+#define PIN_PI_TX   4          // GP4 -> Pi RXD (was PIN_TEENSY_TX)
+#define PIN_PI_RX   5          // GP5 <- Pi TXD (was PIN_TEENSY_RX)
+#define PI_BAUD     230400     // soldered single-ended run; CRC-protected, low-rate
+
 #define PIN_SBUS            6   // reversionary SBUS RX-B (PIO; simulated in alpha)
 
 #define PIN_OE_COANDA       7   // active-low output-enable, coanda servo bank

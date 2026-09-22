@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 bridge_node.py -- Pi ROS2 supervisor/bridge between MAVROS and the RP2350
-valve/sensor node over USB-CDC.
+valve/sensor node over Serial3.
 
   Pixhawk --MAVROS--> [THIS NODE] --serial(CMD,ARM)--> RP2350
   RP2350  --serial(CTRL_TLM,SENSOR_TLM)--> [THIS NODE] --> ROS2 topics --> rosbag
@@ -68,7 +68,7 @@ class BridgeNode(Node):
 
         # ---- parameters ----
         p = self.declare_parameter
-        self.port_name = p("serial_port", "/dev/ttyACM0").value
+        self.port_name = p("serial_port", "/dev/ttyAMA0").value
         self.torque_topic = p("torque_topic", "/fmu/out/vehicle_torque_setpoint").value
         self.thrust_topic = p("thrust_topic", "/fmu/out/vehicle_thrust_setpoint").value
 	# PX4 1.16+ publishes versioned messages under a _v1 suffix. vehicle_status
@@ -190,12 +190,10 @@ class BridgeNode(Node):
             self.get_logger().error("pyserial not installed (python3-serial).")
             return
         try:
-            self._ser = serial.Serial(self.port_name, baudrate=115200, timeout=0)
+            self._ser = serial.Serial(self.port_name, baudrate=230400, timeout=0)
             self.get_logger().info(f"opened {self.port_name}")
             if self.send_tlm_on:
-                # flip the tiny from text console into binary frame mode BEFORE
-                # streaming any binary frame, or the parser never sees them.
-                self._ser.write(b"tlm on\n")
+
         except Exception as e:  # noqa: BLE001
             self._ser = None
             self.get_logger().warn(f"serial open failed ({e}); will retry")

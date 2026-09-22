@@ -48,9 +48,9 @@ static void send_frame(uint8_t type, const uint8_t* payload, uint8_t len) {
     for (uint8_t k = 0; k < len; ++k) { c ^= payload[k]; for (int b=0;b<8;++b) c = (c&0x80)?(uint8_t)((c<<1)^0x07):(uint8_t)(c<<1); }
     cc = c;
   }
-  Serial.write(hdr, 6);
-  if (len) Serial.write(payload, len);
-  Serial.write(&cc, 1);
+  Serial2.write(hdr, 6);
+  if (len) Serial2.write(payload, len);
+  Serial2.write(&cc, 1);
 }
 
 // ---- inbound frame dispatch ----
@@ -110,16 +110,14 @@ static void parse_byte(uint8_t c) {
 void framing_setup() { rx_state = 0; }
 
 void framing_pump() {
-  while (Serial.available()) {
-    uint8_t c = (uint8_t)Serial.read();
-    if (g_binary_tlm) parse_byte(c);       // binary mode: feed the frame parser
-    else              console_feed_char(c); // text mode: feed the console line reader
-  }
+  // Pi link (binary frames) on Serial2 -- always framed
+  while (Serial2.available()) parse_byte((uint8_t)Serial2.read());
+  // Human console on USB -- always text
+  while (Serial.available()) console_feed_char((uint8_t)Serial.read());
 }
 
 // ---- telemetry out (25 Hz each, alternating) ----
 void tlm_service(uint32_t now) {
-  if (!g_binary_tlm) return;
   static uint32_t last = 0;
   static uint8_t  which = 0;
   if ((now - last) < (uint32_t)(1000 / (PI_TLM_EACH_HZ * 2))) return;   // ~20 ms -> 50/s total
