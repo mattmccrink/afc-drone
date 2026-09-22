@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>AFC Drone Dashboard</title>
+<!-- roslibjs (rosbridge client) + uPlot (fast streaming charts), from CDN -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/roslibjs/1.4.1/roslib.min.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.min.css"/>
+<script src="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.iife.min.js"></script>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --edge:#30363d; --ink:#e6edf3; --dim:#8b949e;
+    --ok:#3fb950; --warn:#d29922; --bad:#f85149; --accent:#58a6ff; --port:#58a6ff; --stbd:#f0883e;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:13px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  header{display:flex;gap:12px;align-items:center;padding:8px 12px;background:var(--panel);
+         border-bottom:1px solid var(--edge);flex-wrap:wrap}
+  header h1{font-size:14px;margin:0 8px 0 0;letter-spacing:.5px}
+  input{background:#0d1117;border:1px solid var(--edge);color:var(--ink);padding:4px 8px;
+        border-radius:6px;font:inherit;width:230px}
+  button{background:#21262d;border:1px solid var(--edge);color:var(--ink);padding:5px 12px;
+         border-radius:6px;font:inherit;cursor:pointer}
+  button:hover{border-color:var(--accent)}
+  .dot{width:10px;height:10px;border-radius:50%;display:inline-block;background:var(--bad)}
+  .dot.on{background:var(--ok)}
+  .grid{display:grid;grid-template-columns:1fr 1.1fr 1fr;gap:10px;padding:10px}
+  .panel{background:var(--panel);border:1px solid var(--edge);border-radius:8px;padding:10px}
+  .panel h2{font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--dim);
+            margin:0 0 8px}
+  .kv{display:flex;justify-content:space-between;padding:2px 0}
+  .kv b{font-weight:600}
+  .pill{padding:1px 8px;border-radius:10px;font-size:11px;font-weight:700}
+  .pill.ok{background:rgba(63,185,80,.15);color:var(--ok)}
+  .pill.warn{background:rgba(210,153,34,.15);color:var(--warn)}
+  .pill.bad{background:rgba(248,81,73,.15);color:var(--bad)}
+  .chart{margin-bottom:8px}
+  .bars{display:flex;flex-direction:column;gap:6px}
+  .bar{display:grid;grid-template-columns:60px 1fr 62px;align-items:center;gap:6px}
+  .bar .track{height:14px;background:#0d1117;border:1px solid var(--edge);border-radius:4px;overflow:hidden}
+  .bar .fill{height:100%;background:var(--accent);width:0}
+  .bar.invalid{opacity:.35}
+  .num{text-align:right}
+  svg text{fill:var(--ink);font:11px ui-monospace,monospace}
+  .stale{color:var(--warn)}
+</style>
+</head>
+<body>
+<header>
+  <h1>AFC&nbsp;DRONE</h1>
+  <span class="dot" id="link"></span><span id="linkTxt">disconnected</span>
+  <input id="url" value="ws://192.168.1.50:9090"/>
+  <button id="connect">Connect</button>
+  <span style="margin-left:auto"></span>
+  <span class="pill" id="armPill">ARM ?</span>
+  <span class="pill" id="srcPill">SRC ?</span>
+</header>
+
+<div class="grid">
+  <!-- LEFT: command charts -->
+  <div class="panel">
+    <h2>Torque command (roll / pitch / yaw)</h2>
+    <div class="chart" id="torqueChart"></div>
+    <h2>Thrust command</h2>
+    <div class="chart" id="thrustChart"></div>
+  </div>
+
+  <!-- CENTER: valve schematic (canard, top-down, nose up) -->
+  <div class="panel">
+    <h2>Valves &mdash; top-down (nose up)</h2>
+    <svg id="ac" viewBox="0 0 320 300" width="100%" height="300"></svg>
+    <div id="servoRow" style="margin-top:6px"></div>
+  </div>
+
+  <!-- RIGHT: pressures / mdot + health -->
+  <div class="panel">
+    <h2>Mass flow (g/s)</h2>
+    <div class="bars" id="mdotBars"></div>
+    <div class="kv" style="margin-top:6px"><b>total</b><span id="mdotTotal" class="num">--</span></div>
+    <h2 style="margin-top:12px">Upstream pressure (mbar)</h2>
+    <div class="bars" id="pupBars"></div>
+    <h2 style="margin-top:12px">Link / health</h2>
+    <div class="kv"><span>serial</span><span id="hSer">--</span></div>
+    <div class="kv"><span>ctrl / sensor Hz</span><span id="hHz">-- / --</span></div>
+    <div class="kv"><span>crc errors</span><span id="hCrc">--</span></div>
+    <div class="kv"><span>cmd fresh / arm fresh</span><span id="hFresh">-- / --</span></div>
+    <div class="kv"><span>arm counter</span><span id="hCtr">--</span></div>
+    <div class="kv"><span>node offset (ms)</span><span id="hOff">--</span></div>
+  </div>
+</div>
+
+<script>
+// ---------------------------------------------------------------------------
+// CONFIG -- adjust here if topic names / message types / scaling differ.
+// ---------------------------------------------------------------------------
+const CFG = {
+  topics: {
+    torque: {name:"/fmu/out/vehicle_torque_setpoint", type:"px4_msgs/msg/VehicleTorqueSetpoint", throttle:50},
+    thrust: {name:"/fmu/out/vehicle_thrust_setpoint", type:"px4_msgs/msg/VehicleThrustSetpoint", throttle:50},
+    ctrl:   {name:"/afc/ctrl_tlm",   type:"afc_bridge_msgs/msg/ValveNodeCtrl",   throttle:50},
+    sensor: {name:"/afc/sensor_tlm", type:"afc_bridge_msgs/msg/ValveNodeSensor", throttle:50},
+    health: {name:"/afc/health",     type:"afc_bridge_msgs/msg/ValveNodeHealth", throttle:200},
+  },
+  valveAbsMax: 1000,     // |valve[]| full-scale for fill (int16 aero-intent units)
+  window: 300,           // samples kept in the strip charts (~15s @20Hz)
+  // Valve layout: index 0-5 = valves 1-6. Canard aircraft, top-down, nose UP.
+  //   1(idx0) port-outboard, 2(idx1) left-inboard, 3(idx2) right-inboard,
+  //   4(idx3) stbd-outboard, 5(idx4) fwd-left canard, 6(idx5) fwd-right canard.
+  valvePos: [
+    {x:40,  y:220, label:"1"},   // left wing, port outboard
+    {x:110, y:210, label:"2"},   // left wing, inboard
+    {x:210, y:210, label:"3"},   // right wing, inboard
+    {x:280, y:220, label:"4"},   // right wing, stbd outboard
+    {x:120, y:80,  label:"5"},   // forward-left canard
+    {x:200, y:80,  label:"6"},   // forward-right canard
+  ],
+};
+
+// ---------------------------------------------------------------------------
+// Aircraft schematic (SVG): fuselage + canard + main wing + 6 valve nodes.
+// ---------------------------------------------------------------------------
+const ac = document.getElementById("ac");
+function svg(tag,attrs){const e=document.createElementNS("http://www.w3.org/2000/svg",tag);
+  for(const k in attrs)e.setAttribute(k,attrs[k]);return e;}
+// planform hints
+ac.appendChild(svg("line",{x1:160,y1:40,x2:160,y2:270,stroke:"#30363d","stroke-width":8,"stroke-linecap":"round"})); // fuselage
+ac.appendChild(svg("line",{x1:30,y1:225,x2:290,y2:225,stroke:"#30363d","stroke-width":6,"stroke-linecap":"round"})); // main wing
+ac.appendChild(svg("line",{x1:110,y1:85,x2:210,y2:85,stroke:"#30363d","stroke-width":5,"stroke-linecap":"round"}));  // canard
+ac.appendChild(svg("circle",{cx:160,cy:36,r:6,fill:"#30363d"})); // nose
+ac.appendChild(svg("text",{x:6,y:232,fill:"#8b949e"},)).textContent="PORT";
+const stbdT=svg("text",{x:296,y:232,fill:"#8b949e","text-anchor":"end"});stbdT.textContent="STBD";ac.appendChild(stbdT);
+const valveEls=[];
+CFG.valvePos.forEach((v,i)=>{
+  const c=svg("circle",{cx:v.x,cy:v.y,r:16,fill:"#0d1117",stroke:"#30363d","stroke-width":2});
+  const t=svg("text",{x:v.x,y:v.y+4,"text-anchor":"middle","font-weight":"700"});t.textContent=v.label;
+  const val=svg("text",{x:v.x,y:v.y+30,"text-anchor":"middle",fill:"#8b949e"});val.textContent="--";
+  ac.appendChild(c);ac.appendChild(t);ac.appendChild(val);
+  valveEls.push({c,val});
+});
+function setValve(i,value,valid){
+  const el=valveEls[i]; if(!el)return;
+  const f=Math.max(-1,Math.min(1,value/CFG.valveAbsMax));
+  // bipolar color: port-blue negative, stbd-orange positive; radius grows with |f|
+  const col = !valid ? "#30363d" : (f<0 ? getCSS("--port") : getCSS("--stbd"));
+  el.c.setAttribute("fill", col);
+  el.c.setAttribute("fill-opacity", valid ? (0.25+0.65*Math.abs(f)).toFixed(2) : "0.15");
+  el.c.setAttribute("stroke", valid ? col : "#30363d");
+  el.val.textContent = valid ? Math.round(value) : "x";
+}
+function getCSS(v){return getComputedStyle(document.documentElement).getPropertyValue(v).trim();}
+
+// ---------------------------------------------------------------------------
+// Strip charts (uPlot). Rolling buffers.
+// ---------------------------------------------------------------------------
+function makeChart(el,labels,colors){
+  const data=[[]]; labels.forEach(()=>data.push([]));
+  const series=[{}].concat(labels.map((l,i)=>({label:l,stroke:colors[i],width:1.5})));
+  const opts={width:el.clientWidth||360,height:130,series,
+    axes:[{stroke:"#8b949e"},{stroke:"#8b949e"}],
+    scales:{x:{time:false}},legend:{show:true},cursor:{show:false}};
+  const u=new uPlot(opts,data,el);
+  return {u,data};
+}
+const torque=makeChart(document.getElementById("torqueChart"),
+  ["roll","pitch","yaw"],["#f85149","#3fb950","#58a6ff"]);
+const thrust=makeChart(document.getElementById("thrustChart"),
+  ["thrust"],["#d29922"]);
+let t0=performance.now()/1000;
+function push(ch,vals){
+  const t=performance.now()/1000 - t0;
+  ch.data[0].push(t); vals.forEach((v,i)=>ch.data[i+1].push(v));
+  if(ch.data[0].length>CFG.window) ch.data.forEach(a=>a.shift());
+  ch.u.setData(ch.data);
+}
+
+// ---------------------------------------------------------------------------
+// Bar rows (mdot, pressure) built once, updated per message.
+// ---------------------------------------------------------------------------
+function buildBars(container,n,color){
+  const rows=[];
+  for(let i=0;i<n;i++){
+    const row=document.createElement("div");row.className="bar";
+    row.innerHTML=`<span>valve ${i+1}</span><div class="track"><div class="fill" style="background:${color}"></div></div><span class="num">--</span>`;
+    container.appendChild(row);
+    rows.push({row,fill:row.querySelector(".fill"),num:row.querySelector(".num")});
+  }
+  return rows;
+}
+const mdotRows=buildBars(document.getElementById("mdotBars"),6,"#3fb950");
+const pupRows =buildBars(document.getElementById("pupBars"),6,"#58a6ff");
+function setBar(rows,i,value,max,valid,unit){
+  const r=rows[i]; if(!r)return;
+  r.row.classList.toggle("invalid",!valid);
+  r.fill.style.width=Math.max(0,Math.min(100,100*value/max))+"%";
+  r.num.textContent=valid?value.toFixed(1):"x";
+}
+
+// ---------------------------------------------------------------------------
+// rosbridge connection + subscriptions (SUBSCRIBE-ONLY -- no publishers).
+// ---------------------------------------------------------------------------
+let ros=null;
+function connect(){
+  if(ros){try{ros.close();}catch(e){}}
+  const url=document.getElementById("url").value.trim();
+  ros=new ROSLIB.Ros({url});
+  const dot=document.getElementById("link"),txt=document.getElementById("linkTxt");
+  ros.on("connection",()=>{dot.classList.add("on");txt.textContent="connected "+url;subscribe();});
+  ros.on("error",()=>{dot.classList.remove("on");txt.textContent="error";});
+  ros.on("close",()=>{dot.classList.remove("on");txt.textContent="disconnected";});
+}
+function sub(t){return new ROSLIB.Topic({ros,name:t.name,messageType:t.type,
+  throttle_rate:t.throttle,queue_length:1,queue_size:1});}
+function subscribe(){
+  sub(CFG.topics.torque).subscribe(m=>push(torque,[m.xyz[0],m.xyz[1],m.xyz[2]]));
+  sub(CFG.topics.thrust).subscribe(m=>push(thrust,[m.xyz[2]]));   // z-axis thrust
+  sub(CFG.topics.ctrl).subscribe(onCtrl);
+  sub(CFG.topics.sensor).subscribe(onSensor);
+  sub(CFG.topics.health).subscribe(onHealth);
+}
+
+let lastValid=[true,true,true,true,true,true];
+function onSensor(m){
+  lastValid = m.valid;
+  for(let i=0;i<6;i++){
+    setBar(mdotRows,i,m.mdot[i],50,m.valid[i]);      // 50 g/s full-scale (tweak)
+    setBar(pupRows,i,m.p_up[i],1200,m.valid[i]);     // ~1200 mbar full-scale
+  }
+  document.getElementById("mdotTotal").textContent=m.mdot_total.toFixed(1);
+}
+function onCtrl(m){
+  for(let i=0;i<6;i++) setValve(i, m.valve[i], lastValid[i]);
+  document.getElementById("servoRow").textContent =
+    "servo us: "+Array.from(m.servo_us).join(" ");
+  const arm=document.getElementById("armPill");
+  arm.textContent = m.armed?"ARMED":"DISARMED";
+  arm.className = "pill "+(m.armed?"bad":"ok");   // armed = red (hot), disarmed = green
+  const srcMap=["PRIMARY","SBUS","SAFE"];
+  const src=document.getElementById("srcPill");
+  src.textContent = "SRC "+(srcMap[m.source]||m.source);
+  src.className = "pill "+(m.source===0?"ok":m.source===1?"warn":"bad");
+}
+function onHealth(m){
+  document.getElementById("hSer").innerHTML = m.serial_connected
+    ? '<span class="pill ok">up</span>' : '<span class="pill bad">DOWN</span>';
+  document.getElementById("hHz").textContent = m.ctrl_hz.toFixed(1)+" / "+m.sensor_hz.toFixed(1);
+  const crc=document.getElementById("hCrc");
+  crc.textContent=m.crc_errors; crc.className = m.crc_errors>0 ? "stale":"";
+  document.getElementById("hFresh").innerHTML =
+    pill(m.cmd_fresh)+" "+pill(m.arm_fresh);
+  document.getElementById("hCtr").textContent=m.arm_counter;
+  document.getElementById("hOff").textContent=m.tlm_offset_ms;
+}
+function pill(b){return '<span class="pill '+(b?"ok":"bad")+'">'+(b?"y":"n")+'</span>';}
+
+document.getElementById("connect").onclick=connect;
+// auto-connect on load with whatever URL is in the box
+window.addEventListener("load",connect);
+</script>
+</body>
+</html>
