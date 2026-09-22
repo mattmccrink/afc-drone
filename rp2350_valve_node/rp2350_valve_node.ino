@@ -107,6 +107,8 @@ void arbitration_update(uint32_t now);     // -> g_status.source, .armed, .arm_l
 void allocation_setup();                   // precompute the pseudo-inverse (core 0)
 void allocation_update(uint32_t now);      // -> publishes ValveCmd
 void compressor_update(uint32_t now);      // -> rpm, Teensy stream, g_current_rpm_cmd
+void teensy_rx_service(uint32_t now);
+void teensy_tlm_print(uint32_t now);
 
 void sensors_setup();
 void sensors_tick(uint32_t tick);          // core 1
@@ -131,10 +133,9 @@ void setup() {
   sbus_real_setup();
   #endif
 
-  // Teensy (compressor) link on uart1 / Serial2, GP4 TX / GP5 RX.
-  Serial2.setTX(PIN_TEENSY_TX);
-  Serial2.setRX(PIN_TEENSY_RX);
-  Serial2.begin(TEENSY_BAUD);
+// GP0 = TX, GP1 = RX are Serial1 defaults — no setTX/setRX needed
+  Serial1.setFIFOSize(64);   // must be BEFORE begin(); default is too small for 64-B frames
+  Serial1.begin(TEENSY_BAUD);   // TEENSY_BAUD = 921600
 
   pinMode(PIN_USER_BTN, INPUT_PULLUP);   // BOOT/USER, active low
 
@@ -186,6 +187,8 @@ void loop() {
   arbitration_update(now);      // choose source; enforce arm-token liveness
   allocation_update(now);       // mixing matrix -> 6 valves -> publish to core 1
   compressor_update(now);       // outer loop / direct / fallback -> Teensy stream
+  teensy_rx_service(now);
+  //teensy_tlm_print(now);   // remove once verified; or gate behind a 'mon' flag
 
   tlm_service(now);             // binary telemetry out (if 'tlm on')
   console_service(now);         // human status line (if 'mon on')

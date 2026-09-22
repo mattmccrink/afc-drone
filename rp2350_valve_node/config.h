@@ -20,7 +20,7 @@
 #define USE_REAL_PRIMARY 1   // 0 = simulated Pi command+arm (sweep), 1 = real FT_CMD/FT_ARM only
 #define USE_REAL_I2C     1     // 0 = simulated sensors/servos, no Wire traffic
 #define USE_REAL_SBUS    1     // 0 = simulated SBUS source, PIO program stubbed
-#define USE_REAL_TEENSY  1     // 1 = actually emit Host_comm frames on Serial2
+#define USE_REAL_TEENSY  1     // 1 = actually emit Host_comm frames on Serial1
                                //     (harmless with nothing attached)
 
 // -----------------------------------------------------------------------------
@@ -29,9 +29,6 @@
 //  Single merged I2C bus lives on the Qw/ST (Qwiic/STEMMA) header = I2C0.
 #define PIN_I2C_SDA        12   // Qwiic SDA  (RP2350 I2C0 SDA)
 #define PIN_I2C_SCL        13   // Qwiic SCL  (RP2350 I2C0 SCL)
-
-#define PIN_TEENSY_TX       4   // -> Motor Teensy  (uart1 / Serial2 TX)
-#define PIN_TEENSY_RX       5   // <- Motor Teensy  (uart1 / Serial2 RX)
 
 #define PIN_SBUS            6   // reversionary SBUS RX-B (PIO; simulated in alpha)
 
@@ -177,7 +174,7 @@
 // -----------------------------------------------------------------------------
 //  Teensy (compressor) link -- reuse teensyshot Host_comm format & magic
 // -----------------------------------------------------------------------------
-#define TEENSY_BAUD           115200
+#define TEENSY_BAUD           921600
 #define TEENSY_MAGIC      0x43305735  // "teensyshot" magic, both directions
 #define TEENSY_STREAM_HZ         50   // >=25 Hz to satisfy the ~40 ms dead-man;
                                       //   resend static values, never gate on change
@@ -238,6 +235,7 @@
 #define FT_ARM               0x02   // Pi -> node : slow arm token (1 Hz + on-change)
 #define FT_CTRL_TLM          0x81   // node -> Pi : control telemetry (25 Hz)
 #define FT_SENSOR_TLM        0x82   // node -> Pi : sensor telemetry (25 Hz)
+#define FT_COMP_TLM          0x83    // node -> Pi : measured compressor telemetry (ESC)
 #define PI_TLM_EACH_HZ         25   // each of the two out-frames at this rate
 
 // -----------------------------------------------------------------------------

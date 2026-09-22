@@ -27,6 +27,9 @@ float     ESCPID_f[ESCPID_NB_ESC];
 float     ESCPID_Min[ESCPID_NB_ESC];
 float     ESCPID_Max[ESCPID_NB_ESC];
 
+//Add memory for serial transmission
+static uint8_t serial3_rx_buf[512];
+
 ESCPIDcomm_struct_t ESCPID_comm = {
                                   ESCPID_COMM_MAGIC,
                                   {},
@@ -56,11 +59,11 @@ int ESCPID_comm_update( void ) {
   static int          in_cnt = 0;
   
   ret = 0;
-  
+
   // Read all incoming bytes available until incoming structure is complete
-  while(  ( Serial.available( ) > 0 ) && 
+  while(  ( Serial3.available( ) > 0 ) && 
           ( in_cnt < (int)sizeof( Host_comm ) ) )
-    ptin[in_cnt++] = Serial.read( );
+    ptin[in_cnt++] = Serial3.read( );
   
   // Check if a complete incoming packet is available
   if ( in_cnt == (int)sizeof( Host_comm ) ) {
@@ -86,15 +89,18 @@ int ESCPID_comm_update( void ) {
     if ( Host_comm.magic != ESCPID_COMM_MAGIC ) {
     
       // Flush input buffer
-      while ( Serial.available( ) )
-        Serial.read( );
+      while ( Serial3.available( ) )
+        Serial3.read( );
     
       ret = ESCPID_ERROR_MAGIC;
     }
     else {
     
-      // Valid packet received
-      
+      // Valid packet received, debug to USB port
+      Serial.print("rx magic=");
+      Serial.print(Host_comm.magic, HEX);
+      Serial.print(" RPM_r0=");
+      Serial.println(Host_comm.RPM_r[0]);
       // Reset the communication watchdog
       ESCPID_comm_wd = 0;
       
@@ -134,10 +140,8 @@ int ESCPID_comm_update( void ) {
       }
       
       // Send data structure to host
-      Serial.write( ptout, sizeof( ESCPID_comm ) );
+      Serial3.write( ptout, sizeof( ESCPID_comm ) );
       
-      // Force immediate transmission
-      Serial.send_now( );
     }
   }
 
@@ -152,6 +156,9 @@ void setup() {
 
   // Initialize USB serial link
   Serial.begin( ESCPID_USB_UART_SPEED );
+  Serial3.addMemoryForRead(serial3_rx_buf, sizeof(serial3_rx_buf));
+  Serial3.begin(921600);
+  
 
   // Initialize PID gains
   for ( i = 0; i < ESCPID_NB_ESC; i++ ) {

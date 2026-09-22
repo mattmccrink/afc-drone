@@ -9,6 +9,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ValveNodeCtrl.msg"
   "msg/ValveNodeSensor.msg"
   "msg/ValveNodeHealth.msg"
+  "msg/ValveNodeComp.msg"
   DEPENDENCIES std_msgs
 )
 

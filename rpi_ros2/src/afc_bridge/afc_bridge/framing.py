@@ -27,6 +27,7 @@ FT_CMD = 0x01                   # Pi -> node : fast command (6x int16)
 FT_ARM = 0x02                   # Pi -> node : slow arm token {state:u8, counter:u32}
 FT_CTRL_TLM = 0x81              # node -> Pi : control telemetry
 FT_SENSOR_TLM = 0x82            # node -> Pi : sensor telemetry
+FT_COMP_TLM = 0x83              # node -> Pi : measured compressor telemetry
 
 # ---- CMD field scaling (mirror on_frame() in framing.ino) -------------------
 # payload = 6x int16 LE at offsets 0,2,4,6,8,10:
@@ -176,7 +177,7 @@ SERVO_COUNT = 12
 CTRL_TLM_LEN = 43
 CTRL_TLM_LEN_EXT = 47
 SENSOR_TLM_LEN = 56
-
+COMP_TLM_LEN = 13
 
 def decode_ctrl_tlm(payload: bytes) -> dict:
     if len(payload) < CTRL_TLM_LEN:
@@ -214,3 +215,13 @@ def decode_sensor_tlm(payload: bytes) -> dict:
     return dict(p_up=p_up, p_lo=p_lo, t_die=t_die, mdot=mdot,
                 mdot_total=mdot_total / 10.0, valid=valid,
                 node_stamp_ms=node_stamp_ms)
+
+def decode_comp_tlm(payload: bytes) -> dict:
+    if len(payload) < COMP_TLM_LEN:
+        raise ValueError(f"COMP_TLM short: {len(payload)} < {COMP_TLM_LEN}")
+    volt_cv, amp_ca, rpm10, temp_c, err, ok = \
+        struct.unpack_from("<HHhBbB", payload, 0)
+    (node_ms,) = struct.unpack_from("<I", payload, 9)
+    return dict(volt=volt_cv / 100.0, amp=amp_ca / 100.0,
+                rpm=rpm10 * 10, temp_c=temp_c, err=err,
+                tlm_ok=bool(ok), node_stamp_ms=node_ms)

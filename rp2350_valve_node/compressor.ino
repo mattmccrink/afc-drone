@@ -46,11 +46,14 @@ static void teensy_stream(int16_t rpm10) {
   for (int s = 0; s < TEENSY_NB_SLOTS; ++s) put_u16(f, i, (s==0)? TEENSY_DEF_D:0);  // PID_D
   for (int s = 0; s < TEENSY_NB_SLOTS; ++s) put_u16(f, i, (s==0)? TEENSY_DEF_F:0);  // PID_f
   // i == 64
+  uint32_t n=0;
 #if USE_REAL_TEENSY
-  if (Serial2.availableForWrite() >= 64) Serial2.write(f, sizeof(f));
+  n = Serial1.write(f, sizeof(f));
 #else
   (void)f;
 #endif
+
+
 }
 
 void compressor_update(uint32_t now) {
@@ -153,5 +156,16 @@ void compressor_update(uint32_t now) {
       teensy_stream((int16_t)lroundf(comp_rpm / 10.0f));   // firmware units: 10 rpm
     }
   }
+
+#define LINK_TEST true
   // else: no frames -> Teensy dead-man (~40-80 ms) stops the motor. This IS the stop.
+#if LINK_TEST   // bench link bring-up ONLY -- remove before flight
+  if (!want_run) {                      // only when the real path is idle
+    if ((now - comp_last_stream_ms) >= (1000 / TEENSY_STREAM_HZ)) {
+      comp_last_stream_ms = now;
+      teensy_stream(0);                 // hard zero -- can never command spin
+    }
+  }
+#endif
+
 }

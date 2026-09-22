@@ -51,7 +51,7 @@ try:
 except Exception:  # pragma: no cover - present at runtime once px4_msgs is built
     VehicleTorqueSetpoint = VehicleThrustSetpoint = VehicleStatus = OffboardControlMode = None
 
-from afc_bridge_msgs.msg import ValveNodeCtrl, ValveNodeSensor, ValveNodeHealth
+from afc_bridge_msgs.msg import ValveNodeCtrl, ValveNodeSensor, ValveNodeHealth, ValveNodeComp
 
 _MODE_STR = {0: "DISARMED", 1: "PRIMARY_ARMED", 2: "SBUS_REVERSION",
              3: "SAFE_HOLD", 4: "TERMINATED"}
@@ -133,7 +133,9 @@ class BridgeNode(Node):
         self._sensor_pub = self.create_publisher(ValveNodeSensor, self.sensor_out, 10)
         self._health_pub = self.create_publisher(ValveNodeHealth, self.health_out, 10)
         self._keepalive_pub = self.create_publisher(OffboardControlMode, "/fmu/in/offboard_control_mode",QoSPresetProfiles.SENSOR_DATA.value)
-
+        self.comp_out  = p("comp_topic", "/afc/compressor").value
+        self._comp_pub = self.create_publisher(ValveNodeComp, self.comp_out, 10)
+        self._comp_count = 0    # for health hz, if you extend ValveNodeHealth
         # ---- subscribers ----
         # SENSOR_DATA QoS = best-effort/volatile/keep-last, which matches BOTH
         # MAVROS and PX4's uXRCE-DDS publishers. A default (reliable) QoS here is
@@ -265,7 +267,8 @@ class BridgeNode(Node):
                 self._publish_ctrl(fr.payload)
             elif fr.type == F.FT_SENSOR_TLM:
                 self._publish_sensor(fr.payload)
-
+            elif fr.type == F.FT_COMP_TLM:
+                self._publish_comp(fr.payload)
     # ------------------------------------------------------------- publishing
     def _stamp(self) -> Header:
         h = Header()
@@ -328,7 +331,25 @@ class BridgeNode(Node):
                 or abs(raw - self._tlm_offset0_ms) > 2_000_000_000):
             self._tlm_offset0_ms = raw
         self._tlm_offset_ms = raw - self._tlm_offset0_ms
-
+    
+    def _publish_comp(self, payload: bytes):
+        try:
+            d = F.decode_comp_tlm(payload)
+        except ValueError as e:
+            self.get_logger().warn(str(e))
+            return
+        m = ValveNodeComp()
+        m.header = self._stamp()
+        m.volt = float(d["volt"])
+        m.amp = float(d["amp"])
+        m.rpm = int(d["rpm"])
+        m.temp_c = int(d["temp_c"])
+        m.err = int(d["err"])
+        m.tlm_ok = bool(d["tlm_ok"])
+        m.node_stamp_ms = int(d["node_stamp_ms"])
+        self._comp_pub.publish(m)
+        self._comp_count += 1
+        self._frames_ok += 1
     # ---------------------------------------------------------------- health
     def _health_timer(self):
         now = time.monotonic()

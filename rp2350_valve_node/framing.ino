@@ -170,4 +170,18 @@ void tlm_service(uint32_t now) {
     send_frame(FT_SENSOR_TLM, pl, (uint8_t)i);
   }
   which ^= 1;
+    // ---- COMP_TLM: measured compressor telemetry, own 25 Hz cadence ----
+  static uint32_t last_comp = 0;
+  if ((now - last_comp) >= (uint32_t)(1000 / PI_TLM_EACH_HZ)) {
+    last_comp = now;
+    uint8_t cp[16]; int j = 0;
+    fput_u16(cp, j, g_comp.volt_cv);
+    fput_u16(cp, j, g_comp.amp_ca);
+    fput_i16(cp, j, g_comp.rpm10);
+    fput_u8 (cp, j, g_comp.temp_c);
+    fput_u8 (cp, j, (uint8_t)g_comp.err);   // i8 on wire, cast back on Pi
+    fput_u8 (cp, j, g_comp.ok ? 1 : 0);
+    fput_u32(cp, j, now);
+    send_frame(FT_COMP_TLM, cp, (uint8_t)j);   // j == 13
+  }
 }

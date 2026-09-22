@@ -27,7 +27,7 @@ record is `rp2350_valve_node_architecture.md`.
 
 Simulated (flip to real later via the `USE_REAL_*` switches in `config.h`):
 sensors, servos/PCA9685, and SBUS (its inverted-8E2 PIO decoder is documented as
-a stub in `sbus_sim.ino`). The Teensy stream is emitted for real on `Serial2`.
+a stub in `sbus_sim.ino`). The Teensy stream is emitted for real on `Serial1`.
 
 ---
 

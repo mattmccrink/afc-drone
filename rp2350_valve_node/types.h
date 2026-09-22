@@ -70,6 +70,19 @@ struct NodeStatus {
   bool     terminated      = false;      // latched flight-termination (total comms loss)
 };
 
+// Measured compressor telemetry, latched from the Motor Teensy's ESCPID_comm.
+// Defined once in teensy_rx.ino; read by compressor_update, framing, console.
+struct CompTlm {
+  bool     ok      = false;   // fresh reply within the stale window
+  uint16_t volt_cv = 0;       // pack voltage, 0.01 V
+  uint16_t amp_ca  = 0;       // ESC current, 0.01 A
+  int16_t  rpm10   = 0;       // mechanical rpm, units of 10 rpm
+  int8_t   err     = 0;       // ESCCMD err code (0 ok, -10 TLM_LOST)
+  uint8_t  temp_c  = 0;       // ESC temperature, deg C
+  uint32_t tlm_ms  = 0;       // millis() of last good frame
+};
+extern CompTlm g_comp;        // declaration only -- definition lives in teensy_rx.ino
+
 // One physical MS5837 behind the mux tree: its mux, channel, and which
 // (valve, role) it serves. The real sensor path (sensors.ino) walks a table of
 // these; the mapping is data, so open decision #1 is an edit, not a rewrite.
