@@ -192,7 +192,6 @@ class BridgeNode(Node):
         try:
             self._ser = serial.Serial(self.port_name, baudrate=230400, timeout=0)
             self.get_logger().info(f"opened {self.port_name}")
-            if self.send_tlm_on:
 
         except Exception as e:  # noqa: BLE001
             self._ser = None
