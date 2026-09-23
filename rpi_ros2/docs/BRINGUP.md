@@ -3,6 +3,8 @@
 > **CURRENT ARCHITECTURE: all-DDS (no MAVROS).** The dual-stack sections below
 > are historical; see **Appendix B** for the current command path, DDS bring-up,
 > and the #25873 keep-alive. Read Appendix B first.
+> **Ports (current):** FC = `/dev/serial0` (`ttyAMA0`, direct PL011, no FTDI);
+> Tiny = `uart3` → `/dev/ttyAMA1`. USB/`ttyACM*`/`ttyUSB*` references below are history.
 
 
 Stand up the Pi ROS2 bridge between a PX4 flight controller and the RP2350
@@ -170,7 +172,8 @@ ros2 topic echo /afc/ctrl_tlm                  # valve[] tracks commanded roll
   output — near-zero until armed in a mode that runs it. Not a bug.
 - **Arm fail-safe:** stop the state stream (or `fake_mavros.py --drop-arm-after 8`)
   and watch `/afc/health`: `arm_fresh`→false immediately, `arm_counter` freezes,
-  `last_armed`→false ~10 s later (powered-reversion window).
+  after ~10 s the Tiny reverts to SBUS if usable (pilot governs); with no SBUS it
+  holds its state on PRIMARY — a stale token never disarms by itself.
 
 ---
 
@@ -197,24 +200,28 @@ ros2 topic echo /afc/ctrl_tlm                  # valve[] tracks commanded roll
 
 ## 7. Reference — topics & params
 
-**Subscribes:** `/mavros/state` (arm), `/fmu/out/vehicle_torque_setpoint`,
+**Subscribes:** `/fmu/out/vehicle_status_v1` (arm), `/fmu/out/vehicle_torque_setpoint`,
 `/fmu/out/vehicle_thrust_setpoint` (command).
 **Publishes:** `/afc/ctrl_tlm` (`ValveNodeCtrl`), `/afc/sensor_tlm`
-(`ValveNodeSensor`), `/afc/health` (`ValveNodeHealth`).
+(`ValveNodeSensor`), `/afc/compressor` (`ValveNodeComp`), `/afc/health`
+(`ValveNodeHealth`).
 
 | Param | Default | Note |
 |---|---|---|
-| `serial_port` | `/dev/ttyACM0` | USB-CDC to the tiny; prefer a by-id path |
+| `serial_port` | `/dev/ttyAMA1` | Tiny on Pi uart3 (GPIO4/5); never `ttyAMA0` |
+| `forbidden_ports` | `[/dev/serial0, /dev/ttyAMA0]` | the FC DDS UART; bridge refuses to open |
+| `agent_port` | `""` | appended to `forbidden_ports` (afc_system passes `agent_dev`) |
 | `torque_topic` | `/fmu/out/vehicle_torque_setpoint` | r/p/y demand |
 | `thrust_topic` | `/fmu/out/vehicle_thrust_setpoint` | thrust demand |
-| `state_topic` | `/mavros/state` | arm source |
+| `status_topic` | `/fmu/out/vehicle_status_v1` | arm source (versioned in PX4 1.16+) |
 | `thrust_sign` | `-1.0` | FRD z→throttle sign; **[CONFIRM]** on hardware |
 | `cmd_rate_hz` | `50.0` | CMD forward rate (setpoints arrive ~250 Hz; 5:1 decimation) |
 | `cmd_stale_after_s` | `0.1` | stop forwarding if newest setpoint ages past this |
 | `mdot_target_gps` | `40.0` | constant for now; future airspeed-driven CMU input |
 | `arm_heartbeat_hz` | `1.0` | FT_ARM cadence (+ on-change) |
-| `arm_stale_after_s` | `0.5` | stop advancing the arm counter if `/mavros/state` ages past this |
-| `send_tlm_handshake` | `true` | send `tlm on\n` on connect (alpha boots in text mode) |
+| `arm_stale_after_s` | `0.5` | stop advancing the arm counter if vehicle_status ages past this |
+
+(`send_tlm_handshake` removed: the Tiny's Pi link is always framed.)
 
 **Command freshness:** keyed on the NEWER of torque/thrust (both ride one DDS
 client at 250 Hz; a one-topic stall is unlikely). For strict both-fresh, track
@@ -299,7 +306,9 @@ so the Pi↔FC link carries only DDS telemetry — one link, one middleware.
 - ARM = `vehicle_status.arming_state == ARMING_STATE_ARMED` (strict; the tiny does
   no failsafe reasoning — the FC flips arming_state and it propagates).
 
-**Transport:** serial, FTDI USB↔**TELEM2** (= `/dev/ttyS2` on Pixhawk 6C) @921600.
+**Transport:** serial, **TELEM2** (= `/dev/ttyS2` on Pixhawk 6C) direct-wired to the
+Pi PL011 (`serial0` → `ttyAMA0`, GPIO14/15) @921600. *(Historically an FTDI; the
+FTDI notes below are kept for reference only — it has been removed.)*
 Not the FMU-USB (that defaults to MAVLink; MAVLink and DDS can't share a CDC).
 
 **Firmware prereqs (one rebuild):**
@@ -331,9 +340,9 @@ echo 1 | sudo tee /sys/bus/usb-serial/devices/ttyUSB0/latency_timer   # verify: 
 **Bring-up order (order matters):**
 ```bash
 # 1. agent (owns the serial port) -- foreground while debugging:
-MicroXRCEAgent serial --dev /dev/serial/by-id/usb-...TELEM2-FTDI... -b 921600
+MicroXRCEAgent serial --dev /dev/serial0 -b 921600
 # 2. bridge node -- the keep-alive only fires with the node running:
-ros2 run afc_bridge bridge_node --ros-args -p serial_port:=/dev/serial/by-id/usb-...RP2350...
+ros2 run afc_bridge bridge_node --ros-args -p serial_port:=/dev/ttyAMA1
 # 3. verify:
 nsh> uxrce_dds_client status        # Running, connected; Payload rx != 0 (keep-alive)
 ros2 topic hz /fmu/out/vehicle_torque_setpoint   # stable ~25 Hz, max ~0.07s (NOT 1.0s)

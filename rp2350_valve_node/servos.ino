@@ -2,21 +2,22 @@
 //  servos.ino  --  Curve-fit expansion + PCA9685 servo output  (core 1)
 //
 //  6 valve positions -> 12 servo microseconds via a per-servo cubic with a
-//  per-valve gain/bias schedule (open decision #2). Output goes to THREE PCA9685
-//  drivers (A/B/C, <=6 servos each) over the shared I2C bus, via auto-increment
-//  burst writes. Real I2C compiled only when USE_REAL_I2C == 1; absent boards
-//  simply NACK.
-//
-//  Physical placement is the editable SERVO_OUT_MAP (servo -> device,channel) --
-//  open decision, edit to your wiring.
+//  per-valve gain/bias schedule (open decision #2), plus 4 traditional-surface
+//  servos (linear center/throw/dir from config.h). Output goes to THREE PCA9685
+//  drivers (A/B/C) over the shared I2C bus via auto-increment burst writes.
+//  Layout (decision 2026-09-22): each PCA carries 4 valve servos on ch0-3;
+//  surfaces on A4 (L wing), B4 (R wing), C4/C5 (L/R canard).
 //
 //  Manual bring-up: the console posts {g_servo_manual, dev, ch, us}; this tick
 //  writes that one channel (single-channel write) so ALL I2C stays on core 1.
 //  Manual mode bypasses the valve-command staleness failsafe -- bench only.
 //
-//  Failsafe: OE pin (GPIO, active-low) is the primary hardware output-disable on
-//  a stale command -- coanda domain only. Optional PCA9685 all-call ALL_LED_OFF
-//  software backup is OFF by default (0x70 collides with a mux at 0x70).
+//  Failsafe (decision 2026-09-22, Q7): the PCA outputs are ALWAYS enabled (OE
+//  held low from boot). On a stale/absent core-0 command -- including boot,
+//  before the first allocation -- core 1 drives the DEFINED-SAFE valve pose
+//  through the curve fit and centers the surfaces. Servos never lose their
+//  pulse. If core 1 itself stalls, the PCA9685s keep emitting the last pulses
+//  (hold-last) until the watchdog reset re-establishes the pose.
 // =============================================================================
 #include "config.h"
 #include "types.h"
@@ -38,25 +39,22 @@
 static const uint8_t PCA_ADDRS[PCA9685_COUNT] = { ADDR_PCA9685_0, ADDR_PCA9685_1, ADDR_PCA9685_2 };
 
 // ---------------------------------------------------------------------------
-//  SERVO OUTPUT MAP  --  EDIT to your wiring (open decision).
-//  servo index -> { device 0..2, channel 0..PCA9685_MAX_CH-1 }
-//  Default: servos 0-5 on device A, servos 6-11 on device B, C spare.
+//  SERVO OUTPUT MAP  --  valve servo s -> { device s/4, channel s%4 }.
+//  (servo -> valve assignment is g_servo_valve_map, from calibration.)
 // ---------------------------------------------------------------------------
 struct ServoOut { uint8_t dev; uint8_t ch; };
 static const ServoOut SERVO_OUT_MAP[SERVO_COUNT] = {
-  {0,0},{0,1},{0,2},{0,3},{0,4},{0,5},
-  {1,0},{1,1},{1,2},{1,3},{1,4},{1,5},
+  {0,0},{0,1},{0,2},{0,3},
+  {1,0},{1,1},{1,2},{1,3},
+  {2,0},{2,1},{2,2},{2,3},
 };
+static const ServoOut SURF_MAP[SURF_COUNT]       = SURF_OUT_MAP;
+static const int16_t  SURF_CENTER[SURF_COUNT]    = SURF_US_CENTER;
+static const int16_t  SURF_THROW[SURF_COUNT]     = SURF_US_THROW;
+static const int8_t   SURF_SIGN[SURF_COUNT]      = SURF_DIR;
+static const int16_t  SRV_SAFE_POSE[VALVE_COUNT] = DEFINED_SAFE_VALVE_POSE;
 
-static bool srv_oe_enabled = false;
-
-// ---- OE domain control (active LOW: LOW = outputs enabled) ----
-static void coanda_oe(bool enable) {
-  if (enable == srv_oe_enabled) return;
-  srv_oe_enabled = enable;
-  digitalWrite(PIN_OE_COANDA, enable ? LOW : HIGH);
-  // Emergency-surface OE (PIN_OE_EMERG) is a SEPARATE domain, never touched here.
-}
+uint16_t g_surf_us_echo[SURF_COUNT] = { 0 };     // resolved surface us (core 1 only)
 
 // microseconds -> 12-bit count at 50 Hz (period 20000 us)
 static inline uint16_t us_to_count(uint16_t us) {
@@ -103,7 +101,7 @@ static void pca9685_write_board(uint8_t addr, const uint16_t* counts, int nch) {
   }
   uint8_t rc = Wire.endTransmission();
   if (rc < 8) g_i2c_rc_hist[rc]++;
-  //if (rc)     g_i2c_last_fail_tk = tick;      // pass tick in, or read g_core1_heartbeat
+  if (rc)     g_i2c_last_fail_tk = g_core1_heartbeat;
 }
 
 // Single-channel write (manual bring-up).
@@ -115,25 +113,14 @@ static void pca9685_write_one(uint8_t addr, uint8_t ch, uint16_t us) {
   Wire.write(count & 0xFF); Wire.write((count >> 8) & 0x0F);
   uint8_t rc = Wire.endTransmission();
   if (rc < 8) g_i2c_rc_hist[rc]++;
-  //if (rc)     g_i2c_last_fail_tk = tick;      // pass tick in, or read g_core1_heartbeat
+  if (rc)     g_i2c_last_fail_tk = g_core1_heartbeat;
 }
 
-#if USE_SERVO_ALLCALL_FAILSAFE
-static void pca9685_all_off() {
-  Wire.beginTransmission(ADDR_PCA9685_ALL);    // 0x70 -- collides with a mux at 0x70!
-  Wire.write(PCA_ALL_OFF_H);
-  Wire.write(0x10);                             // bit4 = full OFF on all channels
-  Wire.endTransmission();
-}
-#endif
 #endif // USE_REAL_I2C
 
 void servos_setup() {
-  pinMode(PIN_OE_COANDA, OUTPUT);
-  pinMode(PIN_OE_EMERG,  OUTPUT);
-  digitalWrite(PIN_OE_COANDA, HIGH);   // start DISABLED until a valid command
-  digitalWrite(PIN_OE_EMERG,  HIGH);
-  srv_oe_enabled = false;
+  pinMode(PIN_OE_PCA, OUTPUT);
+  digitalWrite(PIN_OE_PCA, LOW);       // outputs ENABLED, permanently (Q7)
 
 #if USE_REAL_I2C
   for (int d = 0; d < PCA9685_COUNT; ++d) {           // scanner-equivalent addr probe
@@ -189,16 +176,15 @@ void servos_service(uint32_t tick) {
       pca9685_write_board(PCA_ADDRS[d], counts, nch);   // burst, actively re-asserted
     }
 #endif
-    coanda_oe(true);
     return;   // NB: still bypasses the staleness failsafe -- bench only
   }
 
-  // ---- normal path: curve-fit all 12, burst per device ----
+  // ---- normal path: curve-fit 12 valve servos + 4 surfaces, burst per device --
   // Hold the last good valve command across transient cross-core read misses. A
   // single dropped snapshot must NOT slam servos/valves to neutral -- that's a
-  // control disturbance, not a safe state. Failsafe only on SUSTAINED staleness,
-  // i.e. core 0 genuinely stopped updating (stamp older than CMD_TIMEOUT_MS).
-  static ValveCmd s_last = {};                 // 0-init: valves centered, stamp 0
+  // control disturbance, not a safe state. The defined pose is used only on
+  // SUSTAINED staleness (core 0 not updating), or before the first command.
+  static ValveCmd s_last = {};                 // 0-init: stamp 0
   static bool     s_have = false;
 
   ValveCmd cmd;
@@ -208,15 +194,13 @@ void servos_service(uint32_t tick) {
   bool stale = !s_have || (millis() - s_last.stamp_ms) > CMD_TIMEOUT_MS;
 
   if (stale) {
-    coanda_oe(false);                          // primary kill: hardware output-disable
-#if USE_REAL_I2C && USE_SERVO_ALLCALL_FAILSAFE
-    pca9685_all_off();
-#endif
-    for (int s = 0; s < SERVO_COUNT; ++s) g_servo_us_echo[s] = SERVO_US_NEUTRAL;
-    return;
+    // Boot or core-0 stall: defined-safe valve pose (through the curve fit),
+    // surfaces centered. Outputs stay enabled -- the servos keep a pulse.
+    for (int v = 0; v < VALVE_COUNT; ++v) cmd.valve[v] = SRV_SAFE_POSE[v];
+    for (int k = 0; k < SURF_COUNT;  ++k) cmd.surf[k]  = 0;
+  } else {
+    cmd = s_last;                              // drive from the last good command
   }
-
-  cmd = s_last;                                // drive from the last good command
 
   uint16_t us[SERVO_COUNT];
   for (int s = 0; s < SERVO_COUNT; ++s) {
@@ -225,9 +209,18 @@ void servos_service(uint32_t tick) {
     us[s] = curve_us(s, x);
     g_servo_us_echo[s] = us[s];                                // telemetry echo
   }
+  uint16_t sus[SURF_COUNT];
+  for (int k = 0; k < SURF_COUNT; ++k) {
+    float x = (float)cmd.surf[k] / (float)VALVE_POS_MAX;      // [-1,1]
+    float u = (float)SURF_CENTER[k] + (float)SURF_SIGN[k] * (float)SURF_THROW[k] * x;
+    if (u < SERVO_US_MIN) u = SERVO_US_MIN;
+    if (u > SERVO_US_MAX) u = SERVO_US_MAX;
+    sus[k] = (uint16_t)lroundf(u);
+    g_surf_us_echo[k] = sus[k];
+  }
 
 #if USE_REAL_I2C
-  // Bin curve-fit outputs into per-device channel arrays, then burst each board.
+  // Bin outputs into per-device channel arrays, then burst each board.
   uint16_t counts[PCA9685_COUNT][PCA9685_MAX_CH];
   for (int d = 0; d < PCA9685_COUNT; ++d)
     for (int c = 0; c < PCA9685_MAX_CH; ++c)
@@ -236,10 +229,12 @@ void servos_service(uint32_t tick) {
     const ServoOut& o = SERVO_OUT_MAP[s];
     if (o.dev < PCA9685_COUNT && o.ch < PCA9685_MAX_CH) counts[o.dev][o.ch] = us_to_count(us[s]);
   }
+  for (int k = 0; k < SURF_COUNT; ++k) {
+    const ServoOut& o = SURF_MAP[k];
+    if (o.dev < PCA9685_COUNT && o.ch < PCA9685_MAX_CH) counts[o.dev][o.ch] = us_to_count(sus[k]);
+  }
   for (int d = 0; d < PCA9685_COUNT; ++d) {
     if (s_pca_ok[d]) pca9685_write_board(PCA_ADDRS[d], counts[d], PCA9685_MAX_CH);
   }
 #endif
-
-  coanda_oe(true);
 }

@@ -5,10 +5,18 @@
 //  rpm to hit the aggregate mass-flow target. When the aggregate estimate is
 //  untrustworthy, rpm pins to the COMPILED-IN immutable RPM_FALLBACK (30k) --
 //  failing toward MORE airflow to preserve coanda authority. The command is
-//  streamed to the Motor Teensy as a teensyshot Host_comm frame at 50 Hz;
-//  stopping = ceasing the stream (the Teensy's own dead-man stops the motor).
+//  streamed to the Motor Teensy as a teensyshot Host_comm frame at 50 Hz.
 //
-//  DISARMED overrides everything: no stream, rpm target 0.
+//  Start / stop (decisions 2026-09-22, Q4):
+//    * Stop = SILENCE. Disarmed or terminated -> no frames. The Teensy's link
+//      watchdog (~40 ms) sends DShot MOTOR_STOP and the rotor COASTS down (no
+//      active brake). There is no bench stream while disarmed (S1).
+//    * Start = the Tiny sends the target immediately; the TEENSY rate-limits its
+//      reference (~5 s to 30k), seeded from the MEASURED rpm, so a warm re-arm
+//      after a Tiny reset picks a still-coasting rotor up where it is. A single
+//      late/dropped frame (< ~80 ms) is held through on the Teensy.
+//
+//  Also computes the advisory ESC thermal-derate flag (Q2) for COMP_TLM.
 // -----------------------------------------------------------------------------
 #include "config.h"
 #include "types.h"
@@ -46,14 +54,39 @@ static void teensy_stream(int16_t rpm10) {
   for (int s = 0; s < TEENSY_NB_SLOTS; ++s) put_u16(f, i, (s==0)? TEENSY_DEF_D:0);  // PID_D
   for (int s = 0; s < TEENSY_NB_SLOTS; ++s) put_u16(f, i, (s==0)? TEENSY_DEF_F:0);  // PID_f
   // i == 64
-  uint32_t n=0;
 #if USE_REAL_TEENSY
-  n = Serial1.write(f, sizeof(f));
+  Serial1.write(f, sizeof(f));
 #else
   (void)f;
 #endif
+}
 
+// ---- ESC thermal-derate suspicion (advisory; Q2) ---------------------------
+// Hot (>= COMP_THERM_ON_C) AND measured rpm sagging below target for
+// COMP_THERM_SUSTAIN_MS, evaluated only while running past the spin-up grace.
+// Clears when the ESC cools below COMP_THERM_OFF_C or rpm recovers.
+static bool thermal_update(uint32_t now, bool running, uint32_t run_since, float target) {
+  static bool     flag      = false;
+  static uint32_t sag_since = 0;
 
+  bool eval = running && g_comp.ok && target > 0.0f &&
+              (now - run_since) >= COMP_SPINUP_GRACE_MS;
+  if (!eval) { sag_since = 0; flag = false; return false; }
+
+  float rpm = (float)g_comp.rpm10 * 10.0f;
+  int   t   = (int)g_comp.temp_c;
+
+  if (flag) {
+    if (t < COMP_THERM_OFF_C || rpm >= (1.0f - COMP_THERM_OK_FRAC) * target) {
+      flag = false; sag_since = 0;
+    }
+  } else {
+    bool sag = (t >= COMP_THERM_ON_C) && (rpm < (1.0f - COMP_THERM_LAG_FRAC) * target);
+    if (!sag)                 sag_since = 0;
+    else if (sag_since == 0)  sag_since = now;
+    else if ((now - sag_since) >= COMP_THERM_SUSTAIN_MS) flag = true;
+  }
+  return flag;
 }
 
 void compressor_update(uint32_t now) {
@@ -126,8 +159,9 @@ void compressor_update(uint32_t now) {
     mode   = COMP_FALLBACK;
   }
 
-  // ---- run-edge handling: soft start from 0 ----
-  if (want_run && !comp_running) { comp_rpm = 0.0f; comp_integ = 0.0f; }
+  // ---- run-edge handling: jump straight to the target (the Teensy ramps) ----
+  static uint32_t run_since = 0;
+  if (want_run && !comp_running) { comp_rpm = target; comp_integ = 0.0f; run_since = now; }
   comp_running = want_run;
 
   // ---- slew toward target, clamp ----
@@ -148,8 +182,9 @@ void compressor_update(uint32_t now) {
   g_status.flow_fallback = (mode == COMP_FALLBACK);
   g_status.sensor_stale  = sensor_stale;
   g_current_rpm_cmd      = want_run ? (uint32_t)comp_rpm : 0;   // core 1 sim reads this
+  g_status.comp_thermal  = thermal_update(now, want_run, run_since, comp_rpm);
 
-  // ---- stream to Teensy at 50 Hz while running; cease when stopped ----
+  // ---- stream to Teensy at 50 Hz while running; SILENCE when stopped (= stop) ----
   if (want_run) {
     if ((now - comp_last_stream_ms) >= (1000 / TEENSY_STREAM_HZ)) {
       comp_last_stream_ms = now;

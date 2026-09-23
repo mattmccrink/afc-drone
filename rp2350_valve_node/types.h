@@ -12,6 +12,7 @@
 // core 0 -> core 1 : commanded valve positions (aero intent)
 struct ValveCmd {
   int16_t  valve[VALVE_COUNT];   // aero-intent positions
+  int16_t  surf[SURF_COUNT];     // surface commands, [-1000,1000], 0 = configured center
   uint32_t stamp_ms;             // set by core 0; core 1 checks staleness
 };
 
@@ -68,6 +69,9 @@ struct NodeStatus {
   bool     flow_fallback   = false;
   bool     sensor_stale    = false;
   bool     terminated      = false;      // latched flight-termination (total comms loss)
+  bool     surf_engaged    = false;      // surface switch state (SBUS switch or console force)
+  bool     surf_active     = false;      // surfaces actually allocated (switch && live source && !term)
+  bool     comp_thermal    = false;      // ESC thermal-derate suspected (advisory)
 };
 
 // Measured compressor telemetry, latched from the Motor Teensy's ESCPID_comm.

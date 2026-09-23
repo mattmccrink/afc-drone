@@ -1,16 +1,21 @@
 // =============================================================================
-//  framing.ino  --  Pi link over USB CDC  (core 0)
+//  framing.ino  --  Pi link over Serial2 (UART1, GP4/GP5, 230400)  (core 0)
 //
 //  Wire format:  [magic:4 LE][type:1][len:1][payload:len][crc8:1]
 //  crc8 (poly 0x07) is taken over type|len|payload. The reader is a magic-resync
 //  state machine: it never blocks and re-locks on the 4-byte magic after any
 //  garble (same idiom as the teensyshot host link).
 //
-//  USB is shared with the human console. To keep both clean, the port is
-//  MODE-AWARE: in text mode (default) incoming bytes go to the console line
-//  reader; in 'tlm on' (binary) mode they go to this frame parser and telemetry
-//  frames stream out. A production build could interleave both on one stream;
-//  the alpha separates them for a legible bench console.
+//  Serial2 is ALWAYS framed (Pi link); USB CDC is console-only text. There is no
+//  mode switch any more (the old 'tlm on' handshake / g_binary_tlm are gone).
+//
+//  Telemetry payloads (all APPENDED fields keep earlier offsets unchanged):
+//    CTRL_TLM   0x81  55 B = 43 base + 4 fault-tree ext + 8 surfaces (4x i16)
+//                     flags: bit0 terminated, bit1 FC arm eligible (token live),
+//                            bit2 SBUS arm eligible, bit3 SBUS arm sw,
+//                            bit4 surfaces active (allocated), bit5 surface switch on
+//    SENSOR_TLM 0x82  56 B
+//    COMP_TLM   0x83  14 B = 13 base + flags (bit0 ESC thermal-derate suspect)
 // -----------------------------------------------------------------------------
 #include "config.h"
 #include "types.h"
@@ -145,15 +150,19 @@ void tlm_service(uint32_t now) {
                  :                                  MODE_SAFE_HOLD;
     fput_u8(pl, i, mode);
     uint8_t flags = (g_status.terminated       ? 0x01 : 0)   // bit0 terminated
-                  | (arb_fc_seen_disarmed()    ? 0x02 : 0)   // bit1 FC arm eligible
+                  | (arb_fc_eligible()         ? 0x02 : 0)   // bit1 FC arm eligible (token live)
                   | (g_sbus_arm_seen_disarmed  ? 0x04 : 0)   // bit2 SBUS arm eligible
-                  | (g_sbus_arm                ? 0x08 : 0);  // bit3 SBUS switch now
+                  | (g_sbus_arm                ? 0x08 : 0)   // bit3 SBUS switch now
+                  | (g_status.surf_active      ? 0x10 : 0)   // bit4 surfaces ACTIVE (allocated)
+                  | (g_status.surf_engaged     ? 0x20 : 0);  // bit5 surface switch on
     fput_u8(pl, i, flags);
     float srp  = g_alloc_s_rp  < 0.f ? 0.f : (g_alloc_s_rp  > 1.f ? 1.f : g_alloc_s_rp);
     float syaw = g_alloc_s_yaw < 0.f ? 0.f : (g_alloc_s_yaw > 1.f ? 1.f : g_alloc_s_yaw);
     fput_u8(pl, i, (uint8_t)(srp  * 100.f + 0.5f));          // desat scales, %*100
     fput_u8(pl, i, (uint8_t)(syaw * 100.f + 0.5f));
-    send_frame(FT_CTRL_TLM, pl, (uint8_t)i);
+    // ---- surfaces (APPENDED): commanded position, [-1000,1000], 0 = center ----
+    for (int k = 0; k < SURF_COUNT; ++k) fput_i16(pl, i, g_surf_dbg[k]);
+    send_frame(FT_CTRL_TLM, pl, (uint8_t)i);   // i == 55
   } else {
     i = 0;
     for (int v = 0; v < VALVE_COUNT; ++v) fput_i16(pl, i, (int16_t)lroundf((got?fr.p_up[v]:0)  * 10.0f));
@@ -180,6 +189,7 @@ void tlm_service(uint32_t now) {
     fput_u8 (cp, j, (uint8_t)g_comp.err);   // i8 on wire, cast back on Pi
     fput_u8 (cp, j, g_comp.ok ? 1 : 0);
     fput_u32(cp, j, now);
-    send_frame(FT_COMP_TLM, cp, (uint8_t)j);   // j == 13
+    fput_u8 (cp, j, g_status.comp_thermal ? 0x01 : 0);   // APPENDED flags: bit0 thermal suspect
+    send_frame(FT_COMP_TLM, cp, (uint8_t)j);   // j == 14
   }
 }

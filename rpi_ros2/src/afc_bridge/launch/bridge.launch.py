@@ -2,13 +2,13 @@
 
   ros2 launch afc_bridge bridge.launch.py                 # node only
   ros2 launch afc_bridge bridge.launch.py record:=true    # + rosbag
-  ros2 launch afc_bridge bridge.launch.py serial_port:=/dev/ttyACM1 record:=true
+  ros2 launch afc_bridge bridge.launch.py serial_port:=/dev/ttyAMA1 record:=true
 
 Recording is done by an external `ros2 bag record` process rather than a
 rosbag2_py writer inside the node -- that keeps the node free of rosbag2 API
 drift across distros, and bags exactly the four topics needed for post-flight
-cause/effect: what the node received from MAVROS (command + arm intent) and what
-the tiny reported back.
+cause/effect: what the node received from the FC (command + arm intent) and what
+the tiny reported back (control, sensor, compressor).
 """
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, ExecuteProcess, GroupAction
@@ -24,6 +24,7 @@ def generate_launch_description():
     status_topic = LaunchConfiguration("status_topic")
     ctrl_topic = LaunchConfiguration("ctrl_topic")
     sensor_topic = LaunchConfiguration("sensor_topic")
+    comp_topic = LaunchConfiguration("comp_topic")
     record = LaunchConfiguration("record")
     bag_uri = LaunchConfiguration("bag_uri")
 
@@ -39,6 +40,7 @@ def generate_launch_description():
             "status_topic": status_topic,
             "ctrl_topic": ctrl_topic,
             "sensor_topic": sensor_topic,
+            "comp_topic": comp_topic,
         }],
     )
 
@@ -48,20 +50,23 @@ def generate_launch_description():
         condition=IfCondition(record),
         actions=[ExecuteProcess(
             cmd=["ros2", "bag", "record", "-o", bag_uri,
-                 torque_topic, thrust_topic, status_topic, ctrl_topic, sensor_topic],
+                 torque_topic, thrust_topic, status_topic, ctrl_topic, sensor_topic,
+                 comp_topic, "/afc/health"],
             output="screen",
         )],
     )
 
     return LaunchDescription([
-        DeclareLaunchArgument("serial_port", default_value="/dev/ttyACM0"),
+        DeclareLaunchArgument("serial_port", default_value="/dev/ttyAMA1"),   # Tiny, uart3
         DeclareLaunchArgument("torque_topic",
                               default_value="/fmu/out/vehicle_torque_setpoint"),
         DeclareLaunchArgument("thrust_topic",
                               default_value="/fmu/out/vehicle_thrust_setpoint"),
-        DeclareLaunchArgument("status_topic", default_value="/fmu/out/vehicle_status"),
+        # PX4 1.16+ publishes vehicle_status versioned (_v1); the plain name is silent.
+        DeclareLaunchArgument("status_topic", default_value="/fmu/out/vehicle_status_v1"),
         DeclareLaunchArgument("ctrl_topic", default_value="/afc/ctrl_tlm"),
         DeclareLaunchArgument("sensor_topic", default_value="/afc/sensor_tlm"),
+        DeclareLaunchArgument("comp_topic", default_value="/afc/compressor"),
         DeclareLaunchArgument("record", default_value="false"),
         DeclareLaunchArgument("bag_uri", default_value="afc_flight"),
         node,

@@ -5,9 +5,9 @@ Every-time operation, from a powered-off Pi to live data in the browser.
 
 Chain:
 ```
-PX4 ──serial(TELEM2/FTDI)──> uXRCE agent ─┐
-                                          ├─ ROS graph ─> rosbridge :9090 ─WiFi─> browser (PC)
-tiny(RP2350) ──USB──> bridge node ────────┘
+PX4 ──TELEM2 ↔ Pi PL011 (serial0/ttyAMA0)──> uXRCE agent ─┐
+                                                          ├─ ROS graph ─> rosbridge :9090 ─> browser (PC)
+tiny(RP2350) Serial2 ↔ Pi uart3 (ttyAMA1) ──> bridge node ─┘
 ```
 
 ---
@@ -27,14 +27,13 @@ Pick the link the PC will use to reach the Pi:
   → dashboard URL later is `ws://192.168.137.10:9090`.
 
 ## 2. Confirm the two serial devices
-FTDI (Pixhawk/TELEM2) enumerates as **ttyUSB\***, the tiny as **ttyACM\*** — they
-don't collide, but use by-id names to be safe:
+Both links are soldered GPIO UARTs (no USB, no FTDI). The FC is on `serial0`
+(`ttyAMA0`); the Tiny is on `uart3` (`ttyAMA1`, base `fe201600`). **The Tiny is
+never `ttyAMA0`.**
 ```bash
-ls -l /dev/serial/by-id/
-cat /sys/bus/usb-serial/devices/ttyUSB0/latency_timer    # want 1 (udev rule = automatic)
+ls -l /dev/serial0                 # -> ttyAMA0
+dmesg | grep -iE 'ttyAMA'          # fe201600 = uart3 = the Tiny
 ```
-If latency_timer isn't 1 (and you didn't add the udev rule), set it:
-`echo 1 | sudo tee /sys/bus/usb-serial/devices/ttyUSB0/latency_timer`
 
 ## 3. Source the environment (every terminal)
 ```bash
@@ -43,22 +42,22 @@ source ~/afc-drone/rpi_ros2/install/setup.bash
 ```
 (Put these two lines in ~/.bashrc so every new shell is ready.)
 
-## 4. Start the uXRCE-DDS agent — Terminal A (owns the FTDI serial)
+## 4+5. Start the agent + bridge (+ rosbridge) — one command
 ```bash
-MicroXRCEAgent serial --dev /dev/serial/by-id/usb-...TELEM2-FTDI... -b 921600
+ros2 launch afc_bridge afc_system.launch.py      # defaults: agent_dev=/dev/serial0, serial_port=/dev/ttyAMA1
 ```
-Watch for `create_client` / `create_participant`. Leave it running.
+Watch for `create_client` / `create_participant` from the agent and
+`opened /dev/ttyAMA1 (exclusive)` from the bridge (which also starts the #25873
+keep-alive). Do NOT cycle the DDS link with Ctrl-C mid-session: an agent restart
+wedges the FC client until an FC reboot (S14).
 
-## 5. Start the bridge node — Terminal B (opens the tiny; keep-alive fires here)
+Running pieces by hand instead:
 ```bash
-ros2 run afc_bridge bridge_node --ros-args \
-     -p serial_port:=/dev/serial/by-id/usb-...RP2350...
+MicroXRCEAgent serial --dev /dev/serial0 -b 921600                      # Terminal A
+ros2 run afc_bridge bridge_node --ros-args -p serial_port:=/dev/ttyAMA1 # Terminal B
 ```
-The node auto-sends `tlm on\n` to the tiny and starts the #25873 keep-alive.
-(Steps 4+5 in one: `ros2 launch afc_bridge afc_system.launch.py
-serial_port:=<tiny> agent_dev:=<ftdi> start_agent:=true`.)
 
-## 6. Start rosbridge — Terminal C (websocket :9090)
+## 6. rosbridge (websocket :9090) — started by afc_system; by hand:
 ```bash
 ros2 launch rosbridge_server rosbridge_websocket_launch.xml
 ```
@@ -68,7 +67,8 @@ graph is up (it just exposes existing topics).
 ## 7. Verify on the Pi (before touching the browser)
 ```bash
 ros2 topic list                       # see /afc/* and /fmu/out/*
-ros2 topic echo /afc/health           # serial up, ctrl/sensor ~25 Hz, crc 0
+ros2 topic echo /afc/health           # serial up, ctrl/sensor/comp ~25 Hz, crc 0
+ros2 topic echo /afc/compressor       # thermal_suspect false; rpm/temp when armed
 ros2 topic hz /fmu/out/vehicle_torque_setpoint   # steady, max ~0.07s (NOT 1.0s)
 # on the FC (nsh): uxrce_dds_client status  -> connected, Payload rx != 0
 ```
@@ -82,14 +82,16 @@ ros2 topic hz /fmu/out/vehicle_torque_setpoint   # steady, max ~0.07s (NOT 1.0s)
 ---
 
 ## Shutdown
-Ctrl-C terminals C → B → A (reverse order). The tiny reverts to SBUS/SAFE when
-the bridge stops (by design).
+Ctrl-C the launch (or terminals C → B → A). The Tiny reverts to SBUS/SAFE when
+the bridge stops (by design); if it was armed with no SBUS it terminates after 3 s.
 
 ## Quick troubleshooting
 | Symptom | Check |
 |---|---|
 | Ethernet drops during heavy work | power/brownout — `vcgencmd get_throttled`; use `--parallel-workers 1` for builds |
 | agent: no `create_client` | wrong `--dev`, baud, or MAVLink still on TELEM2 |
+| bridge: `refusing to open ...` | `serial_port` points at the FC UART — the Tiny is `/dev/ttyAMA1` |
+| dashboard red "ESC THERMAL" banner | ESC ≥ 90 °C and rpm sagging > 10 % below target ≥ 3 s — ESC likely self-derating |
 | `/fmu/out/*` stalls ~1 Hz | bridge node not running (keep-alive only fires with it up) |
 | topics exist but dashboard empty | wrong ws URL/IP, or message-type strings in the HTML CFG don't match `ros2 topic type` |
 | dashboard link dot stays red | rosbridge not running, port 9090 blocked, or PC not on the Pi's subnet |

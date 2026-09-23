@@ -14,8 +14,14 @@
 #include "AWPID.h"
 #include "ESCPID.h"
 
+// Forward declarations (defined below loop helpers)
+static void ESCPID_restart_bookkeeping( int i );
+
 // Globals
-float     ESCPID_Reference[ESCPID_NB_ESC] = {};
+float     ESCPID_Target[ESCPID_NB_ESC] = {};      // host target, clamped [0, ESCPID_REF_MAX]
+float     ESCPID_Reference[ESCPID_NB_ESC] = {};   // rate-limited reference fed to the PID
+bool      ESCPID_Running[ESCPID_NB_ESC] = {};     // start sequence begun since the last MOTOR_STOP
+bool      ESCPID_Fresh[ESCPID_NB_ESC] = {};       // a post-start telemetry sample has seeded the loop
 float     ESCPID_Measurement[ESCPID_NB_ESC] = {};
 float     ESCPID_Control[ESCPID_NB_ESC] = {};
 uint16_t  ESCPID_comm_wd = 0;
@@ -96,17 +102,18 @@ int ESCPID_comm_update( void ) {
     }
     else {
     
-      // Valid packet received, debug to USB port
-      Serial.print("rx magic=");
-      Serial.print(Host_comm.magic, HEX);
-      Serial.print(" RPM_r0=");
-      Serial.println(Host_comm.RPM_r[0]);
       // Reset the communication watchdog
       ESCPID_comm_wd = 0;
       
-      // Update the reference
-      for ( i = 0; i < ESCPID_NB_ESC; i++ )
-        ESCPID_Reference[i] = Host_comm.RPM_r[i];
+      // Update the TARGET (the reference is rate-limited toward it in loop()).
+      // Unidirectional compressor: clamp to [0, ESCPID_REF_MAX]. A negative or
+      // corrupt value can no longer reach the PID's reverse branch (removed).
+      for ( i = 0; i < ESCPID_NB_ESC; i++ ) {
+        float t = Host_comm.RPM_r[i];
+        if ( t < 0.0f )           t = 0.0f;
+        if ( t > ESCPID_REF_MAX ) t = ESCPID_REF_MAX;
+        ESCPID_Target[i] = t;
+      }
       
       // Update PID tuning parameters
       for ( i = 0; i < ESCPID_NB_ESC; i++ ) {
@@ -185,7 +192,8 @@ void setup() {
   // Arming ESCs
   ESCCMD_arm_all( );
   
-  // Switch 3D mode on
+  // 3D mode is NOT used: the compressor is unidirectional. (ESCCMD_3D_on() also
+  // wrote ESC EEPROM on every boot.) Normal-mode throttle range 0..1999.
   //ESCCMD_3D_on( );
 
   // Arming ESCs
@@ -201,7 +209,89 @@ void setup() {
 
   // Reference watchdog is initially triggered
   ESCPID_comm_wd = ESCPID_COMM_WD_LEVEL;
+  for ( i = 0; i < ESCPID_NB_ESC; i++ )
+    ESCPID_restart_bookkeeping( i );        // clean stopped state (throttle floor, no seed)
 }
+
+//
+//  Start / hold / stop sequencing and reference shaping (AFC, decision 2026-09-22).
+//
+//  * Brief link lapse (comm watchdog tripped but ESCCMD has NOT yet sent
+//    MOTOR_STOP): HOLD everything -- reference, PID state, last throttle (ESCCMD
+//    keeps re-sending it). A single late/dropped frame must not cost airflow.
+//  * Stop (ESCCMD's throttle watchdog has sent MOTOR_STOP): rotor coasts. Reset
+//    the PID and mark the loop not running; the next start is a fresh start.
+//  * Start: hold throttle at PID_MIN only until a FRESH telemetry sample arrives
+//    (ESCCMD invalidates telemetry on MOTOR_STOP), then seed the reference from
+//    the MEASURED rpm (<= target) so a still-coasting rotor is picked up where it
+//    is instead of being braked down to a ramp from 0. The PID's first call
+//    initialises its derivative history from that same fresh sample (no kick).
+//  * Running: reference rate-limited toward the target at ESCPID_REF_RATE_RPM_S
+//    in both directions (0 -> 30k in ~5 s).
+//
+static void ESCPID_restart_bookkeeping( int i ) {
+  AWPID_reset( );
+  ESCPID_Running[i]   = false;
+  ESCPID_Fresh[i]     = false;
+  ESCPID_Reference[i] = 0.0f;
+  ESCPID_Control[i]   = ESCPID_Min[i];   // never re-send a stale high throttle
+}
+
+// Returns true once the loop has a fresh measurement and may run the PID.
+static bool ESCPID_shape_reference( int i ) {
+  const float step = ( ESCPID_REF_RATE_RPM_S / 10.0f ) * ( ESCCMD_TIMER_PERIOD * 1e-6f );
+
+  if ( !ESCPID_Running[i] ) {             // first live tick after a stop / boot
+    ESCPID_Running[i] = true;
+    ESCPID_Fresh[i]   = false;
+    ESCPID_Control[i] = ESCPID_Min[i];
+  }
+
+  if ( !ESCPID_Fresh[i] ) {
+    int16_t rpm;
+    if ( ESCCMD_read_tlm_status( i ) == 0 && ESCCMD_read_rpm( i, &rpm ) == 0 ) {
+      float seed = ( rpm > 0 ) ? (float)rpm : 0.0f;          // 10 rpm units
+      if ( seed > ESCPID_Target[i] ) seed = ESCPID_Target[i];
+      ESCPID_Reference[i] = seed;
+      ESCPID_comm.rpm[i]  = rpm;           // PID measurement = this fresh sample
+      ESCPID_Fresh[i]     = true;
+    } else {
+      return false;                        // still acquiring: throttle stays at PID_MIN
+    }
+  }
+
+  float d = ESCPID_Target[i] - ESCPID_Reference[i];
+  if ( d >  step ) d =  step;
+  if ( d < -step ) d = -step;
+  ESCPID_Reference[i] += d;
+  return true;
+}
+
+#if ESCPID_USB_DEBUG
+// 10 Hz human-readable line on USB (bench verification of ramp / stop).
+static void ESCPID_debug_print( void ) {
+  static uint32_t last = 0;
+  uint32_t now = millis( );
+  if ( ( now - last ) < 100 ) return;
+  last = now;
+  // Never block the control loop on USB: skip the line if no terminal is open or
+  // the USB TX buffer can't take it right now.
+  // (64 = one USB FS packet; Teensy 3.x never reports more than that.)
+  if ( !Serial.dtr( ) || Serial.availableForWrite( ) < 64 ) return;
+  // NB: never call ESCCMD_read_err() here -- it CLEARS the error, which would
+  // hide it from the host reply. Print the last value already reported instead.
+  uint16_t cmd = 0; int16_t rpm = 0; uint8_t deg = 0;
+  int8_t   err = ESCPID_comm.err[0];
+  ESCCMD_read_cmd( 0, &cmd );
+  ESCCMD_read_rpm( 0, &rpm );
+  ESCCMD_read_deg( 0, &deg );
+  Serial.printf( "tgt=%ld ref=%ld rpm=%ld cmd=%u wd=%s err=%d deg=%u\n",
+                 (long)( ESCPID_Target[0] * 10 ), (long)( ESCPID_Reference[0] * 10 ),
+                 (long)rpm * 10, cmd,
+                 ( ESCPID_comm_wd < ESCPID_COMM_WD_LEVEL ) ? "live" : "STALE",
+                 err, deg );
+}
+#endif
 
 //
 //  Arduino main loop
@@ -218,39 +308,36 @@ void loop( ) {
   if ( ret == ESCCMD_TIC_OCCURED )  {
 
     // Process timer event
+    bool live = ( ESCPID_comm_wd < ESCPID_COMM_WD_LEVEL );
 
-    // Read all measurements and compute current control signal
     for ( i = 0; i < ESCPID_NB_ESC; i++ ) {
-    
-      // Compute control signal only if telemetry is valid
-      // In case of invalid telemetry, last control signal is sent
-      // If motor is stopped, don't update PID to avoid integral term windup
-      if ( !ESCCMD_read_tlm_status( i ) ) {
-      
-        // Update measurement
-        ESCPID_Measurement[i] = ESCPID_comm.rpm[i];
-        
-        // Update control signal
-        if ( ESCPID_Reference[i] >= 0 )
-          AWPID_control(  i, 
-                          ESCPID_Reference[i], 
-                          ESCPID_Measurement[i], 
+
+      if ( live ) {
+        // Sequence the start and advance the rate-limited reference
+        bool seeded = ESCPID_shape_reference( i );
+
+        // Compute control signal only with a fresh-since-start, valid sample.
+        // In case of invalid telemetry, last control signal is sent.
+        if ( seeded && !ESCCMD_read_tlm_status( i ) ) {
+          ESCPID_Measurement[i] = ESCPID_comm.rpm[i];
+          AWPID_control(  i,
+                          ESCPID_Reference[i],
+                          ESCPID_Measurement[i],
                           &ESCPID_Control[i] );
-        else  {
-          AWPID_control(  i, 
-                          -ESCPID_Reference[i], 
-                          -ESCPID_Measurement[i], 
-                          &ESCPID_Control[i] );
-          ESCPID_Control[i] *= -1.0;
         }
-      }
-      
-      // Send control signal if reference has been sufficiently refreshed
-      if ( ESCPID_comm_wd < ESCPID_COMM_WD_LEVEL ) {
+
+        // Send control signal (forward only; ESCPID_PID_MIN..MAX)
         ret = ESCCMD_throttle( i, (int16_t)ESCPID_Control[i] );
       }
       else {
-        AWPID_reset( );
+        // Link silent (host disarmed/terminated, or link lost). Stop feeding
+        // throttle; ESCCMD's throttle watchdog sends MOTOR_STOP ~40 ms later and
+        // the rotor COASTS. Until that has actually happened, HOLD all state so a
+        // brief lapse resumes seamlessly.
+        uint16_t c = DSHOT_CMD_MOTOR_STOP;
+        ESCCMD_read_cmd( i, &c );
+        if ( c == DSHOT_CMD_MOTOR_STOP && ESCPID_Running[i] )
+          ESCPID_restart_bookkeeping( i );
       }
     }
     
@@ -259,4 +346,8 @@ void loop( ) {
       ESCPID_comm_wd++;
     }
   }
+
+#if ESCPID_USB_DEBUG
+  ESCPID_debug_print( );
+#endif
 }

@@ -1,5 +1,5 @@
 """
-framing.py -- Pi-side of the RP2350 valve-node USB-CDC link.
+framing.py -- Pi-side of the RP2350 valve-node link (Pi uart3 <-> Tiny Serial2).
 
 Byte-for-byte compatible with the tiny's framing.ino:
 
@@ -165,19 +165,30 @@ class FrameReader:
 # ---- node counts (mirror config.h) ------------------------------------------
 VALVE_COUNT = 6
 SERVO_COUNT = 12
+SURF_COUNT = 4
 
 # ---- inbound telemetry decoders (CTRL_TLM 0x81, SENSOR_TLM 0x82) ------------
 # Mirror tlm_service() in framing.ino. Payload layouts:
 #   CTRL_TLM   (43 B base): B source, B armed, B comp_mode, B flow_fallback,
 #                      H rpm_target, B n_valid, 6h valve[], 12H servo_us[]
-#   CTRL_TLM  (+4 B ext, 47 total): B mode, B flags(bit0 term,1 elig_fc,2 elig_sbus,
-#                      3 sbus_sw), B desat_rp*100, B desat_yaw*100
+#   CTRL_TLM  (+4 B ext, 47 total): B mode, B flags(bit0 term,1 elig_fc [FC token
+#                      recent],2 elig_sbus,3 sbus_sw,4 surf_engaged [surfaces ACTIVE:
+#                      switch on AND live source AND not terminated],5 surf_switch),
+#                      B desat_rp*100,
+#                      B desat_yaw*100
+#   CTRL_TLM  (+8 B ext2, 55 total): 4h surf[] command, [-1000,1000], 0 = center
 #   SENSOR_TLM (56 B): 6h p_up*10, 6h p_lo*10, 6h t_die*100, 6h mdot*10,
 #                      1h mdot_total*10, H valid_mask, I node_stamp_ms
+#   COMP_TLM   (13 B): H volt*100, H amp*100, h rpm/10, B temp_c, b err, B ok,
+#                      I node_ms
+#   COMP_TLM  (+1 B ext, 14 total): B flags (bit0 ESC thermal-derate suspect)
+# Every extension is APPENDED; shorter (older-firmware) frames decode with defaults.
 CTRL_TLM_LEN = 43
 CTRL_TLM_LEN_EXT = 47
+CTRL_TLM_LEN_EXT2 = 55
 SENSOR_TLM_LEN = 56
 COMP_TLM_LEN = 13
+COMP_TLM_LEN_EXT = 14
 
 def decode_ctrl_tlm(payload: bytes) -> dict:
     if len(payload) < CTRL_TLM_LEN:
@@ -191,13 +202,18 @@ def decode_ctrl_tlm(payload: bytes) -> dict:
              n_valid=n_valid, valve=valve, servo_us=servo_us,
              # defaults for pre-update firmware (43-byte frames):
              mode=0, terminated=False, elig_fc=False, elig_sbus=False,
-             sbus_sw=False, desat_rp=1.0, desat_yaw=1.0)
+             sbus_sw=False, surf_engaged=False, surf_switch=False,
+             desat_rp=1.0, desat_yaw=1.0,
+             surf=[0] * SURF_COUNT)
     if len(payload) >= CTRL_TLM_LEN_EXT:
         mode, flags, drp, dyaw = struct.unpack_from("<BBBB", payload, 43)
         d.update(mode=mode, terminated=bool(flags & 0x01),
                  elig_fc=bool(flags & 0x02), elig_sbus=bool(flags & 0x04),
-                 sbus_sw=bool(flags & 0x08),
+                 sbus_sw=bool(flags & 0x08), surf_engaged=bool(flags & 0x10),
+                 surf_switch=bool(flags & 0x20),
                  desat_rp=drp / 100.0, desat_yaw=dyaw / 100.0)
+    if len(payload) >= CTRL_TLM_LEN_EXT2:
+        d.update(surf=list(struct.unpack_from("<4h", payload, 47)))
     return d
 
 
@@ -222,6 +238,8 @@ def decode_comp_tlm(payload: bytes) -> dict:
     volt_cv, amp_ca, rpm10, temp_c, err, ok = \
         struct.unpack_from("<HHhBbB", payload, 0)
     (node_ms,) = struct.unpack_from("<I", payload, 9)
+    flags = payload[13] if len(payload) >= COMP_TLM_LEN_EXT else 0
     return dict(volt=volt_cv / 100.0, amp=amp_ca / 100.0,
                 rpm=rpm10 * 10, temp_c=temp_c, err=err,
-                tlm_ok=bool(ok), node_stamp_ms=node_ms)
+                tlm_ok=bool(ok), node_stamp_ms=node_ms,
+                thermal_suspect=bool(flags & 0x01))

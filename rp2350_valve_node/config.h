@@ -36,10 +36,12 @@
 
 #define PIN_SBUS            6   // reversionary SBUS RX-B (PIO; simulated in alpha)
 
-#define PIN_OE_COANDA       7   // active-low output-enable, coanda servo bank
-#define PIN_OE_EMERG       26   // active-low output-enable, emergency surfaces
-                                //   (separate OE domain -- routine coanda
-                                //    dead-man must NOT disable the surfaces)
+#define PIN_OE_PCA          7   // active-low output-enable, ALL PCA9685 boards.
+                                //   Held LOW (enabled) permanently from boot: the
+                                //   valve + surface servos always receive a pulse.
+                                //   Failsafe = drive the defined pose, never
+                                //   de-power (hobby servos go limp on pulse loss).
+                                //   GP26 (old emergency-surface OE) is now spare.
 
 #define PIN_LED_R          18   // onboard RGB, ACTIVE LOW
 #define PIN_LED_G          19
@@ -47,14 +49,14 @@
 #define PIN_USER_BTN       23   // onboard BOOT/USER, ACTIVE LOW
                                 //   press = simulate primary (Pi) loss
 
-// Spare, broken out: GP0 GP1 GP2 GP3 GP27 GP28 GP29
+// Spare, broken out: GP2 GP3 GP26 GP27 GP28 GP29   (GP0/1 = Teensy, GP4/5 = Pi)
 
 // -----------------------------------------------------------------------------
 //  I2C device addresses   <<OPEN #1 -- confirm against hardware>>
 // -----------------------------------------------------------------------------
 //  Merged-bus address hygiene (all three families share one address space):
 //    - MS5837 sensors all answer 0x76, DOWNSTREAM of the muxes.
-//    - PCA9685 all-call default = 0x70 (our ALL_LED_OFF failsafe target).
+//    - PCA9685 all-call default = 0x70 (unused, but kept clear of the muxes).
 //    - PCA9685 default sub-addresses = 0x71/0x72/0x73 (disabled at reset, but
 //      we keep the muxes off them anyway).
 //    => PCA9545 switches use 0x74/0x75/0x77 -- clear of 0x70, 0x71-73, and 0x76.
@@ -66,14 +68,11 @@
 #define ADDR_PCA9685_1     0x48   // servo driver "B"
 #define ADDR_PCA9685_2     0x50   // servo driver "C"
 #define PCA9685_COUNT         3
-#define PCA9685_MAX_CH        6    // channels used per device (<=16 chip max)
-#define ADDR_PCA9685_ALL   0x70   // all-call: broadcast ALL_LED_OFF failsafe
-
-// Software servo failsafe via the PCA9685 all-call (backup to the OE hardware
-// disable). KEEP 0 until the mux is strapped OFF 0x70 -- the all-call address
-// (0x70) collides with a mux left at 0x70, and a broadcast would scramble the
-// sensor mux routing. Set to 1 only after the mux moves (e.g. to 0x74/0x75/0x77).
-#define USE_SERVO_ALLCALL_FAILSAFE 0
+#define PCA9685_MAX_CH        6    // channels written per device (<=16 chip max):
+                                   //   ch0-3 = valve servos, ch4-5 = surfaces/spare
+#define VALVE_SERVOS_PER_PCA  4    // valve servo s -> PCA s/4, channel s%4 (SERVO_OUT_MAP)
+// PCA9685 all-call (0x70) is NOT used: the servo failsafe drives a defined pose
+// and never de-powers the outputs (Q7), so the ALL_LED_OFF backup was removed.
 
 // -----------------------------------------------------------------------------
 //  Counts
@@ -168,6 +167,10 @@
 #define ARM_HEARTBEAT_MS       1000   // expected arm-token cadence (1 Hz)
 #define ARM_LOSS_TIMEOUT_MS   10000   // FC-token liveness window (reversion, not disarm)
                                       //   <<default per spec; configurable>>
+#define ARM_TOKEN_FRESH_MS     1500   // PRIMARY ACTS on the token only if it advanced this
+                                      //   recently (1.5 heartbeats). An older value (e.g. from
+                                      //   before a termination/bridge restart) is never obeyed;
+                                      //   the node holds its state until a fresh token lands.
 
 // Total-comms-loss flight termination: how long BOTH sources may be dead (SRC_SAFE)
 // before the node cuts air and comes down. Debounce against a transient double
@@ -211,9 +214,20 @@
 #define FLOW_FALLBACK_HOLD_MS 250   // hysteresis into/out of fallback (anti-chatter)
 #define COMP_MDOT_LOOP        0   // 0 = stub (armed -> RPM_FALLBACK); 1 = re-enable mdot PI (needs venturi-loss handling)
 
-// Direct-rpm mapping for SBUS manual reversion  <<OPEN #5 -- direct rpm>>
-#define SBUS_RPM_MIN          0
-#define SBUS_RPM_MAX      45000
+// Spin-up/spin-down shaping lives on the TEENSY (reference rate limit, ~5 s to
+// 30k). The Tiny does NOT ramp from 0 on a run edge; it sends the target and the
+// Teensy shapes it. RPM_SLEW_PER_S above only shapes in-run target changes.
+#define COMP_SPINUP_GRACE_MS  6000  // Teensy ramp (5 s) + margin; flag checks wait this long
+
+// ESC thermal-derate suspicion flag (advisory only -- no control action).
+// Sets when the ESC is hot AND rpm has sagged below target for a sustained
+// window (the signature of the ESC self-throttling while the PID pushes).
+// Clears when it cools OR rpm recovers. Reported in COMP_TLM -> /afc/compressor.
+#define COMP_THERM_ON_C        90   // deg C, set threshold
+#define COMP_THERM_OFF_C       85   // deg C, clear threshold (hysteresis)
+#define COMP_THERM_LAG_FRAC  0.10f  // rpm < (1-this)*target counts as sagging
+#define COMP_THERM_OK_FRAC   0.05f  // rpm >= (1-this)*target counts as recovered
+#define COMP_THERM_SUSTAIN_MS 3000  // sag must persist this long while hot
 
 // -----------------------------------------------------------------------------
 //  Valve / servo ranges and curve-fit
@@ -224,15 +238,39 @@
 #define SERVO_US_NEUTRAL     1500
 #define SERVO_US_MAX         2000
 
-// DEFINED-SAFE valve pose  <<OPEN #4 -- REPLACE with aero-correct pose>>
-// PLACEHOLDER: neutral. The real pose almost certainly biases toward AIRFLOW to
-// preserve coanda authority in the terminal no-command state, NOT geometric zero.
-// Do not fly this placeholder.
+// DEFINED-SAFE valve pose (valve domain, through the curve fit). Decision
+// 2026-09-22: "0" = aero neutral; per-valve bias is calibrated out in the curve
+// fit (g_valve_bias / servo cubic c0), so 0 here means centered after cal.
+// Applied: at boot until a source is heard, in SAFE, when terminated, and on a
+// stale core-0 command (core 1 keeps pulsing this pose; servos never go limp).
 #define DEFINED_SAFE_VALVE_POSE { 0, 0, 0, 0, 0, 0 }
 #define VALVE_TRIM_NORM { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f }   // per-valve neutral, NORMALIZED [-1,1], 0=center. <<POPULATE>>
 
 // -----------------------------------------------------------------------------
-//  Pi link (USB CDC) binary framing
+//  Traditional control surfaces (rung 2a -- pilot-selected "maximum effort")
+// -----------------------------------------------------------------------------
+//  Engaged by an SBUS switch (SBUS_CH_SURF in sbus_real.ino). Engaged = AFC +
+//  surfaces allocated TOGETHER through one combined pseudo-inverse over all 10
+//  actuators (same moment per unit demand -> PX4 loop gain unchanged; more total
+//  authority). Compressor and AFC stay on. Disengaged, SAFE, or terminated =
+//  surfaces held at their configured center. Surfaces share the valve PCA9685s.
+#define SURF_COUNT            4
+//  Surface index -> PCA9685 {device, channel}.  0=L wing (A ch4), 1=R wing
+//  (B ch4), 2=L canard (C ch4), 3=R canard (C ch5).
+#define SURF_OUT_MAP     { {0,4}, {1,4}, {2,4}, {2,5} }
+#define SURF_US_CENTER   { 1500, 1500, 1500, 1500 }   // us at 0 command <<SET per surface>>
+#define SURF_US_THROW    {  400,  400,  400,  400 }   // us per unit command (|u|<=1)
+#define SURF_DIR         {   +1,   +1,   +1,   +1 }   // +1 / -1 to reverse a servo
+//  Surface effectiveness (rows roll,pitch,yaw; cols surfaces 0..3), same units
+//  and sign convention as B_EFF.  <<PLACEHOLDER: signs/magnitudes unverified.>>
+//  Wings = ailerons (antisymmetric roll); canards = symmetric pitch; no yaw.
+#define B_SURF_INIT { \
+  { +0.50f, -0.50f,  0.00f,  0.00f },   /* roll  */ \
+  {  0.00f,  0.00f, +0.50f, +0.50f },   /* pitch */ \
+  {  0.00f,  0.00f,  0.00f,  0.00f } }  /* yaw   */
+
+// -----------------------------------------------------------------------------
+//  Pi link (Serial2 UART, 230400) binary framing
 // -----------------------------------------------------------------------------
 #define PI_MAGIC       0x52503233   // distinct from the Teensy magic
 #define FT_CMD               0x01   // Pi -> node : fast command

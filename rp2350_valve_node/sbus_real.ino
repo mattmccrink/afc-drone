@@ -44,7 +44,9 @@
 #define SBUS_CH_PITCH        1
 #define SBUS_CH_THROTTLE     2
 #define SBUS_CH_YAW          3
-#define SBUS_CH_ARM          7    // VALIDATE: 2-position arm switch; high (> MID) = arm intent
+#define SBUS_CH_ARM          7    // 2-position arm switch; high (> MID) = arm intent (Matt: 7)
+#define SBUS_CH_SURF         8    // VALIDATE: traditional-surface switch; high = engage
+#define SBUS_SURF_THRESH     SBUS_RAW_MID   // raw > this -> surfaces engaged
 
 // SBUS raw endpoints (standard Futaba scaling).
 #define SBUS_RAW_MIN  172
@@ -126,6 +128,10 @@ static void sbus_decode(const uint8_t* f) {
         bool sw_armed = (ch[SBUS_CH_ARM] > SBUS_RAW_MID);
         if (!sw_armed) g_sbus_arm_seen_disarmed = true;
         g_sbus_arm = sw_armed;
+
+        // Traditional-surface switch: simple threshold, clean frames only, so the
+        // last state HOLDS through an SBUS dropout (arbitration reads it).
+        g_sbus_surf_sw = (ch[SBUS_CH_SURF] > SBUS_SURF_THRESH);
     }
 }
 
@@ -160,6 +166,8 @@ void sbus_real_print() {
         SBUS_CH_ROLL, SBUS_CH_PITCH, SBUS_CH_YAW, SBUS_CH_THROTTLE);
     Serial.printf("[sbus] arm: sw=%d seen_disarmed=%d (ch %d raw %u)\n",
         g_sbus_arm, g_sbus_arm_seen_disarmed, SBUS_CH_ARM, s_ch[SBUS_CH_ARM]);
+    Serial.printf("[sbus] surf: sw=%d (ch %d raw %u, thresh %u)\n",
+        g_sbus_surf_sw, SBUS_CH_SURF, s_ch[SBUS_CH_SURF], (unsigned)SBUS_SURF_THRESH);
 }
 
 void sbus_real_setup() {
@@ -190,6 +198,7 @@ void sbus_real_setup() {
     g_sbus_in.valid  = false;
     g_sbus_arm               = false;  // boot disarmed on the SBUS path
     g_sbus_arm_seen_disarmed = false;  // must observe a clean disarmed frame first
+    g_sbus_surf_sw           = false;  // surfaces disengaged until a clean frame says otherwise
 }
 
 // Call from the CORE 0 loop, where sbus_sim_update() used to be called.

@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
-bridge_node.py -- Pi ROS2 supervisor/bridge between MAVROS and the RP2350
-valve/sensor node over Serial3.
+bridge_node.py -- Pi ROS2 supervisor/bridge between the Pixhawk (uXRCE-DDS) and
+the RP2350 valve/sensor node over the Pi's uart3 (Tiny Serial2, 230400).
 
-  Pixhawk --MAVROS--> [THIS NODE] --serial(CMD,ARM)--> RP2350
-  RP2350  --serial(CTRL_TLM,SENSOR_TLM)--> [THIS NODE] --> ROS2 topics --> rosbag
+  Pixhawk --DDS--> [THIS NODE] --uart3(CMD,ARM)--> RP2350
+  RP2350  --uart3(CTRL_TLM,SENSOR_TLM,COMP_TLM)--> [THIS NODE] --> ROS2 topics
+
+Ports: the Tiny is on uart3 (PL011 @ fe201600 -> /dev/ttyAMA1 on this Pi). The FC
+is on /dev/serial0 -> /dev/ttyAMA0 and belongs to the uXRCE-DDS agent: this node
+refuses to open it (forbidden_ports) and opens its own port exclusively.
 
 The node is a supervisor + bridge, NOT an in-loop controller: it forwards
 pre-allocation control demand, relays the arm token with correct liveness
@@ -21,8 +25,8 @@ Command source (PX4 1.14+ control allocation, all uXRCE-DDS / px4_msgs):
     does its own allocation.
   * ARM: vehicle_status.arming_state == ARMING_STATE_ARMED. STRICT boolean --
     the tiny does not reason about FC failsafe; the FC executes failsafe, which
-    flips arming_state, which propagates here. Single link, single middleware;
-    QGC/arming/missions live on a separate telemetry radio, not this link.
+    flips arming_state, which propagates here. QGC/arming/missions ride the
+    Doodle MAVLink link straight to the FC, not this node.
 
 Fail-safe intent preserved on the Pi side:
   * CMD is forwarded ONLY while the setpoint stream is fresh -- if it goes stale
@@ -68,10 +72,17 @@ class BridgeNode(Node):
 
         # ---- parameters ----
         p = self.declare_parameter
-        self.port_name = p("serial_port", "/dev/ttyAMA0").value
+        self.port_name = p("serial_port", "/dev/ttyAMA1").value      # Tiny = uart3
+        # Never open the FC's DDS UART from here (a second opener would inject
+        # CMD/ARM frames into the FC link). Compared after resolving symlinks.
+        self.forbidden_ports = list(p("forbidden_ports",
+                                      ["/dev/serial0", "/dev/ttyAMA0"]).value)
+        agent_port = str(p("agent_port", "").value)     # afc_system passes agent_dev
+        if agent_port:
+            self.forbidden_ports.append(agent_port)
         self.torque_topic = p("torque_topic", "/fmu/out/vehicle_torque_setpoint").value
         self.thrust_topic = p("thrust_topic", "/fmu/out/vehicle_thrust_setpoint").value
-	# PX4 1.16+ publishes versioned messages under a _v1 suffix. vehicle_status
+        # PX4 1.16+ publishes versioned messages under a _v1 suffix. vehicle_status
         # is a DEFAULT DDS publication so it carries the suffix; the setpoints below
         # are plain because they're hand-added to dds_topics.yaml under those names.
         self.status_topic = p("status_topic", "/fmu/out/vehicle_status_v1").value 
@@ -86,7 +97,6 @@ class BridgeNode(Node):
         self.thrust_hi = float(p("thrust_hi", 1.0).value)
         self.arm_hb_hz = float(p("arm_heartbeat_hz", 1.0).value)
         self.arm_stale_s = float(p("arm_stale_after_s", 0.5).value)
-        self.send_tlm_on = bool(p("send_tlm_handshake", True).value)
         self.ctrl_out = p("ctrl_topic", "/afc/ctrl_tlm").value
         self.sensor_out = p("sensor_topic", "/afc/sensor_tlm").value
 
@@ -126,6 +136,8 @@ class BridgeNode(Node):
         self._last_sbus_sw = False
         self._last_desat_rp = 1.0
         self._last_desat_yaw = 1.0
+        self._last_surf = False
+        self._last_thermal = False
         self._health_t = time.monotonic()
 
         # ---- publishers ----
@@ -135,7 +147,7 @@ class BridgeNode(Node):
         self._keepalive_pub = self.create_publisher(OffboardControlMode, "/fmu/in/offboard_control_mode",QoSPresetProfiles.SENSOR_DATA.value)
         self.comp_out  = p("comp_topic", "/afc/compressor").value
         self._comp_pub = self.create_publisher(ValveNodeComp, self.comp_out, 10)
-        self._comp_count = 0    # for health hz, if you extend ValveNodeHealth
+        self._comp_count = 0    # COMP_TLM frames since last health tick -> comp_hz
         # ---- subscribers ----
         # SENSOR_DATA QoS = best-effort/volatile/keep-last, which matches BOTH
         # MAVROS and PX4's uXRCE-DDS publishers. A default (reliable) QoS here is
@@ -185,13 +197,39 @@ class BridgeNode(Node):
         m.direct_actuator = False
         self._keepalive_pub.publish(m)
     # ---------------------------------------------------------------- serial
+    def _port_forbidden(self) -> bool:
+        import os
+        try:
+            me = os.path.realpath(self.port_name)
+        except Exception:  # noqa: BLE001
+            me = self.port_name
+        for fp in self.forbidden_ports:
+            if me == os.path.realpath(fp):
+                return True
+        return False
+
     def _open_serial(self):
         if serial is None:
             self.get_logger().error("pyserial not installed (python3-serial).")
             return
+        if self._port_forbidden():
+            self.get_logger().error(
+                f"refusing to open {self.port_name}: it is the FC DDS port "
+                f"({self.forbidden_ports}). The Tiny is on uart3 (/dev/ttyAMA1).")
+            return
         try:
-            self._ser = serial.Serial(self.port_name, baudrate=230400, timeout=0)
-            self.get_logger().info(f"opened {self.port_name}")
+            # exclusive=True is pyserial's ADVISORY flock (stops other pyserial
+            # users); TIOCEXCL below is the kernel-enforced lock: any further open()
+            # of this tty by a non-root process fails with EBUSY.
+            self._ser = serial.Serial(self.port_name, baudrate=230400, timeout=0,
+                                      exclusive=True)
+            try:
+                import fcntl
+                import termios
+                fcntl.ioctl(self._ser.fileno(), termios.TIOCEXCL)
+            except Exception as e:  # noqa: BLE001
+                self.get_logger().warn(f"TIOCEXCL failed on {self.port_name} ({e})")
+            self.get_logger().info(f"opened {self.port_name} (exclusive)")
 
         except Exception as e:  # noqa: BLE001
             self._ser = None
@@ -288,6 +326,9 @@ class BridgeNode(Node):
         m.n_valid = d["n_valid"]
         m.valve = d["valve"]
         m.servo_us = d["servo_us"]
+        m.surf_engaged = d["surf_engaged"]
+        m.surf_switch = d["surf_switch"]
+        m.surf = d["surf"]
         self._ctrl_pub.publish(m)
         self._ctrl_count += 1
         self._frames_ok += 1
@@ -300,6 +341,7 @@ class BridgeNode(Node):
         self._last_sbus_sw = d["sbus_sw"]
         self._last_desat_rp = d["desat_rp"]
         self._last_desat_yaw = d["desat_yaw"]
+        self._last_surf = d["surf_engaged"]
 
     def _publish_sensor(self, payload: bytes):
         try:
@@ -344,7 +386,12 @@ class BridgeNode(Node):
         m.err = int(d["err"])
         m.tlm_ok = bool(d["tlm_ok"])
         m.node_stamp_ms = int(d["node_stamp_ms"])
+        m.thermal_suspect = bool(d["thermal_suspect"])
         self._comp_pub.publish(m)
+        if m.thermal_suspect and not self._last_thermal:
+            self.get_logger().warn(
+                f"[comp] ESC THERMAL-DERATE SUSPECTED: {m.temp_c} C, {m.rpm} rpm")
+        self._last_thermal = m.thermal_suspect
         self._comp_count += 1
         self._frames_ok += 1
     # ---------------------------------------------------------------- health
@@ -353,8 +400,10 @@ class BridgeNode(Node):
         dt = max(now - self._health_t, 1e-3)
         ctrl_hz = self._ctrl_count / dt
         sensor_hz = self._sensor_count / dt
+        comp_hz = self._comp_count / dt
         self._ctrl_count = 0
         self._sensor_count = 0
+        self._comp_count = 0
         self._health_t = now
 
         cmd_fresh = self._cmd_fresh(now)
@@ -365,6 +414,7 @@ class BridgeNode(Node):
         m.serial_connected = self._ser is not None
         m.ctrl_hz = float(ctrl_hz)
         m.sensor_hz = float(sensor_hz)
+        m.comp_hz = float(comp_hz)
         m.crc_errors = int(self._reader.crc_errors)
         m.frames_ok = int(self._frames_ok)
         m.last_source = int(self._last_source) if self._last_source != 255 else 255
@@ -377,6 +427,7 @@ class BridgeNode(Node):
         m.sbus_sw = bool(self._last_sbus_sw)
         m.desat_rp = float(self._last_desat_rp)
         m.desat_yaw = float(self._last_desat_yaw)
+        m.surf_engaged = bool(self._last_surf)
         m.cmd_fresh = bool(cmd_fresh)
         m.arm_fresh = bool(arm_fresh)
         m.arm_counter = int(self._armtx.counter)
@@ -388,11 +439,11 @@ class BridgeNode(Node):
         src = {0: "PRIMARY", 1: "SBUS", 2: "SAFE", 255: "--"}.get(self._last_source, "?")
         self.get_logger().info(
             f"[health] ser={'up' if m.serial_connected else 'DOWN'} "
-            f"ctrl={ctrl_hz:4.1f}Hz sens={sensor_hz:4.1f}Hz crc={m.crc_errors} "
+            f"ctrl={ctrl_hz:4.1f}Hz sens={sensor_hz:4.1f}Hz comp={comp_hz:4.1f}Hz crc={m.crc_errors} "
             f"mode={m.mode_str} src={src} armed={m.last_armed} term={m.terminated} "
             f"elig[fc={m.elig_fc} sbus={m.elig_sbus} sw={m.sbus_sw}] "
             f"cmd_fresh={m.cmd_fresh} arm_fresh={m.arm_fresh} "
-            f"desat={m.desat_rp:.2f}/{m.desat_yaw:.2f} "
+            f"desat={m.desat_rp:.2f}/{m.desat_yaw:.2f} surf={m.surf_engaged} "
             f"armctr={m.arm_counter} off={m.tlm_offset_ms}ms")
 
 

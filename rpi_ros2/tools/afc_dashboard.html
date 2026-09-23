@@ -44,6 +44,11 @@
   .num{text-align:right}
   svg text{fill:var(--ink);font:11px ui-monospace,monospace}
   .stale{color:var(--warn)}
+  .banner{display:none;margin:10px 10px 0;padding:10px 14px;border-radius:8px;font-weight:700;
+          letter-spacing:.5px;background:rgba(248,81,73,.18);border:1px solid var(--bad);color:var(--bad)}
+  .banner.on{display:block;animation:blink 1s steps(2,start) infinite}
+  @keyframes blink{to{border-color:transparent}}
+  .big{font-size:22px;font-weight:700}
 </style>
 </head>
 <body>
@@ -53,9 +58,17 @@
   <input id="url" value="ws://192.168.1.50:9090"/>
   <button id="connect">Connect</button>
   <span style="margin-left:auto"></span>
+  <span class="pill" id="modePill">MODE ?</span>
   <span class="pill" id="armPill">ARM ?</span>
   <span class="pill" id="srcPill">SRC ?</span>
+  <span class="pill" id="surfPill">SURF ?</span>
+  <span class="pill" id="thermPill">ESC ?</span>
 </header>
+<div class="banner" id="thermBanner">
+  ESC THERMAL-DERATE SUSPECTED &mdash; ESC hot and compressor rpm sagging below target.
+  Consider engaging surfaces / reducing demand / landing.
+  <span id="thermDetail"></span>
+</div>
 
 <div class="grid">
   <!-- LEFT: command charts -->
@@ -64,11 +77,17 @@
     <div class="chart" id="torqueChart"></div>
     <h2>Thrust command</h2>
     <div class="chart" id="thrustChart"></div>
+    <h2 style="margin-top:12px">Compressor (measured, via Teensy)</h2>
+    <div class="kv"><span>rpm (meas / target)</span><span><span id="cRpm" class="big">--</span> / <span id="cTgt">--</span></span></div>
+    <div class="chart" id="rpmChart"></div>
+    <div class="kv"><span>ESC temp</span><span id="cTemp">--</span></div>
+    <div class="kv"><span>volt / amp</span><span id="cVA">-- / --</span></div>
+    <div class="kv"><span>ESC telemetry / err</span><span id="cTlm">--</span></div>
   </div>
 
   <!-- CENTER: valve schematic (canard, top-down, nose up) -->
   <div class="panel">
-    <h2>Valves &mdash; top-down (nose up)</h2>
+    <h2>Valves + surfaces &mdash; top-down (nose up)</h2>
     <svg id="ac" viewBox="0 0 320 300" width="100%" height="300"></svg>
     <div id="servoRow" style="margin-top:6px"></div>
   </div>
@@ -82,7 +101,7 @@
     <div class="bars" id="pupBars"></div>
     <h2 style="margin-top:12px">Link / health</h2>
     <div class="kv"><span>serial</span><span id="hSer">--</span></div>
-    <div class="kv"><span>ctrl / sensor Hz</span><span id="hHz">-- / --</span></div>
+    <div class="kv"><span>ctrl / sensor / comp Hz</span><span id="hHz">-- / -- / --</span></div>
     <div class="kv"><span>crc errors</span><span id="hCrc">--</span></div>
     <div class="kv"><span>cmd fresh / arm fresh</span><span id="hFresh">-- / --</span></div>
     <div class="kv"><span>arm counter</span><span id="hCtr">--</span></div>
@@ -101,7 +120,16 @@ const CFG = {
     ctrl:   {name:"/afc/ctrl_tlm",   type:"afc_bridge_msgs/msg/ValveNodeCtrl",   throttle:50},
     sensor: {name:"/afc/sensor_tlm", type:"afc_bridge_msgs/msg/ValveNodeSensor", throttle:50},
     health: {name:"/afc/health",     type:"afc_bridge_msgs/msg/ValveNodeHealth", throttle:200},
+    comp:   {name:"/afc/compressor", type:"afc_bridge_msgs/msg/ValveNodeComp",   throttle:100},
   },
+  escTempWarn: 80, escTempBad: 90,   // deg C colour bands (flag logic lives on the Tiny)
+  // Traditional surfaces (surf[] order: L wing, R wing, L canard, R canard)
+  surfPos: [
+    {x:75,  y:262, label:"LW"},
+    {x:245, y:262, label:"RW"},
+    {x:62,  y:85,  label:"LC"},
+    {x:258, y:85,  label:"RC"},
+  ],
   valveAbsMax: 1000,     // |valve[]| full-scale for fill (int16 aero-intent units)
   window: 300,           // samples kept in the strip charts (~15s @20Hz)
   // Valve layout: index 0-5 = valves 1-6. Canard aircraft, top-down, nose UP.
@@ -138,6 +166,22 @@ CFG.valvePos.forEach((v,i)=>{
   ac.appendChild(c);ac.appendChild(t);ac.appendChild(val);
   valveEls.push({c,val});
 });
+const surfEls=[];
+CFG.surfPos.forEach((p)=>{
+  const r=svg("rect",{x:p.x-18,y:p.y-5,width:36,height:10,rx:2,fill:"#0d1117",stroke:"#30363d","stroke-width":1.5});
+  const t=svg("text",{x:p.x,y:p.y+19,"text-anchor":"middle",fill:"#8b949e"});t.textContent=p.label;
+  ac.appendChild(r);ac.appendChild(t);
+  surfEls.push({r,t,label:p.label});
+});
+function setSurf(i,value,engaged){
+  const el=surfEls[i]; if(!el)return;
+  const f=Math.max(-1,Math.min(1,value/CFG.valveAbsMax));
+  const col=f<0?getCSS("--port"):getCSS("--stbd");
+  el.r.setAttribute("fill", engaged ? col : "#0d1117");
+  el.r.setAttribute("fill-opacity", engaged ? (0.25+0.65*Math.abs(f)).toFixed(2) : "1");
+  el.r.setAttribute("stroke", engaged ? col : "#30363d");
+  el.t.textContent = el.label+(engaged?" "+Math.round(value):"");
+}
 function setValve(i,value,valid){
   const el=valveEls[i]; if(!el)return;
   const f=Math.max(-1,Math.min(1,value/CFG.valveAbsMax));
@@ -153,11 +197,11 @@ function getCSS(v){return getComputedStyle(document.documentElement).getProperty
 // ---------------------------------------------------------------------------
 // Strip charts (uPlot). Rolling buffers.
 // ---------------------------------------------------------------------------
-function makeChart(el,labels,colors){
+function makeChart(el,labels,colors,ySize){
   const data=[[]]; labels.forEach(()=>data.push([]));
   const series=[{}].concat(labels.map((l,i)=>({label:l,stroke:colors[i],width:1.5})));
   const opts={width:el.clientWidth||360,height:130,series,
-    axes:[{stroke:"#8b949e"},{stroke:"#8b949e"}],
+    axes:[{stroke:"#8b949e"},{stroke:"#8b949e",size:ySize||50}],
     scales:{x:{time:false}},legend:{show:true},cursor:{show:false}};
   const u=new uPlot(opts,data,el);
   return {u,data};
@@ -166,6 +210,9 @@ const torque=makeChart(document.getElementById("torqueChart"),
   ["roll","pitch","yaw"],["#f85149","#3fb950","#58a6ff"]);
 const thrust=makeChart(document.getElementById("thrustChart"),
   ["thrust"],["#d29922"]);
+const rpmCh=makeChart(document.getElementById("rpmChart"),
+  ["rpm meas","rpm target"],["#58a6ff","#8b949e"],64);
+let lastRpmTarget=0;
 let t0=performance.now()/1000;
 function push(ch,vals){
   const t=performance.now()/1000 - t0;
@@ -217,6 +264,7 @@ function subscribe(){
   sub(CFG.topics.ctrl).subscribe(onCtrl);
   sub(CFG.topics.sensor).subscribe(onSensor);
   sub(CFG.topics.health).subscribe(onHealth);
+  sub(CFG.topics.comp).subscribe(onComp);
 }
 
 let lastValid=[true,true,true,true,true,true];
@@ -229,6 +277,7 @@ function onSensor(m){
   document.getElementById("mdotTotal").textContent=m.mdot_total.toFixed(1);
 }
 function onCtrl(m){
+  lastCtrlT=performance.now();
   for(let i=0;i<6;i++) setValve(i, m.valve[i], lastValid[i]);
   document.getElementById("servoRow").textContent =
     "servo us: "+Array.from(m.servo_us).join(" ");
@@ -239,11 +288,53 @@ function onCtrl(m){
   const src=document.getElementById("srcPill");
   src.textContent = "SRC "+(srcMap[m.source]||m.source);
   src.className = "pill "+(m.source===0?"ok":m.source===1?"warn":"bad");
+  lastRpmTarget = m.armed ? m.rpm_target : 0;
+  document.getElementById("cTgt").textContent = lastRpmTarget;
+  const eng = !!m.surf_engaged, surf = m.surf || [0,0,0,0];
+  for(let i=0;i<4;i++) setSurf(i, surf[i], eng);
+  const sp=document.getElementById("surfPill");
+  sp.textContent = eng ? "SURFACES ON" : (m.surf_switch ? "SURF sw on (idle)" : "SURFACES off");
+  sp.className = "pill "+(eng?"warn":"ok");
+}
+let lastCompT=0, lastCtrlT=0;
+// Staleness: a pill that stops updating must not keep saying "ok".
+setInterval(()=>{
+  const now=performance.now();
+  if(lastCompT && now-lastCompT>1500){
+    const tp=document.getElementById("thermPill"); tp.textContent="ESC stale"; tp.className="pill warn";
+    document.getElementById("thermBanner").classList.remove("on");
+  }
+  if(lastCtrlT && now-lastCtrlT>1500){
+    for(const id of ["surfPill","armPill","srcPill"]){
+      const e=document.getElementById(id); e.textContent=e.textContent.replace(/ \(stale\)$/,"")+" (stale)"; e.className="pill warn";
+    }
+  }
+},500);
+function onComp(m){
+  lastCompT=performance.now();
+  document.getElementById("cRpm").textContent = m.rpm;
+  push(rpmCh,[m.rpm, lastRpmTarget]);
+  const t=document.getElementById("cTemp");
+  t.textContent = m.temp_c+" C";
+  t.className = m.temp_c>=CFG.escTempBad?"pill bad":m.temp_c>=CFG.escTempWarn?"pill warn":"";
+  document.getElementById("cVA").textContent = m.volt.toFixed(2)+" V / "+m.amp.toFixed(2)+" A";
+  document.getElementById("cTlm").innerHTML = pill(m.tlm_ok)+" err="+m.err
+    +(m.err===-8?' <span class="pill bad">ESC >=100C</span>':"");
+  const th=!!m.thermal_suspect;
+  const tp=document.getElementById("thermPill");
+  tp.textContent = th ? "ESC THERMAL" : "ESC ok";
+  tp.className = "pill "+(th?"bad":"ok");
+  document.getElementById("thermBanner").classList.toggle("on", th);
+  document.getElementById("thermDetail").textContent = th ? `(${m.temp_c} C, ${m.rpm} rpm vs ${lastRpmTarget})` : "";
 }
 function onHealth(m){
   document.getElementById("hSer").innerHTML = m.serial_connected
     ? '<span class="pill ok">up</span>' : '<span class="pill bad">DOWN</span>';
-  document.getElementById("hHz").textContent = m.ctrl_hz.toFixed(1)+" / "+m.sensor_hz.toFixed(1);
+  document.getElementById("hHz").textContent = m.ctrl_hz.toFixed(1)+" / "+m.sensor_hz.toFixed(1)
+    +" / "+(m.comp_hz!==undefined?m.comp_hz.toFixed(1):"--");
+  const mp=document.getElementById("modePill");
+  mp.textContent = m.mode_str || "MODE ?";
+  mp.className = "pill "+({1:"ok",2:"warn",3:"bad",4:"bad"}[m.mode]||"");
   const crc=document.getElementById("hCrc");
   crc.textContent=m.crc_errors; crc.className = m.crc_errors>0 ? "stale":"";
   document.getElementById("hFresh").innerHTML =

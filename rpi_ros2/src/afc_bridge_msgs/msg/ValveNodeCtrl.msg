@@ -25,3 +25,8 @@ uint8 n_valid               # count of valves feeding the flow sum
 
 int16[6] valve              # aero-intent valve positions
 uint16[12] servo_us         # resolved servo commands (us)
+
+bool surf_engaged           # surfaces ACTIVE: allocated with AFC (switch on, live source, not terminated)
+bool surf_switch            # surface switch position (SBUS / console force), regardless of mode
+int16[4] surf               # surface commands [-1000,1000], 0 = configured center
+                            # order: L wing, R wing, L canard, R canard

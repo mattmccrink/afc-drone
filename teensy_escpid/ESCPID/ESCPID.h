@@ -24,6 +24,16 @@
 #define ESCPID_RESET_GAIN         0xffff            // PIDf gain value that triggers teensy reset
 #define ESCPID_RESET_DELAY        1500              // Delay between reception of reset cmd and effective reset (ms)
 #define ESCPID_COMM_WD_LEVEL      20                // Maximum number of periods without reference refresh
+                                                    //   20 x 2 ms = 40 ms; then ESCCMD's throttle watchdog
+                                                    //   (another 40 ms) sends DShot MOTOR_STOP -> rotor COASTS.
+
+// Reference shaping (AFC decision 2026-09-22, Q4): the reference is RATE-LIMITED
+// toward the host target, not stepped. Spin-up 0 -> 30k rpm takes ~5 s. Stop is
+// NOT ramped: link silence (disarm/terminate/link loss) -> MOTOR_STOP -> coast.
+// Units: RPM_r / reference / measurement are all in 10 rpm (teensyshot units).
+#define ESCPID_REF_RATE_RPM_S     6000              // max reference slew, rpm/s (30k / 5 s)
+#define ESCPID_REF_MAX            6000              // reference clamp, 10 rpm units (= 60k rpm)
+#define ESCPID_USB_DEBUG          1                 // 1 = 10 Hz USB line: tgt ref rpm cmd wd err deg
 
 #define ESCPID_ERROR_MAGIC        -1                // Magic number error code
 

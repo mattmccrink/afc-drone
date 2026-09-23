@@ -41,7 +41,7 @@
 #define ESCCMD_TLM_PER          1000              // If 100, error thresholds are in percent     
 
 #define ESCCMD_MAX_THROTTLE     1999              // Max default throttle value
-#define ESCCMD_MAX_3D_THROTTLE  1999               // Max 3D throttle value
+#define ESCCMD_MAX_3D_THROTTLE  999               // Max 3D throttle value
 #define ESCCMD_MIN_3D_THROTTLE  -999              // Min 3D throttle value
 
 #define ESCCMD_BEEP_DURATION    50                // Duration of a beep (ms)

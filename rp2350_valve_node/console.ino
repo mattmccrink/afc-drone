@@ -32,15 +32,18 @@ static const char* mode_name(CompMode m) {
 
 static void print_status() {
   Serial.printf(
-    "[st] src=%-7s arm=%d(live=%d) term=%d prim=%d | elig fc=%d sbus=%d sw=%d | comp=%-8s rpm=%5u | mdot=%.1f/%.1f g/s nvalid=%u%s%s | v=[%d %d %d %d %d %d] desat=%.2f/%.2f | cal=%s | hb=%lu drop=%lu\n",
+    "[st] src=%-7s arm=%d(live=%d) term=%d prim=%d | elig fc=%d sbus=%d sw=%d | comp=%-8s rpm=%5u%s | mdot=%.1f/%.1f g/s nvalid=%u%s%s | v=[%d %d %d %d %d %d] surf=%s[%d %d %d %d] desat=%.2f/%.2f | cal=%s | hb=%lu drop=%lu\n",
     src_name(g_status.source), g_status.armed?1:0, g_status.arm_live?1:0, g_status.terminated?1:0, g_status.primary_present?1:0,
-    arb_fc_seen_disarmed()?1:0, g_sbus_arm_seen_disarmed?1:0, g_sbus_arm?1:0,
-    mode_name(g_status.comp_mode), g_status.rpm_target,
+    arb_fc_eligible()?1:0, g_sbus_arm_seen_disarmed?1:0, g_sbus_arm?1:0,
+    mode_name(g_status.comp_mode), g_status.rpm_target, g_status.comp_thermal ? " THERMAL" : "",
     (double)g_status.mdot_total, (double)g_status.mdot_target, g_status.n_valid,
     g_status.flow_fallback ? " FALLBACK" : "", g_status.sensor_stale ? " STALE" : "",
     g_valve_dbg[0], g_valve_dbg[1], g_valve_dbg[2], g_valve_dbg[3], g_valve_dbg[4], g_valve_dbg[5],
+    g_status.surf_active ? (g_surf_force >= 0 ? "ON(forced)" : "ON")
+      : g_status.surf_engaged ? "sw-on/idle" : (g_surf_force >= 0 ? "off(forced)" : "off"),
+    g_surf_dbg[0], g_surf_dbg[1], g_surf_dbg[2], g_surf_dbg[3],
     (double)g_alloc_s_rp, (double)g_alloc_s_yaw,
-    g_cal_from_flash ? "flash" : "default", (unsigned long)g_core1_heartbeat),(unsigned long)g_tlm_dropped;
+    g_cal_from_flash ? "flash" : "default", (unsigned long)g_core1_heartbeat, (unsigned long)g_tlm_dropped);
 }
 
 static void print_help() {
@@ -50,13 +53,13 @@ static void print_help() {
     "  status                  one-shot status line\n"
     "  health                  reprint boot/health summary (sensor PROM, cal, liveness)\n"
     "  mon on|off              periodic status line (2 Hz)\n"
-    "  tlm on|off              binary telemetry mode (RX+TX switch to frames)\n"
     "  src auto|primary|sbus|safe   force/release the active source\n"
+    "  surf on|off|auto        force traditional surfaces / follow the SBUS switch (bench)\n"
     "  arm | disarm            simulated Pixhawk arm channel\n"
     "  prim on|off             simulate primary (Pi) presence\n"
     "  sbusfs on|off           simulate SBUS failsafe flag\n"
     "  sbuslost on|off         simulate SBUS frame-lost flag\n"
-    "  sbus                    Write real SBUS if available"
+    "  sbus                    print real SBUS decode (raw ch, arm, surf)\n"
     "  stick R P Y T           set SBUS sticks (floats: roll pitch yaw throttle)\n"
     "  fault valve N on|off    inject per-valve sensor fault (N=0..5)\n"
     "  fault agg on|off        inject aggregate flow fault\n"
@@ -125,9 +128,11 @@ static void dispatch(char* line) {
       }
     }
   }
-  else if (eq(tok[0], "tlm") && n >= 2)  {
-    bool b; if (onoff(tok[1], b)) { g_binary_tlm = b;
-      if (!b) Serial.println(F("[tlm] text mode")); }
+  else if (eq(tok[0], "surf") && n >= 2) {
+    if      (eq(tok[1], "auto")) g_surf_force = -1;
+    else if (eq(tok[1], "on"))   g_surf_force = 1;
+    else if (eq(tok[1], "off"))  g_surf_force = 0;
+    Serial.printf("[surf] %s\n", g_surf_force < 0 ? "follow SBUS switch" : (g_surf_force ? "FORCED ON" : "FORCED OFF"));
   }
   else if (eq(tok[0], "src") && n >= 2) {
     if      (eq(tok[1],"auto"))    arbitration_force(SRC_SAFE, false);
@@ -295,9 +300,9 @@ void console_service(uint32_t now) {
     // (leave step_active set so it HOLDS at step_end; 'servo off' to release)
   }
 
-  // 2 Hz calibration stream for LabVIEW (text mode only): all 12 pressures (!A)
+  // 2 Hz calibration stream for LabVIEW: all 12 pressures (!A)
   // and all 12 temps (!B), fixed width -- unpopulated valves read 0 until wired.
-  if (con_pstream && !g_binary_tlm) {
+  if (con_pstream) {
     static uint32_t last_ps = 0;
     if ((now - last_ps) >= 500) {
       last_ps = now;
@@ -315,7 +320,7 @@ void console_service(uint32_t now) {
     }
   }
 
-  if (!con_mon_on || g_binary_tlm) return;
+  if (!con_mon_on) return;
   static uint32_t last = 0;
   if ((now - last) < 500) return;
   last = now;

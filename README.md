@@ -10,7 +10,7 @@ control surfaces (which are retained as a reversion rung).
 |---|---|---|
 | `rp2350_valve_node/` | RP2350 (Tiny 2350) dual-core valve/sensor node: MS5837 pressure sensing, PCA9685 servos, mass-flow to rpm outer loop, source arbitration, arm enforcement | Active |
 | `teensy_escpid/` | Teensy compressor controller (teensyshot-based DShot ESC, closed-loop RPM) | Working at bench |
-| `rpi_ros2/` | Raspberry Pi ROS2 hub: supervisor + telemetry bridge, Pixhawk arm-token relay | Not started |
+| `rpi_ros2/` | Raspberry Pi ROS2 hub: supervisor + telemetry bridge, Pixhawk arm-token relay, rosbridge dashboard | Working at bench |
 | `host_tools/` | Python bench tools (control panels, serial test clients) | — |
 | `docs/` | Architecture specs, handoffs, project tracker, datasheets | — |
 
@@ -29,5 +29,5 @@ control surfaces (which are retained as a reversion rung).
 
 ## Where to start
 
-- System architecture: `docs/rp2350_valve_node_architecture.md`
-- Current task state: `docs/project_tracker.md`
+- System architecture: `rp2350_valve_node_architecture.md` (project knowledge)
+- Current task state, safety register and test plan: `project_tracker.md` (project knowledge)

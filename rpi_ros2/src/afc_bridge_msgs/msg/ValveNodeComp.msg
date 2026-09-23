@@ -10,3 +10,5 @@ int16   temp_c        # ESC temperature (deg C)
 int8    err           # ESCCMD err code (0 = ok, -10 = TLM_LOST)
 bool    tlm_ok        # Teensy had fresh ESC telemetry (err==0 & not stale)
 uint32  node_stamp_ms # tiny millis() at emit, for cross-stream correlation
+bool    thermal_suspect  # ESC hot (>=90 C) AND rpm sagging >10% below target for >=3 s
+                         # (ESC likely self-derating). Advisory -- pilot-actionable.

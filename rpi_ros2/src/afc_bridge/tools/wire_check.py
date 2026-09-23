@@ -1,9 +1,9 @@
 """
-Off-hardware wire test for the whole framing path: CMD/ARM out, CTRL/SENSOR in.
+Off-hardware wire test for the whole framing path: CMD/ARM out, CTRL/SENSOR/COMP in.
 Mirrors both sides of framing.ino (parse_byte/on_frame and tlm_service) so the
 Pi modules are proven byte-exact without a tiny attached.
 
-Run from the package dir:  python3 test/test_wire.py
+Run from the package dir:  PYTHONPATH=. python3 tools/wire_check.py
 """
 import struct
 import sys
@@ -65,6 +65,27 @@ def tiny_pack_ctrl(source, armed, comp_mode, flow_fb, rpm_target, n_valid,
     return F.build_frame(F.FT_CTRL_TLM, pl)
 
 
+def tiny_pack_ctrl_full(source, armed, comp_mode, flow_fb, rpm_target, n_valid,
+                        valve, servo_us, mode, flags, drp, dyaw, surf):
+    """Current firmware layout: 43 base + 4 fault-tree + 8 surfaces = 55 B."""
+    pl = struct.pack("<BBBBHB", source, armed, comp_mode, flow_fb, rpm_target, n_valid)
+    pl += struct.pack("<6h", *valve)
+    pl += struct.pack("<12H", *servo_us)
+    pl += struct.pack("<BBBB", mode, flags, drp, dyaw)
+    pl += struct.pack("<4h", *surf)
+    assert len(pl) == F.CTRL_TLM_LEN_EXT2
+    return F.build_frame(F.FT_CTRL_TLM, pl)
+
+
+def tiny_pack_comp(volt_cv, amp_ca, rpm10, temp_c, err, ok, node_ms, flags=None):
+    """Mirror of the COMP_TLM block in tlm_service(): 13 B base (+1 B flags)."""
+    pl = struct.pack("<HHhBbB", volt_cv, amp_ca, rpm10, temp_c, err, ok)
+    pl += struct.pack("<I", node_ms)
+    if flags is not None:
+        pl += struct.pack("<B", flags)
+    return F.build_frame(F.FT_COMP_TLM, pl)
+
+
 def tiny_pack_sensor(p_up, p_lo, t_die, mdot, mdot_total, valid, node_ms):
     pl = b""
     pl += struct.pack("<6h", *[round(x * 10) for x in p_up])
@@ -110,6 +131,43 @@ def test_ctrl_tlm():
     check("n_valid", d["n_valid"] == 5)
     check("valve[]", d["valve"] == valve)
     check("servo_us[]", d["servo_us"] == servo)
+
+
+def test_ctrl_tlm_ext():
+    print("CTRL_TLM in: fault-tree + surfaces extension")
+    valve = [100, -100, 50, -50, 25, -25]
+    servo = [1500] * 12
+    surf = [520, -520, 300, 300]
+    flags = 0x01 | 0x02 | 0x10 | 0x20   # terminated, FC eligible, surfaces active, switch on
+    frame = tiny_pack_ctrl_full(0, 1, 3, 1, 30000, 6, valve, servo, 4, flags, 77, 100, surf)
+    got = list(F.FrameReader().feed(frame))
+    check("one 55-byte frame", len(got) == 1 and len(got[0].payload) == 55)
+    d = F.decode_ctrl_tlm(got[0].payload)
+    check("mode/terminated", d["mode"] == 4 and d["terminated"] is True)
+    check("elig_fc / not elig_sbus", d["elig_fc"] is True and d["elig_sbus"] is False)
+    check("surf_engaged bit4 / surf_switch bit5", d["surf_engaged"] is True and d["surf_switch"] is True)
+    check("desat scales", approx(d["desat_rp"], 0.77) and approx(d["desat_yaw"], 1.0))
+    check("surf[] round-trip", d["surf"] == surf)
+    # old 47-byte firmware still decodes, with surfaces defaulted
+    d47 = F.decode_ctrl_tlm(got[0].payload[:47])
+    check("47-byte frame: surf defaults to centered", d47["surf"] == [0, 0, 0, 0])
+
+
+def test_comp_tlm():
+    print("COMP_TLM in: byte-exact round-trip (+ thermal flag ext)")
+    frame = tiny_pack_comp(2520, 4550, 3012, 91, -8, 1, 7654321, flags=0x01)
+    got = list(F.FrameReader().feed(frame))
+    check("one 14-byte frame", len(got) == 1 and got[0].type == F.FT_COMP_TLM
+          and len(got[0].payload) == 14)
+    d = F.decode_comp_tlm(got[0].payload)
+    check("volt/amp scaling", approx(d["volt"], 25.20) and approx(d["amp"], 45.50))
+    check("rpm = rpm10*10", d["rpm"] == 30120)
+    check("temp / signed err", d["temp_c"] == 91 and d["err"] == -8)
+    check("tlm_ok / node_ms", d["tlm_ok"] is True and d["node_stamp_ms"] == 7654321)
+    check("thermal_suspect set", d["thermal_suspect"] is True)
+    got13 = list(F.FrameReader().feed(tiny_pack_comp(2520, 0, 0, 30, 0, 0, 1)))
+    d13 = F.decode_comp_tlm(got13[0].payload)
+    check("13-byte (old fw) frame: thermal defaults False", d13["thermal_suspect"] is False)
 
 
 def test_sensor_tlm():
@@ -174,7 +232,8 @@ def test_arm_token():
 
 
 def main():
-    for fn in [test_cmd_and_resync, test_ctrl_tlm, test_sensor_tlm, test_arm_token]:
+    for fn in [test_cmd_and_resync, test_ctrl_tlm, test_ctrl_tlm_ext, test_comp_tlm,
+               test_sensor_tlm, test_arm_token]:
         fn()
     print()
     if _fails:

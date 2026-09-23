@@ -1075,6 +1075,10 @@ int ESCCMD_tic( void )  {
         // Watchdog triggered on ESC number i
         ESCCMD_cmd[i] = DSHOT_CMD_MOTOR_STOP;
         ESCCMD_tlm[i] = 0;
+        // AFC: invalidate the last telemetry sample. Telemetry requests stop with
+        // MOTOR_STOP, so the stored rpm/temp would otherwise read as current on
+        // the next start (stale-rpm PID kick). Cleared until a fresh packet lands.
+        ESCCMD_tlm_valid[i] = 0;
         ESCCMD_last_error[i] = 0;
         ESCCMD_tlm_lost_cnt[i] = 0;
         ESCCMD_CRC_errors[i] = 0;

@@ -5,7 +5,7 @@
 //  simulated hardware leaves (sensors, servos, SBUS) so the whole thing runs and
 //  is drivable on a bare board over USB + the onboard RGB LED.
 //
-//  Core 0 (setup/loop):   USB comms, source arbitration, arm enforcement,
+//  Core 0 (setup/loop):   Pi/console comms, source arbitration, arm enforcement,
 //                         allocation, mass-flow->rpm outer loop, Teensy stream,
 //                         watchdog + status LED.
 //  Core 1 (setup1/loop1): fixed 100 Hz I2C service -- sensor pipeline, venturi
@@ -67,6 +67,9 @@ bool g_sbus_failsafe  = false;         // simulated SBUS failsafe flag
 bool g_sbus_framelost = false;         // simulated SBUS frame-lost flag
 bool g_sbus_arm       = false;         // SBUS arm-switch state (clean-frame gated; SBUS source only)
 bool g_sbus_arm_seen_disarmed = false; // per-source boot latch: seen a clean disarmed SBUS frame once
+bool g_sbus_surf_sw   = false;         // SBUS surface switch (clean-frame gated; holds on dropout)
+int8_t g_surf_force   = -1;            // console 'surf': -1 follow SBUS, 0 force off, 1 force on (bench)
+int16_t g_surf_dbg[SURF_COUNT] = {0};  // last published surface commands (core-0 console/tlm)
 int16_t g_valve_dbg[VALVE_COUNT] = {0}; // last published valve poses (core-0 console/debug)
 float   g_alloc_s_rp  = 1.0f;          // last roll/pitch desaturation scale (1.0 = no clip)
 float   g_alloc_s_yaw = 1.0f;          // last yaw desaturation scale (1.0 = no clip)
@@ -88,16 +91,13 @@ bool    g_cal_from_flash = false;           // true if coeffs came from LittleFS
 // -----------------------------------------------------------------------------
 NodeStatus g_status;
 
-// Console output mode: text (human) vs binary telemetry (Pi/script).
-bool g_binary_tlm = false;
-
 // -----------------------------------------------------------------------------
 //  Forward decls implemented in module tabs (Arduino auto-prototypes too, but
 //  explicit decls keep the intent legible).
 // -----------------------------------------------------------------------------
 void framing_setup();
-void framing_pump();                       // service USB RX (binary + text)
-void tlm_service(uint32_t now);            // emit binary telemetry if enabled
+void framing_pump();                       // service Pi RX (binary) + USB console (text)
+void tlm_service(uint32_t now);            // binary telemetry to the Pi (Serial2)
 void console_service(uint32_t now);        // periodic human status line
 
 void primary_sim_update(uint32_t now);
@@ -178,7 +178,7 @@ static void poll_user_button(uint32_t now) {
 void loop() {
   uint32_t now = millis();
 
-  framing_pump();               // ingest USB (binary frames and/or text commands)
+  framing_pump();               // ingest Pi frames (Serial2) + console text (USB)
   poll_user_button(now);
 
   #if !USE_REAL_PRIMARY
@@ -195,7 +195,7 @@ void loop() {
   teensy_rx_service(now);
   //teensy_tlm_print(now);   // remove once verified; or gate behind a 'mon' flag
 
-  tlm_service(now);             // binary telemetry out (if 'tlm on')
+  tlm_service(now);             // binary telemetry out to the Pi (always)
   console_service(now);         // human status line (if 'mon on')
   watchdog_service(now);        // RGB status + conditional hardware watchdog pet
 }
