@@ -186,7 +186,7 @@ void setup() {
   ESCCMD_arm_all( );
   
   // Switch 3D mode on
-  ESCCMD_3D_on( );
+  //ESCCMD_3D_on( );
 
   // Arming ESCs
   ESCCMD_arm_all( );
