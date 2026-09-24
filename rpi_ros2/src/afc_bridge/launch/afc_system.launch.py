@@ -71,7 +71,7 @@ def generate_launch_description():
         DeclareLaunchArgument("serial_port", default_value="/dev/ttyAMA1"),   # Tiny, uart3
         DeclareLaunchArgument("agent_dev", default_value="/dev/serial0"),     # FC, ttyAMA0
         DeclareLaunchArgument("agent_baud", default_value="921600"),
-        DeclareLaunchArgument("start_agent", default_value="true"),
+        DeclareLaunchArgument("start_agent", default_value="false"),
         DeclareLaunchArgument("start_rosbridge", default_value="true"),
         DeclareLaunchArgument("rosbridge_port", default_value="9090"),
         agent,
