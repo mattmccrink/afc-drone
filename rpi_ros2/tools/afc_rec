@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# afc_rec -- start/stop/inspect AFC bag recording on the Pi.
+#
+#   afc_rec start [tag]   start a new bag (tag defaults to "run")
+#   afc_rec stop          stop recording, print the bag summary
+#   afc_rec status        is it recording? latest bags, free disk
+#   afc_rec ls            list bags with sizes
+#
+# Install: see INSTALL.md.
+set -euo pipefail
+
+BAG_DIR="${AFC_BAG_DIR:-/home/pi/bags}"
+UNIT_GLOB='afc-record@*.service'
+
+ros_env() {
+  set +u
+  source /opt/ros/humble/setup.bash
+  source "${AFC_WS:-/home/pi/afc-drone/rpi_ros2}/install/setup.bash"
+  set -u
+}
+
+active_units() {
+  systemctl list-units --state=active --no-legend --plain "$UNIT_GLOB" \
+    | awk '{print $1}'
+}
+
+latest_bag() {
+  ls -1dt "$BAG_DIR"/afc_* 2>/dev/null | head -1 || true
+}
+
+case "${1:-status}" in
+  start)
+    if [[ -n "$(active_units)" ]]; then
+      echo "already recording: $(active_units)"; exit 1
+    fi
+    tag="${2:-run}"
+    # systemd instance names can't contain '/' or spaces
+    tag="${tag//[^A-Za-z0-9_.-]/_}"
+    sudo systemctl start "afc-record@${tag}.service"
+    sleep 2
+    if systemctl is-active --quiet "afc-record@${tag}.service"; then
+      echo "recording -> $(latest_bag)"
+    else
+      echo "failed to start; last log lines:"
+      journalctl -u "afc-record@${tag}.service" -n 20 --no-pager
+      exit 1
+    fi
+    ;;
+  stop)
+    units="$(active_units)"
+    if [[ -z "$units" ]]; then echo "not recording"; exit 0; fi
+    sudo systemctl stop $units
+    bag="$(latest_bag)"
+    echo "stopped: $bag"
+    ros_env
+    ros2 bag info "$bag" || echo "(metadata missing? try: ros2 bag reindex $bag)"
+    ;;
+  status)
+    units="$(active_units)"
+    if [[ -n "$units" ]]; then
+      echo "RECORDING ($units) -> $(latest_bag)  [$(du -sh "$(latest_bag)" | cut -f1)]"
+    else
+      echo "idle"
+    fi
+    echo "latest bags:"; ls -1dt "$BAG_DIR"/afc_* 2>/dev/null | head -3 | sed 's/^/  /' || true
+    df -h "$BAG_DIR" | tail -1 | awk '{print "disk: " $4 " free of " $2}'
+    ;;
+  ls)
+    du -sh "$BAG_DIR"/afc_* 2>/dev/null | sort -k2 || echo "no bags in $BAG_DIR"
+    ;;
+  *)
+    sed -n '2,10p' "$0"; exit 1
+    ;;
+esac

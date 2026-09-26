@@ -1,0 +1,26 @@
+# /etc/systemd/system/afc-record@.service
+#
+# Manual-only rosbag recorder. The instance name is the bag tag:
+#   sudo systemctl start afc-record@T-C5      -> ~/bags/afc_<date>_<time>_T-C5
+# Use the `afc_rec` wrapper rather than calling systemctl directly.
+#
+# Deliberately has NO [Install] section: it can't be enabled at boot, so an
+# idle Pi never fills the SD card.
+
+[Unit]
+Description=AFC rosbag recorder (%i)
+After=network-online.target microxrce-agent.service
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+# Must match the shell that runs the ROS graph, or the recorder sees no topics.
+# Uncomment / edit if you set these in ~/.bashrc:
+#Environment=ROS_DOMAIN_ID=0
+#Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+ExecStart=/home/pi/afc-drone/rpi_ros2/tools/afc_record.sh %i
+# Clean close: SIGINT lets rosbag2 flush and write metadata.yaml.
+KillSignal=SIGINT
+TimeoutStopSec=20
+Restart=no
