@@ -16,6 +16,39 @@ struct ValveCmd {
   uint32_t stamp_ms;             // set by core 0; core 1 checks staleness
 };
 
+// Why a venturi is (in)valid -- per valve, in SensorFrame.why[]. Worst-first
+// order is not implied; the first failing check wins (see sensors.ino).
+enum VentHealth : uint8_t {
+  VH_OK = 0,
+  VH_UNMAPPED,     // no up/lo pair in SENSOR_MAP
+  VH_NOPROM,       // a sensor's PROM read/CRC failed at boot (never usable)
+  VH_NODATA,       // no reading yet since boot
+  VH_STALE,        // a sensor stopped answering (no good read within SENS_*STALE_MS)
+  VH_FROZEN,       // a sensor returns identical raw counts (SENS_FROZEN_N)
+  VH_LOSSY,        // a sensor fails too many reads (SENS_FAIL_WEIGHT / SENS_FAIL_TRIP)
+  VH_RANGE,        // pressure / temperature outside physical limits
+  VH_DPNEG,        // throat above upstream beyond VENTURI_DP_NEG_MAX
+  VH_RECOVER,      // was faulty; waiting out SENS_RECOVER_MS clean time
+  VH_INJECTED,     // console 'fault' injection
+};
+
+inline const char* vh_name(uint8_t w) {
+  switch (w) {
+    case VH_OK:       return "OK";
+    case VH_UNMAPPED: return "UNMAPPED";
+    case VH_NOPROM:   return "NOPROM";
+    case VH_NODATA:   return "NODATA";
+    case VH_STALE:    return "STALE";
+    case VH_FROZEN:   return "FROZEN";
+    case VH_LOSSY:    return "LOSSY";
+    case VH_RANGE:    return "RANGE";
+    case VH_DPNEG:    return "DPNEG";
+    case VH_RECOVER:  return "RECOVER";
+    case VH_INJECTED: return "INJECTED";
+    default:          return "?";
+  }
+}
+
 // core 1 -> core 0 : sensor + resolved-servo frame
 struct SensorFrame {
   float    p_up[VALVE_COUNT];    // upstream pressure  (mbar)
@@ -26,6 +59,7 @@ struct SensorFrame {
   float    mdot_total;           // summed over VALID valves only
   uint16_t servo_us[SERVO_COUNT];// resolved servo commands (telemetry echo)
   uint8_t  valid[VALVE_COUNT];   // per-valve validity flag (see sensors_sim)
+  uint8_t  why[VALVE_COUNT];     // VentHealth reason (VH_OK when valid)
   uint8_t  n_valid;              // count of valid valves
 };
 

@@ -72,7 +72,8 @@ C ch4/ch5 = L/R canard. Center/throw/direction per surface in `config.h`.
 ```
 help                         list commands
 status                       one-shot status line (src/arm/elig, comp rpm + THERMAL, valves, surf)
-health                       reprint boot/health summary
+health                       reprint boot/health summary (incl. last reset cause, vhealth)
+vhealth                      per-venturi validity reason + per-sensor read/fault counters
 mon on|off                   periodic status line (2 Hz)
 src auto|primary|sbus|safe   force / release the active source (never leave forced)
 surf on|off|auto             force traditional surfaces / follow the SBUS switch (bench)
@@ -85,7 +86,16 @@ fault valve N on|off / fault agg on|off   inject sensor faults
 mdot X                       set mass-flow target (g/s)
 sens / pstream on|off        sensor dump / 2 Hz LabVIEW stream
 servo|sweep|step ...         PCA9685 bring-up (bypasses the staleness failsafe)
-save / zero / calshow        calibration store
+save / zero / calshow        calibration store (save/zero refused while armed; zero also
+                             waits ZERO_SETTLE_MS after disarm and skips unhealthy venturis)
+```
+
+Bench-only, compiled in with `BENCH_HOOKS 1` in `config.h` (default 0; boot banner
+and a compiler warning flag such a build). Never fly a BENCH_HOOKS build.
+
+```
+hang core0|core1             stall a core -> watchdog reset (T-S3 / T-S7)
+tdrop N                      skip the next N Teensy frames, 20 ms each (T-C4 / T-C5)
 ```
 
 The onboard **BOOT/USER button (GP23)** toggles simulated primary presence.
@@ -103,6 +113,14 @@ The onboard **BOOT/USER button (GP23)** toggles simulated primary presence.
 - **Servos never go limp:** stale core-0 command (and boot) → defined-safe valve
   pose (0 through the curve fit) + centered surfaces.
 - **Total loss 3 s → terminate** (air off); only if armed at least once.
+- **Venturi health (2026-09-26):** a venturi is valid only if both sensors are
+  answering (no good read within 200 ms pressure / 2 s temperature → STALE),
+  not frozen (30 identical raw counts), not losing more than ~1/3 of reads
+  (LOSSY), in range, and throat not above upstream by > 5 mbar (DPNEG). One-off
+  corrupt reads are dropped (a real step is accepted on the confirming read).
+  After any fault a venturi waits 500 ms clean before counting again. Fewer
+  than `MIN_VALID_VALVES` (= all 6) valid → compressor holds `RPM_FALLBACK`.
+  See `vhealth`; thresholds are placeholders in `config.h`.
 
 ---
 

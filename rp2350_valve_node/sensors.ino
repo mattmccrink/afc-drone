@@ -24,6 +24,7 @@
 
 #if USE_REAL_I2C
 #include <Wire.h>
+#include "vent_health.h"
 
 // ---------------------------------------------------------------------------
 //  SENSOR MAP  --  EDIT as the tree populates (open decision #1).
@@ -64,6 +65,11 @@ static bool     s_ema_init[SENSOR_COUNT];
 
 // ---- per-valve slot lookup ----
 static int8_t   s_up[VALVE_COUNT], s_lo[VALVE_COUNT];
+
+// ---- health (vent_health.h) ----
+static SlotHealth s_h[SENSOR_COUNT];
+static VentGate   s_gate[VALVE_COUNT];
+static uint8_t    s_why[VALVE_COUNT];     // last published reason (console)
 
 // ---- Valve constants ----
 //ET and MMC calibration using Alicat mass flow sensor, 9/10/2026
@@ -175,11 +181,34 @@ void sensors_health_print() {
                   s_prom_ok[k] ? "OK" : "FAIL");
 }
 
+// Per-venturi reason + per-sensor counters ('vhealth'). Runs on core 0 and
+// reads core-1 counters without a lock: 32-bit reads are atomic, so each
+// number is real, but a line can mix values from adjacent ticks. Diagnostic only.
+void sensors_vhealth_print() {
+  uint32_t now = millis();
+  Serial.println(F("[vh] venturi  reason     (valid = OK; fallback if fewer than MIN_VALID_VALVES)"));
+  for (int v = 0; v < VALVE_COUNT; ++v)
+    Serial.printf("[vh] v%d       %s\n", v, vh_name(s_why[v]));
+  Serial.println(F("[vh] slot mux  ch valve role state    ok      fail    spike  stale_ev frozen_ev lossy_ev score same d1_age_ms"));
+  for (int k = 0; k < N_SLOTS; ++k) {
+    const SlotHealth& h = s_h[k];
+    Serial.printf("[vh] %-4d 0x%02X %-2u %-5u %-4s %-8s %-7lu %-7lu %-6lu %-8lu %-9lu %-8lu %-5u %-4u %ld\n",
+      k, SENSOR_MAP[k].mux, SENSOR_MAP[k].ch, SENSOR_MAP[k].valve,
+      SENSOR_MAP[k].role == ROLE_UP ? "UP" : "LO", vh_name(h.state),
+      (unsigned long)h.n_ok, (unsigned long)h.n_fail, (unsigned long)h.n_spike,
+      (unsigned long)h.n_stale_ev, (unsigned long)h.n_frozen_ev, (unsigned long)h.n_lossy_ev,
+      (unsigned)h.fail_score, (unsigned)h.same_d1,
+      h.seen_d1 ? (long)(now - h.last_d1_ms) : -1L);
+  }
+}
+
 // ---------------------------------------------------------------------------
 //  Setup: build mux list + valve lookup, cache PROM per sensor
 // ---------------------------------------------------------------------------
 void sensors_setup() {
-  for (int v = 0; v < VALVE_COUNT; ++v) { s_up[v] = -1; s_lo[v] = -1; }
+  static_assert(sizeof(SENSOR_MAP) / sizeof(SENSOR_MAP[0]) <= SENSOR_COUNT,
+                "SENSOR_MAP has more slots than SENSOR_COUNT");
+  for (int v = 0; v < VALVE_COUNT; ++v) { s_up[v] = -1; s_lo[v] = -1; s_why[v] = VH_NODATA; }
   s_nmux = 0;
 
   for (int k = 0; k < N_SLOTS; ++k) {
@@ -203,13 +232,17 @@ void sensors_setup() {
 //  100 Hz tick
 // ---------------------------------------------------------------------------
 void sensors_tick(uint32_t tick) {
+  uint32_t now = millis();
+
   // ---- 1) read back a conversion that has become ready ----
   if (s_conv_pending && (int32_t)(tick - s_conv_ready_tick) >= 0) {
     for (int k = 0; k < N_SLOTS; ++k) {
       if (!s_prom_ok[k]) continue;
       mux_select_only(SENSOR_MAP[k].mux, SENSOR_MAP[k].ch);
-      uint32_t raw;
-      if (ms_read_adc(raw)) {
+      uint32_t raw = 0;
+      bool xfer = ms_read_adc(raw);
+      // Bad transfers, 0 / 0xFFFFFF and D1 spikes never reach compensation.
+      if (sh_on_read(s_h[k], s_conv_type, xfer, raw, now)) {
         if (s_conv_type == 0) { s_rawD1[k] = raw; s_have1[k] = true; }
         else                  { s_rawD2[k] = raw; s_have2[k] = true; }
       }
@@ -225,13 +258,26 @@ void sensors_tick(uint32_t tick) {
     mux_close_all();
   }
 
-  // ---- 2) assemble + publish per-valve frame (every tick; holds between updates) ----
+  // ---- 2) health: evaluate every sensor slot ----
+  uint8_t sh[SENSOR_COUNT];
+  for (int k = 0; k < SENSOR_COUNT; ++k) sh[k] = VH_UNMAPPED;
+  for (int k = 0; k < N_SLOTS; ++k) {
+    sh[k] = sh_eval(s_h[k], s_prom_ok[k], now);
+    // A faulted slot restarts its EMA on recovery instead of blending from a
+    // value that may be long stale.
+    if (sh[k] == VH_STALE || sh[k] == VH_FROZEN || sh[k] == VH_LOSSY) s_ema_init[k] = false;
+  }
+
+  // ---- 3) assemble + publish per-valve frame (every tick; holds between updates) ----
   SensorFrame& out = g_sensor_pub.begin_write();
   float total = 0.0f; uint8_t nvalid = 0;
 
   for (int v = 0; v < VALVE_COUNT; ++v) {
     int up = s_up[v], lo = s_lo[v];
-    bool paired = (up >= 0 && lo >= 0 && s_prom_ok[up] && s_prom_ok[lo] && s_have1[up] && s_have1[lo]);
+    bool mapped = (up >= 0 && lo >= 0);
+    // Values are published whenever data exists (so a frozen / stale reading
+    // stays visible for diagnosis); VALIDITY is decided separately below.
+    bool paired = mapped && s_prom_ok[up] && s_prom_ok[lo] && s_have1[up] && s_have1[lo];
 
     float pu = paired ? s_P[up] : 0.0f;
     float pl = paired ? s_P[lo] : 0.0f;
@@ -242,15 +288,20 @@ void sensors_tick(uint32_t tick) {
                     pl >= MS_P_RANGE_MIN && pl <= MS_P_RANGE_MAX &&
                     td >= MS_T_RANGE_MIN && td <= MS_T_RANGE_MAX;
 
-    // VALIDITY = sensor health only. Flow presence is a separate deadband test,
-    // so a healthy sensor at low/zero flow still counts toward n_valid.
-    bool valid = range_ok && !g_fault_valve[v] && !g_fault_aggregate;
-
-
- //float pu_adjusted =  pu - g_dp_zero[v];
-
     float dp = ((pu - pl) - g_dp_zero[v]);          // zero-corrected differential (mbar)
-//float dp = pl - pu_adjusted; // - g_dp_zero[v];          // zero-corrected differential (mbar)
+
+    // VALIDITY = sensor + pair health only. Flow presence is a separate
+    // deadband test, so a healthy venturi at zero flow still counts.
+    VentInputs vin;
+    vin.mapped   = mapped;
+    vin.sh_up    = mapped ? sh[up] : (uint8_t)VH_UNMAPPED;
+    vin.sh_lo    = mapped ? sh[lo] : (uint8_t)VH_UNMAPPED;
+    vin.injected = g_fault_valve[v] || g_fault_aggregate;
+    vin.range_ok = range_ok;
+    vin.dp_corr  = dp;
+    uint8_t why  = vent_gate(s_gate[v], vent_reason(vin), now);
+    bool valid   = (why == VH_OK);
+    s_why[v]     = why;
 
     float mdot = 0.0f;
     if (valid) {
@@ -268,6 +319,7 @@ void sensors_tick(uint32_t tick) {
     out.t_lo[v]  = paired ? s_T[lo] : 0.0f;              // throat (cal/tempco)
     out.mdot[v]  = mdot;
     out.valid[v] = valid ? 1 : 0;
+    out.why[v]   = why;
   }
 
   out.mdot_total = total;
@@ -275,7 +327,7 @@ void sensors_tick(uint32_t tick) {
   for (int s = 0; s < SERVO_COUNT; ++s) out.servo_us[s] = g_servo_us_echo[s];
   g_sensor_pub.end_write();
 
-  // ---- 3) if nothing is in flight, kick the next conversion (broadcast) ----
+  // ---- 4) if nothing is in flight, kick the next conversion (broadcast) ----
   if (!s_conv_pending) {
     int type = ((s_conv_count % D2_CADENCE_TICKS) == 0) ? 1 : 0;   // D2 temp vs D1 pressure
     mux_open_all_populated();

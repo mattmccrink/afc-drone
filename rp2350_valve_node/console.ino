@@ -71,7 +71,14 @@ static void print_help() {
     "  step <A|B|C> <ch> [min max step_us hold_ms]  step one channel (default 1000 2000 100 200)\n"
     "  save                    persist current calibration to LittleFS\n"
     "  zero                    capture no-flow dp offset per valve, then save\n"
-    "  calshow                 show calibration source + servo0 coeffs + dp_zero"));
+    "  calshow                 show calibration source + servo0 coeffs + dp_zero\n"
+    "  vhealth                 per-venturi validity reason + per-sensor read/fault counters"));
+#if BENCH_HOOKS
+  Serial.println(F(
+    "bench hooks (BENCH_HOOKS=1 -- not a flight build):\n"
+    "  hang core0|core1        stall a core -> watchdog reset (T-S3 / T-S7)\n"
+    "  tdrop N                 skip the next N Teensy frames, 20 ms each (T-C4 / T-C5)"));
+#endif
 }
 
 static bool eq(const char* a, const char* b) { return strcmp(a, b) == 0; }
@@ -108,11 +115,39 @@ static void dispatch(char* line) {
   else if (eq(tok[0], "status")) { print_status(); }
   else if (eq(tok[0], "health")) {
     Serial.println(F("RP2350 valve/sensor node -- health"));
+    Serial.printf("[health] last reset cause=%s  uptime=%lu s\n",
+                  g_reset_cause, (unsigned long)(millis() / 1000));
     Serial.printf("[health] core1 heartbeat=%lu (should advance between calls)\n",
                   (unsigned long)g_core1_heartbeat);
     Serial.printf("[health] cal source=%s\n", g_cal_from_flash ? "flash" : "default");
     sensors_health_print();
     servos_health_print();
+    sensors_vhealth_print();
+  }
+  else if (eq(tok[0], "vhealth")) { sensors_vhealth_print(); }
+  else if (eq(tok[0], "hang") || eq(tok[0], "tdrop")) {
+#if BENCH_HOOKS
+    if (eq(tok[0], "hang") && n >= 2 && eq(tok[1], "core0")) {
+      // Core 0 stops here: no more WDT pets -> hardware reset in ~WDT_TIMEOUT_MS.
+      // Core 1 keeps running and, after CMD_TIMEOUT_MS, drives the safe pose.
+      Serial.println(F("[hang] core0 spinning; expect safe pose, then WATCHDOG reset"));
+      Serial.flush();
+      for (;;) { tight_loop_contents(); }
+    } else if (eq(tok[0], "hang") && n >= 2 && eq(tok[1], "core1")) {
+      // Core 1 stops; core 0 sees the heartbeat stall (CORE1_STALL_TRIP_MS),
+      // withholds the pet -> reset. PCA9685s hold their last pulse meanwhile.
+      g_hang_core1 = true;
+      Serial.println(F("[hang] core1 spinning; expect WATCHDOG reset"));
+    } else if (eq(tok[0], "tdrop") && n >= 2) {
+      int k = atoi(tok[1]);
+      if (k < 1 || k > 250) Serial.println(F("[tdrop] N must be 1..250"));
+      else { g_tdrop = (uint16_t)k;
+             Serial.printf("[tdrop] skipping next %d Teensy frame(s) (~%d ms; only while armed)\n",
+                           k, k * (1000 / TEENSY_STREAM_HZ)); }
+    } else Serial.println(F("usage: hang core0|core1 | tdrop N"));
+#else
+    Serial.println(F("[bench] hooks not compiled in (BENCH_HOOKS=0)"));
+#endif
   }
   else if (eq(tok[0], "mon") && n >= 2)  { onoff(tok[1], con_mon_on); }
   else if (eq(tok[0], "pstream") && n >= 2) {
@@ -237,21 +272,42 @@ static void dispatch(char* line) {
       Serial.printf("[sens] v%d pu=%.2f pl=%.2f dpraw=%.2f dpz=%.2f dpcorr=%.2f mbar t=%.2f C mdot=%.3f g/s %s\n",
         v, (double)fr.p_up[v], (double)fr.p_lo[v], (double)dpraw,
         (double)g_dp_zero[v], (double)dpcorr, (double)fr.t_die[v],
-        (double)fr.mdot[v], fr.valid[v] ? "OK" : "--");
+        (double)fr.mdot[v], vh_name(fr.why[v]));
     }
     Serial.printf("[sens] total=%.3f g/s  nvalid=%u\n", (double)fr.mdot_total, fr.n_valid); 
   }           
-  else if (eq(tok[0], "save")) { Serial.println(cal_save() ? F("[cal] saved") : F("[cal] SAVE FAILED")); }
+  else if (eq(tok[0], "save")) {
+    // Flash writes pause core 1 (sensor reads + servo writes): never while armed.
+    if (g_status.armed) { Serial.println(F("[cal] refused: disarm first")); return; }
+    Serial.println(cal_save() ? F("[cal] saved") : F("[cal] SAVE FAILED"));
+  }
   else if (eq(tok[0], "zero")) {
     // Capture the current no-flow (p_up - p_lo) per valve as the offset. MUST be
     // done at genuine no-flow (compressor stopped, still air).
+    if (g_status.armed) { Serial.println(F("[zero] refused: disarm first (needs no flow)")); return; }
+    if (g_last_armed_ms != 0 && (millis() - g_last_armed_ms) < ZERO_SETTLE_MS) {
+      Serial.printf("[zero] refused: rotor may still be coasting; wait %lu s after disarm\n",
+                    (unsigned long)((ZERO_SETTLE_MS - (millis() - g_last_armed_ms)) / 1000 + 1));
+      return;
+    }
     SensorFrame fr;
     if (!g_sensor_pub.snapshot(fr)) { Serial.println(F("[zero] no sensor frame")); return; }
     int n = 0;
     for (int v = 0; v < VALVE_COUNT; ++v) {
-      if (fr.p_up[v] > 0.0f && fr.p_lo[v] > 0.0f) {   // a paired valve is present
-        g_dp_zero[v] = fr.p_up[v] - fr.p_lo[v];
+      // Only from a venturi whose sensors are healthy: an offset captured from a
+      // stale / frozen sensor would bias dp for good. DPNEG is the exception --
+      // a large raw offset between the pair is exactly what 'zero' removes.
+      bool healthy = (fr.why[v] == VH_OK || fr.why[v] == VH_DPNEG);
+      float off = fr.p_up[v] - fr.p_lo[v];
+      if (healthy && fr.p_up[v] > 0.0f && fr.p_lo[v] > 0.0f && fabsf(off) > ZERO_MAX_OFFSET) {
+        Serial.printf("[zero] v%d refused: offset %.2f mbar > %.1f -- check sensors/ports (kept %.2f)\n",
+                      v, (double)off, (double)ZERO_MAX_OFFSET, (double)g_dp_zero[v]);
+      } else if (healthy && fr.p_up[v] > 0.0f && fr.p_lo[v] > 0.0f) {
+        g_dp_zero[v] = off;
         n++;
+      } else if (fr.p_up[v] > 0.0f || fr.p_lo[v] > 0.0f) {
+        Serial.printf("[zero] v%d skipped: %s (kept %.2f mbar)\n", v, vh_name(fr.why[v]),
+                      (double)g_dp_zero[v]);
       }
     }
     bool ok = cal_save();

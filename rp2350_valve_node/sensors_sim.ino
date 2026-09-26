@@ -75,6 +75,11 @@ static void sim_convert(uint32_t tick, int type) {
   }
 }
 
+// Sim has no per-sensor state; 'vhealth' just says so.
+void sensors_vhealth_print() {
+  Serial.println(F("[vh] USE_REAL_I2C=0 (simulated sensors): per-sensor health n/a; see 'sens'"));
+}
+
 void sensors_tick(uint32_t tick) {
   // ---- 1) read back the conversion kicked on the PREVIOUS tick ----
   if (s_pend_have) {
@@ -120,6 +125,8 @@ void sensors_tick(uint32_t tick) {
     out.t_lo[v]  = td;                                   // sim: one die temp for the pair
     out.mdot[v]  = mdot;
     out.valid[v] = valid ? 1 : 0;
+    out.why[v]   = valid ? VH_OK : ((g_fault_aggregate || g_fault_valve[v]) ? VH_INJECTED
+                 : (range_ok ? VH_DPNEG : VH_RANGE));
   }
 
   out.mdot_total = total;      // summed over VALID valves only

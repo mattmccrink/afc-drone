@@ -23,6 +23,15 @@
 #define USE_REAL_TEENSY  1     // 1 = actually emit Host_comm frames on Serial1
                                //     (harmless with nothing attached)
 
+// Bench-only fault hooks (console 'hang core0|core1', 'tdrop N'). They exist to
+// exercise the watchdog / reset / dropped-frame paths (T-S3, T-S7, T-C4, T-C5).
+// MUST be 0 in any build that flies: a hook left reachable is a way to hang a
+// core or starve the compressor from the console (the LINK_TEST lesson).
+#define BENCH_HOOKS      0
+#if BENCH_HOOKS
+  #warning "BENCH_HOOKS=1: bench fault hooks compiled in -- NOT a flight build"
+#endif
+
 // -----------------------------------------------------------------------------
 //  Pin map  (Tiny 2350 -- 12 broken-out GPIO; see tiny2350_pinout_diagram.pdf)
 // -----------------------------------------------------------------------------
@@ -148,6 +157,45 @@
                                   //   Set to ~3-5x the OBSERVED post-filter dpcorr noise
                                   //   (watch 'sens' at no flow). 0.05 -> ~0.6 g/s floor at
                                   //   K=0.18. Lower it only as far as the measured noise allows.
+// ---- per-sensor / per-venturi health (real I2C path; sensors.ino) ----
+// A venturi is VALID only if both of its sensors are healthy AND the pair is
+// plausible. Invalid venturis drop out of mdot_total and n_valid; too few valid
+// -> compressor holds RPM_FALLBACK (compressor.ino, MIN_VALID_VALVES).
+//   <<PLACEHOLDERS -- tighten against observed behaviour; see 'vhealth'>>
+#define SENS_STALE_MS         200   // no good pressure (D1) read this long -> STALE
+                                    //   (D1 lands every 30 ms, 60 ms across a D2, so ~6
+                                    //   consecutive misses; rides through the odd timeout)
+#define SENS_T_STALE_MS      2000   // no good temperature (D2) read this long -> STALE
+                                    //   (D2 lands ~every 0.5 s)
+#define SENS_FROZEN_N          30   // this many IDENTICAL consecutive raw D1 counts -> FROZEN
+                                    //   (~1 s). At OSR 8192 a live -02BA's raw noise is tens
+                                    //   of LSB, so an exact repeat run this long means a
+                                    //   stuck part / stuck bus, not a quiet sensor.
+#define SENS_D1_JUMP_MAX   100000UL // raw D1 counts; a read differing from the previous good
+                                    //   one (< SENS_STALE_MS old) by more is a SPIKE: rejected
+                                    //   and counted as a failed read (no bus CRC on I2C).
+                                    //   ~0.00044 mbar/count on a typical -02BA -> ~44 mbar in
+                                    //   30 ms. A real step is accepted on the NEXT read if that
+                                    //   read confirms the new level (costs ~30 ms).
+#define SENS_D2_JUMP_MAX   160000UL // raw D2 counts; same rule for temperature (~5 C per
+                                    //   ~0.5 s D2 interval on a typical -02BA). A corrupt D2
+                                    //   would otherwise skew compensation until the next D2.
+#define SENS_FAIL_WEIGHT        2   // loss-rate score: +this per failed read, -1 per good read
+#define SENS_FAIL_TRIP         60   //   -> LOSSY while score >= this. Trips when more than
+                                    //   ~1/(1+WEIGHT) = 1/3 of reads fail, sustained.
+#define SENS_RECOVER_MS       500   // a slot must stay clean this long after ANY fault
+                                    //   before its venturi counts as valid again (anti-flap)
+#define VENTURI_DP_NEG_MAX   5.0f   // mbar; zero-corrected dp below -this -> IMPLAUSIBLE
+                                    //   (throat reading above upstream: swapped / failed
+                                    //   sensor). Needs 'zero' captured, or raw sensor
+                                    //   offsets can approach this margin.
+
+// 'zero' guards: an offset this large is a sensor/port fault, not an offset to
+// absorb; and it needs genuinely still air -- the rotor COASTS after disarm and
+// coast-down isn't observable over the link, so wait this long after disarm.
+#define ZERO_MAX_OFFSET     10.0f   // mbar  <<tighten to ~3x observed pair spread>>
+#define ZERO_SETTLE_MS      30000   // ms after the last armed moment  <<set from measured coast-down>>
+
 #define R_AIR             287.05f // J/(kg K), dry-air specific gas constant
                                   //   beta 0.7, D=2.54 cm -> K~0.18). Geometry w/ Cd=0.98
                                   //   predicts ~2x less dp, so Cd is uncertain: CALIBRATE
@@ -208,11 +256,16 @@
 #define MDOT_TARGET_DEFAULT  40.0f  // g/s (used until a source commands otherwise)
 #define MDOT_PLAUSIBLE_MIN    0.0f  // g/s  aggregate plausibility window
 #define MDOT_PLAUSIBLE_MAX  400.0f  // g/s
-#define MIN_VALID_VALVES        4   // fewer valid valves than this -> untrustworthy
+#define MIN_VALID_VALVES VALVE_COUNT // fewer valid venturis than this -> untrustworthy ->
+                                    //   RPM_FALLBACK. = ALL six (was 4): an invalid venturi
+                                    //   contributes 0 to mdot_total, so tracking on a partial
+                                    //   sum would UNDER-read flow and the mdot PI would drive
+                                    //   rpm up to chase flow it can't see. Lower this only
+                                    //   together with a missing-flow estimate for dead venturis.
 #define FLOW_PI_KP           50.0f  // rpm per (g/s) error
 #define FLOW_PI_KI           20.0f  // rpm per (g/s * s)
 #define FLOW_FALLBACK_HOLD_MS 250   // hysteresis into/out of fallback (anti-chatter)
-#define COMP_MDOT_LOOP        0   // 0 = stub (armed -> RPM_FALLBACK); 1 = re-enable mdot PI (needs venturi-loss handling)
+#define COMP_MDOT_LOOP        0   // 0 = stub (armed -> RPM_FALLBACK); 1 = mdot PI (tracks only with all venturis valid)
 
 // Spin-up/spin-down shaping lives on the TEENSY (reference rate limit, ~5 s to
 // 30k). The Tiny does NOT ramp from 0 on a run edge; it sends the target and the

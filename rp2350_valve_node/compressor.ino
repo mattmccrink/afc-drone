@@ -125,6 +125,7 @@ void compressor_update(uint32_t now) {
 
   // ---- decide run + target rpm ----
   bool     want_run = g_status.armed;      // arm gates the compressor only
+  if (want_run) g_last_armed_ms = now;     // 'zero' waits out the coast-down after this
   float    target;
   CompMode mode;
 
@@ -133,10 +134,12 @@ void compressor_update(uint32_t now) {
     target = 0.0f;
   }
 #if COMP_MDOT_LOOP
-  // <<STUBBED OFF via COMP_MDOT_LOOP=0>> Mass-flow tracking PI. Do NOT re-enable
-  // until dead-venturi handling exists: gate on sensor health and hold RPM_FALLBACK
-  // when n_valid is too low -- never track a mdot estimate from too few valid
-  // venturis. See tracker (compressor mdot loop / venturi-loss).
+  // <<STUBBED OFF via COMP_MDOT_LOOP=0>> Mass-flow tracking PI. Dead-venturi
+  // handling is in place (2026-09-26): sensors.ino marks a venturi invalid on a
+  // stale / frozen / implausible sensor, and comp_flow_ok (above) needs
+  // n_valid >= MIN_VALID_VALVES (= all six), so any lost venturi drops this
+  // branch and the compressor holds RPM_FALLBACK. Before enabling: calibrate
+  // K_VENTURI / dp_zero and verify the fallback transition on hardware.
   else if (g_status.source == SRC_PRIMARY && comp_flow_ok) {
     // Track the mass-flow target with a gentle PI (anti-windup below).
     float err = g_status.mdot_target - mdot_total;
@@ -173,6 +176,9 @@ void compressor_update(uint32_t now) {
   if (comp_rpm > RPM_CMD_MAX) comp_rpm = RPM_CMD_MAX;
   if (comp_rpm < RPM_CMD_MIN) comp_rpm = RPM_CMD_MIN;
   if (!want_run) comp_rpm = 0.0f;
+#if BENCH_HOOKS
+  if (!want_run) g_tdrop = 0;              // a leftover drop count never eats the next run's frames
+#endif
 
   // ---- publish status + close the sim flow loop ----
   g_status.comp_mode     = mode;
@@ -188,6 +194,10 @@ void compressor_update(uint32_t now) {
   if (want_run) {
     if ((now - comp_last_stream_ms) >= (1000 / TEENSY_STREAM_HZ)) {
       comp_last_stream_ms = now;
+#if BENCH_HOOKS
+      if (g_tdrop > 0) g_tdrop--;          // bench: skip this frame (T-C4 / T-C5)
+      else
+#endif
       teensy_stream((int16_t)lroundf(comp_rpm / 10.0f));   // firmware units: 10 rpm
     }
   }

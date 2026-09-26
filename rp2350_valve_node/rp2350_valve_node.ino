@@ -51,6 +51,15 @@ volatile uint32_t g_current_rpm_cmd = 0;   // core 0 -> core 1 (closes sim flow 
 volatile bool     g_core0_ready = false;
 volatile bool     g_core1_ready = false;
 uint32_t          g_tlm_dropped = 0;            // count of contended SensorFrame telemetry reads
+uint32_t          g_last_armed_ms = 0;          // last moment the compressor was allowed to run
+const char*       g_reset_cause = "?";          // captured at boot; shown by 'health' (USB is
+                                                //   rarely open in time to see the boot print)
+
+#if BENCH_HOOKS
+// Bench fault hooks (console 'hang', 'tdrop'); compiled out of flight builds.
+volatile bool     g_hang_core1 = false;   // core 1 spins forever -> core 0 withholds WDT pet
+volatile uint16_t g_tdrop      = 0;       // skip this many upcoming Teensy frames
+#endif
 
 // -----------------------------------------------------------------------------
 //  Command / arm "inboxes" -- written by the sim OR by real binary frames,
@@ -123,7 +132,23 @@ void led_setup();
 // =============================================================================
 //  CORE 0
 // =============================================================================
+static const char* reset_cause_name() {
+  // Core API: on RP2350 it also checks the bootrom boot type, so a UF2 /
+  // picotool reboot is not misreported as a watchdog reset.
+  switch (rp2040.getResetReason()) {
+    case RP2040::WDT_RESET:      return "WATCHDOG";
+    case RP2040::PWRON_RESET:    return "POWER-ON";
+    case RP2040::RUN_PIN_RESET:  return "RUN PIN";
+    case RP2040::SOFT_RESET:     return "SOFT (reflash/reboot)";
+    case RP2040::BROWNOUT_RESET: return "BROWNOUT";
+    case RP2040::GLITCH_RESET:   return "GLITCH";
+    case RP2040::DEBUG_RESET:    return "DEBUG";
+    default:                     return "UNKNOWN";
+  }
+}
+
 void setup() {
+  g_reset_cause = reset_cause_name();   // before anything else can reboot us
   Serial.begin(115200);
   led_setup();
   framing_setup();
@@ -154,6 +179,11 @@ void setup() {
 
   Serial.println();
   Serial.println(F("RP2350 valve/sensor node -- ALPHA"));
+  // WATCHDOG here = a core hung (or a 'hang' bench hook). Also in 'health'.
+  Serial.printf("[boot] reset cause: %s\n", g_reset_cause);
+#if BENCH_HOOKS
+  Serial.println(F("[boot] *** BENCH_HOOKS ENABLED -- NOT A FLIGHT BUILD ***"));
+#endif
   Serial.println(F("type 'help' for the bench console"));
 
   watchdog_setup();   // arm the hardware watchdog LAST
@@ -242,6 +272,9 @@ void setup1() {
 }
 
 void loop1() {
+#if BENCH_HOOKS
+  if (g_hang_core1) { for (;;) { tight_loop_contents(); } }   // bench: core-1 stall
+#endif
   static uint32_t tick = 0;
   static uint32_t next_deadline_us = 0;
   if (next_deadline_us == 0) next_deadline_us = micros() + TICK_US;

@@ -1,0 +1,999 @@
+diff --git a/host_tools/stub/Arduino.h b/host_tools/stub/Arduino.h
+new file mode 100644
+index 0000000..19303ab
+--- /dev/null
++++ b/host_tools/stub/Arduino.h
+@@ -0,0 +1,5 @@
++// Host-test stub: just enough of Arduino.h for config.h / types.h / vent_health.h.
++#pragma once
++#include <stdint.h>
++#include <string.h>
++#include <math.h>
+diff --git a/host_tools/test_vent_health.cpp b/host_tools/test_vent_health.cpp
+new file mode 100644
+index 0000000..ea66ba1
+--- /dev/null
++++ b/host_tools/test_vent_health.cpp
+@@ -0,0 +1,244 @@
++// Host test for rp2350_valve_node/vent_health.h (venturi / sensor health logic).
++// Build + run from repo root:
++//   g++ -std=c++17 -Wall -Wextra -I host_tools/stub -I rp2350_valve_node
++//       host_tools/test_vent_health.cpp -o /tmp/tvh && /tmp/tvh
++//
++// Covers the pure state machines only. The sensors_tick() integration (EMA
++// reset, n_valid / mdot_total exclusion, slot->venturi mapping) is exercised on
++// the bench: console 'fault valve N on', unplugging one sensor, 'vhealth'.
++#include <cstdio>
++#include <random>
++#include "vent_health.h"
++
++static int fails = 0;
++static void check(const char* name, bool ok) {
++  printf("  [%s] %s\n", ok ? "PASS" : "FAIL", name);
++  if (!ok) fails++;
++}
++
++// One sensor on the real core-1 cadence: a 10 ms tick; a conversion is read
++// back every 3 ticks; every 16th conversion is D2. sh_eval() runs EVERY tick,
++// as in sensors_tick(). 'feed(type, ok, raw)' decides each read's result.
++struct Sim {
++  SlotHealth h;
++  uint32_t now = 1000, tick = 0, conv = 0;
++  uint32_t stale_ev_seen = 0;
++  uint8_t  last = VH_NODATA;
++  template <class F> void run_ms(uint32_t ms, F feed) {
++    for (uint32_t t = 0; t < ms; t += 10) {
++      if (tick % 3 == 0) {
++        int type = (conv % 16 == 0) ? 1 : 0;
++        bool ok; uint32_t r;
++        feed(type, ok, r);
++        sh_on_read(h, type, ok, r, now);
++        conv++;
++      }
++      last = sh_eval(h, true, now);
++      tick++; now += 10;
++    }
++  }
++  // count D1 reads only, for boundary tests
++  template <class F> void run_d1_reads(int n, F feed) {
++    int got = 0;
++    while (got < n) {
++      if (tick % 3 == 0) {
++        int type = (conv % 16 == 0) ? 1 : 0;
++        bool ok; uint32_t r;
++        feed(type, ok, r);
++        sh_on_read(h, type, ok, r, now);
++        conv++;
++        if (type == 0) got++;
++      }
++      last = sh_eval(h, true, now);
++      tick++; now += 10;
++    }
++  }
++};
++
++static std::mt19937 rng(12345);
++static uint32_t noisy(double sigma, uint32_t base = 5000000) {
++  std::normal_distribution<double> n(0.0, sigma);
++  return (uint32_t)((int64_t)base + llround(n(rng)));
++}
++static auto GOOD = [](int, bool& ok, uint32_t& r) { ok = true; r = noisy(36); };
++static uint32_t absdiff32(uint32_t a, uint32_t b) { return a > b ? a - b : b - a; }
++static auto DEAD = [](int, bool& ok, uint32_t& r) { ok = false; r = 0; };
++
++int main() {
++  printf("slot: healthy / dropout / stale\n");
++  {
++    Sim s;
++    s.run_ms(1000, GOOD);
++    check("healthy sensor -> OK", s.last == VH_OK);
++
++    // D1 every 30 ms (60 ms across a D2): 5 consecutive missed D1 = ~150-180 ms
++    s.run_d1_reads(5, DEAD);
++    check("5 missed D1 reads ride through (evaluated every tick)", s.last == VH_OK);
++    s.run_ms(300, GOOD);
++    s.run_ms(300, DEAD);
++    check("stops answering -> STALE", s.last == VH_STALE);
++    check("stale event counted exactly once (per-tick eval)", s.h.n_stale_ev == 1);
++    s.run_ms(600, GOOD);
++    check("answers again -> OK", s.last == VH_OK);
++  }
++
++  printf("slot: bad raw values\n");
++  {
++    Sim s; s.run_ms(1000, GOOD);
++    uint32_t f0 = s.h.n_fail;
++    s.run_ms(300, [](int, bool& ok, uint32_t& r) { ok = true; r = 0; });
++    check("raw 0 counted as failed read", s.h.n_fail > f0);
++    check("raw 0 does not refresh -> STALE", s.last == VH_STALE);
++    Sim t; t.run_ms(1000, GOOD);
++    t.run_ms(300, [](int, bool& ok, uint32_t& r) { ok = true; r = 0xFFFFFF; });
++    check("raw 0xFFFFFF does not refresh -> STALE", t.last == VH_STALE);
++    Sim u; u.run_ms(1000, GOOD);
++    u.run_ms(300, [](int, bool& ok, uint32_t& r) { ok = false; r = 5000123; });
++    check("failed transfer with a non-zero raw is still a failure", u.last == VH_STALE);
++  }
++
++  printf("slot: frozen boundary\n");
++  {
++    Sim s; s.run_ms(1000, GOOD);
++    const uint32_t stuck = 5000017;   // near the live level (a far value is a SPIKE first)
++    // after this constant read, SENS_FROZEN_N-1 further identical D1s -> same_d1 = N-1
++    s.run_d1_reads(SENS_FROZEN_N, [&](int, bool& ok, uint32_t& r) { ok = true; r = stuck; });
++    check("N-1 repeats -> still OK", s.last == VH_OK && s.h.same_d1 == SENS_FROZEN_N - 1);
++    s.run_d1_reads(1, [&](int, bool& ok, uint32_t& r) { ok = true; r = stuck; });
++    check("N repeats -> FROZEN", s.last == VH_FROZEN);
++    s.run_d1_reads(1, [&](int, bool& ok, uint32_t& r) { ok = true; r = stuck + 1; });
++    check("one different count -> OK again (slot level)", s.last == VH_OK);
++  }
++
++  printf("slot: spike rejection\n");
++  {
++    Sim s; s.run_ms(1000, GOOD);
++    uint32_t prev = s.h.prev_d1, sp0 = s.h.n_spike;
++    bool used = sh_on_read(s.h, 0, true, prev + SENS_D1_JUMP_MAX + 1, s.now);
++    check("jump > SENS_D1_JUMP_MAX rejected", !used && s.h.n_spike == sp0 + 1);
++    check("rejected spike does not move the reference", s.h.prev_d1 == prev);
++    used = sh_on_read(s.h, 0, true, prev + SENS_D1_JUMP_MAX, s.now);
++    check("jump == SENS_D1_JUMP_MAX accepted", used);
++
++    // One corrupt read, then normal: dropped, reference kept, candidate cleared.
++    Sim g; g.run_ms(1000, GOOD);
++    uint32_t ref = g.h.prev_d1;
++    bool a = sh_on_read(g.h, 0, true, ref ^ (1u << 20), g.now);        // bit-20 flip
++    bool b = sh_on_read(g.h, 0, true, ref + 20, g.now + 30);
++    check("single corrupt read dropped, next normal read accepted", !a && b && !g.h.has_cand[0]);
++
++    // A REAL step (~+3x the limit): accepted on the confirming read, never STALE,
++    // whatever the D2 phase (a D2 can fall between the two D1 reads).
++    bool all_ok = true; int worst_reads = 0;
++    for (int phase = 0; phase < 16; ++phase) {
++      Sim t; t.run_ms(1000, GOOD);
++      t.run_ms(10 * 3 * phase, GOOD);                    // shift the D2 phase
++      uint32_t base = t.h.prev_d1 + 3 * SENS_D1_JUMP_MAX;
++      uint32_t st0 = t.h.n_stale_ev;
++      int reads = 0; bool accepted = false;
++      t.run_ms(300, [&](int ty, bool& ok, uint32_t& r) {
++        ok = true; r = (ty == 0) ? noisy(36, base) : noisy(36);   // pressure steps, temperature doesn't
++        if (ty == 0 && !accepted) { reads++; }
++      });
++      accepted = absdiff32(t.h.prev_d1, base) < 1000;
++      if (!accepted || t.h.n_stale_ev != st0 || t.last != VH_OK) all_ok = false;
++      if (t.h.n_spike > (uint32_t)worst_reads) worst_reads = (int)t.h.n_spike;
++    }
++    check("real step accepted on the confirming read, no STALE, all 16 D2 phases", all_ok);
++    char msg[96]; snprintf(msg, sizeof msg, "real step costs exactly one rejected read (worst %d)", worst_reads);
++    check(msg, worst_reads == 1);
++
++    // 1 bar/s ramp (~30 mbar per 30 ms read, below the per-read limit): no spikes.
++    Sim r; r.run_ms(1000, GOOD);
++    uint32_t lvl = r.h.prev_d1;
++    r.run_ms(1000, [&](int ty, bool& ok, uint32_t& v) {
++      ok = true; if (ty == 0) lvl += 68000; v = (ty == 0) ? lvl : noisy(36); });
++    check("1 bar/s ramp tracked with no spikes", r.h.n_spike == 0 && r.last == VH_OK);
++
++    // D2 (temperature) corrupt read is rejected too
++    Sim d; d.run_ms(2000, GOOD);
++    uint32_t sp = d.h.n_spike;
++    bool tu = sh_on_read(d.h, 1, true, d.h.prev_d2 + SENS_D2_JUMP_MAX + 1, d.now);
++    check("D2 spike rejected", !tu && d.h.n_spike == sp + 1);
++  }
++
++  printf("slot: loss rate (LOSSY)\n");
++  {
++    // 2 of every 3 reads fail: never 200 ms without a good D1, so not STALE
++    Sim s; s.run_ms(1000, GOOD);
++    uint32_t i = 0;
++    s.run_ms(10000, [&](int, bool& ok, uint32_t& r) { ok = (i++ % 3 == 0); r = noisy(36); });
++    check("2-of-3 reads failing -> LOSSY (not hidden as OK)", s.last == VH_LOSSY);
++    check("lossy event counted", s.h.n_lossy_ev >= 1);
++
++    Sim q; q.run_ms(1000, GOOD);
++    uint32_t j = 0;          // 1 in 5 fails (20 %): below the ~1/3 trip
++    q.run_ms(60000, [&](int, bool& ok, uint32_t& r) { ok = (j++ % 5 != 0); r = noisy(36); });
++    check("20 % read loss -> stays OK", q.last == VH_OK && q.h.n_lossy_ev == 0);
++
++    s.run_ms(5000, GOOD);
++    check("LOSSY clears once reads are clean", s.last == VH_OK);
++  }
++
++  printf("slot: temperature (D2) path + boot\n");
++  {
++    Sim s; s.run_ms(1000, GOOD);
++    s.run_ms(2600, [](int t, bool& ok, uint32_t& r) { ok = (t == 0); r = noisy(36); });
++    check("D1 fine but no D2 for >2 s -> STALE", s.last == VH_STALE);
++    SlotHealth h;
++    check("no reads yet -> NODATA", sh_eval(h, true, 5000) == VH_NODATA);
++    check("PROM failed -> NOPROM", sh_eval(h, false, 5000) == VH_NOPROM);
++  }
++
++  printf("venturi: reasons, precedence, recover gate\n");
++  {
++    VentInputs in{true, VH_OK, VH_OK, false, true, 0.0f};
++    check("all good -> OK", vent_reason(in) == VH_OK);
++    in.dp_corr = -VENTURI_DP_NEG_MAX - 0.1f;
++    check("throat above upstream -> DPNEG", vent_reason(in) == VH_DPNEG);
++    in.dp_corr = -VENTURI_DP_NEG_MAX + 0.1f;
++    check("small negative dp (noise) -> OK", vent_reason(in) == VH_OK);
++    in.range_ok = false;
++    check("out of range -> RANGE", vent_reason(in) == VH_RANGE);
++    in.sh_lo = VH_LOSSY;
++    check("sensor fault wins over range", vent_reason(in) == VH_LOSSY);
++    in.injected = true;
++    check("injection shows as INJECTED", vent_reason(in) == VH_INJECTED);
++    in.mapped = false;
++    check("unmapped -> UNMAPPED", vent_reason(in) == VH_UNMAPPED);
++  }
++  {
++    VentGate g;
++    check("never faulted -> OK immediately", vent_gate(g, VH_OK, 100) == VH_OK);
++    vent_gate(g, VH_STALE, 1000);
++    check("just recovered -> RECOVER", vent_gate(g, VH_OK, 1100) == VH_RECOVER);
++    check("still RECOVER at +499 ms", vent_gate(g, VH_OK, 1499) == VH_RECOVER);
++    check("OK at +500 ms", vent_gate(g, VH_OK, 1500) == VH_OK);
++    check("no spurious RECOVER ~25 days later", vent_gate(g, VH_OK, 1500u + 0x80000000u + 1000u) == VH_OK);
++
++    VentGate f; int valid_ticks = 0;          // fault flapping 300 ms on / 300 ms off
++    for (uint32_t t = 0; t < 10000; t += 10) {
++      uint8_t w = ((t / 300) % 2) ? VH_OK : VH_FROZEN;
++      if (vent_gate(f, w, 2000 + t) == VH_OK) valid_ticks++;
++    }
++    check("flapping fault (300 ms cycle) never counts as valid", valid_ticks == 0);
++
++    VentGate w;                                // millis() wrap
++    vent_gate(w, VH_STALE, 0xFFFFFF00u);
++    check("wrap: RECOVER across rollover", vent_gate(w, VH_OK, 0x00000010u) == VH_RECOVER);
++    check("wrap: OK after 500 ms", vent_gate(w, VH_OK, 0xFFFFFF00u + 500u) == VH_OK);
++  }
++
++  printf("frozen / spike false-trip check (1 h at ~31 Hz, assumed noise)\n");
++  for (double sigma : {36.0, 3.0, 1.0}) {
++    Sim s;
++    s.run_ms(3600000, [&](int, bool& ok, uint32_t& r) { ok = true; r = noisy(sigma); });
++    char name[128];
++    snprintf(name, sizeof name, "noise sigma %.0f LSB: frozen=%u spikes=%u lossy=%u",
++             sigma, (unsigned)s.h.n_frozen_ev, (unsigned)s.h.n_spike, (unsigned)s.h.n_lossy_ev);
++    check(name, s.h.n_frozen_ev == 0 && s.h.n_spike == 0 && s.h.n_lossy_ev == 0);
++  }
++
++  printf("\n%s\n", fails ? "SOME CHECKS FAILED" : "all checks passed");
++  return fails ? 1 : 0;
++}
+diff --git a/rp2350_valve_node/README.md b/rp2350_valve_node/README.md
+index 565c4a8..8cbb65f 100644
+--- a/rp2350_valve_node/README.md
++++ b/rp2350_valve_node/README.md
+@@ -72,7 +72,8 @@ C ch4/ch5 = L/R canard. Center/throw/direction per surface in `config.h`.
+ ```
+ help                         list commands
+ status                       one-shot status line (src/arm/elig, comp rpm + THERMAL, valves, surf)
+-health                       reprint boot/health summary
++health                       reprint boot/health summary (incl. last reset cause, vhealth)
++vhealth                      per-venturi validity reason + per-sensor read/fault counters
+ mon on|off                   periodic status line (2 Hz)
+ src auto|primary|sbus|safe   force / release the active source (never leave forced)
+ surf on|off|auto             force traditional surfaces / follow the SBUS switch (bench)
+@@ -85,7 +86,16 @@ fault valve N on|off / fault agg on|off   inject sensor faults
+ mdot X                       set mass-flow target (g/s)
+ sens / pstream on|off        sensor dump / 2 Hz LabVIEW stream
+ servo|sweep|step ...         PCA9685 bring-up (bypasses the staleness failsafe)
+-save / zero / calshow        calibration store
++save / zero / calshow        calibration store (save/zero refused while armed; zero also
++                             waits ZERO_SETTLE_MS after disarm and skips unhealthy venturis)
++```
++
++Bench-only, compiled in with `BENCH_HOOKS 1` in `config.h` (default 0; boot banner
++and a compiler warning flag such a build). Never fly a BENCH_HOOKS build.
++
++```
++hang core0|core1             stall a core -> watchdog reset (T-S3 / T-S7)
++tdrop N                      skip the next N Teensy frames, 20 ms each (T-C4 / T-C5)
+ ```
+ 
+ The onboard **BOOT/USER button (GP23)** toggles simulated primary presence.
+@@ -103,6 +113,14 @@ The onboard **BOOT/USER button (GP23)** toggles simulated primary presence.
+ - **Servos never go limp:** stale core-0 command (and boot) → defined-safe valve
+   pose (0 through the curve fit) + centered surfaces.
+ - **Total loss 3 s → terminate** (air off); only if armed at least once.
++- **Venturi health (2026-09-26):** a venturi is valid only if both sensors are
++  answering (no good read within 200 ms pressure / 2 s temperature → STALE),
++  not frozen (30 identical raw counts), not losing more than ~1/3 of reads
++  (LOSSY), in range, and throat not above upstream by > 5 mbar (DPNEG). One-off
++  corrupt reads are dropped (a real step is accepted on the confirming read).
++  After any fault a venturi waits 500 ms clean before counting again. Fewer
++  than `MIN_VALID_VALVES` (= all 6) valid → compressor holds `RPM_FALLBACK`.
++  See `vhealth`; thresholds are placeholders in `config.h`.
+ 
+ ---
+ 
+diff --git a/rp2350_valve_node/compressor.ino b/rp2350_valve_node/compressor.ino
+index 6df6484..4e298a1 100644
+--- a/rp2350_valve_node/compressor.ino
++++ b/rp2350_valve_node/compressor.ino
+@@ -125,6 +125,7 @@ void compressor_update(uint32_t now) {
+ 
+   // ---- decide run + target rpm ----
+   bool     want_run = g_status.armed;      // arm gates the compressor only
++  if (want_run) g_last_armed_ms = now;     // 'zero' waits out the coast-down after this
+   float    target;
+   CompMode mode;
+ 
+@@ -133,10 +134,12 @@ void compressor_update(uint32_t now) {
+     target = 0.0f;
+   }
+ #if COMP_MDOT_LOOP
+-  // <<STUBBED OFF via COMP_MDOT_LOOP=0>> Mass-flow tracking PI. Do NOT re-enable
+-  // until dead-venturi handling exists: gate on sensor health and hold RPM_FALLBACK
+-  // when n_valid is too low -- never track a mdot estimate from too few valid
+-  // venturis. See tracker (compressor mdot loop / venturi-loss).
++  // <<STUBBED OFF via COMP_MDOT_LOOP=0>> Mass-flow tracking PI. Dead-venturi
++  // handling is in place (2026-09-26): sensors.ino marks a venturi invalid on a
++  // stale / frozen / implausible sensor, and comp_flow_ok (above) needs
++  // n_valid >= MIN_VALID_VALVES (= all six), so any lost venturi drops this
++  // branch and the compressor holds RPM_FALLBACK. Before enabling: calibrate
++  // K_VENTURI / dp_zero and verify the fallback transition on hardware.
+   else if (g_status.source == SRC_PRIMARY && comp_flow_ok) {
+     // Track the mass-flow target with a gentle PI (anti-windup below).
+     float err = g_status.mdot_target - mdot_total;
+@@ -173,6 +176,9 @@ void compressor_update(uint32_t now) {
+   if (comp_rpm > RPM_CMD_MAX) comp_rpm = RPM_CMD_MAX;
+   if (comp_rpm < RPM_CMD_MIN) comp_rpm = RPM_CMD_MIN;
+   if (!want_run) comp_rpm = 0.0f;
++#if BENCH_HOOKS
++  if (!want_run) g_tdrop = 0;              // a leftover drop count never eats the next run's frames
++#endif
+ 
+   // ---- publish status + close the sim flow loop ----
+   g_status.comp_mode     = mode;
+@@ -188,6 +194,10 @@ void compressor_update(uint32_t now) {
+   if (want_run) {
+     if ((now - comp_last_stream_ms) >= (1000 / TEENSY_STREAM_HZ)) {
+       comp_last_stream_ms = now;
++#if BENCH_HOOKS
++      if (g_tdrop > 0) g_tdrop--;          // bench: skip this frame (T-C4 / T-C5)
++      else
++#endif
+       teensy_stream((int16_t)lroundf(comp_rpm / 10.0f));   // firmware units: 10 rpm
+     }
+   }
+diff --git a/rp2350_valve_node/config.h b/rp2350_valve_node/config.h
+index cb34f37..a2c5406 100644
+--- a/rp2350_valve_node/config.h
++++ b/rp2350_valve_node/config.h
+@@ -23,6 +23,15 @@
+ #define USE_REAL_TEENSY  1     // 1 = actually emit Host_comm frames on Serial1
+                                //     (harmless with nothing attached)
+ 
++// Bench-only fault hooks (console 'hang core0|core1', 'tdrop N'). They exist to
++// exercise the watchdog / reset / dropped-frame paths (T-S3, T-S7, T-C4, T-C5).
++// MUST be 0 in any build that flies: a hook left reachable is a way to hang a
++// core or starve the compressor from the console (the LINK_TEST lesson).
++#define BENCH_HOOKS      0
++#if BENCH_HOOKS
++  #warning "BENCH_HOOKS=1: bench fault hooks compiled in -- NOT a flight build"
++#endif
++
+ // -----------------------------------------------------------------------------
+ //  Pin map  (Tiny 2350 -- 12 broken-out GPIO; see tiny2350_pinout_diagram.pdf)
+ // -----------------------------------------------------------------------------
+@@ -148,6 +157,45 @@
+                                   //   Set to ~3-5x the OBSERVED post-filter dpcorr noise
+                                   //   (watch 'sens' at no flow). 0.05 -> ~0.6 g/s floor at
+                                   //   K=0.18. Lower it only as far as the measured noise allows.
++// ---- per-sensor / per-venturi health (real I2C path; sensors.ino) ----
++// A venturi is VALID only if both of its sensors are healthy AND the pair is
++// plausible. Invalid venturis drop out of mdot_total and n_valid; too few valid
++// -> compressor holds RPM_FALLBACK (compressor.ino, MIN_VALID_VALVES).
++//   <<PLACEHOLDERS -- tighten against observed behaviour; see 'vhealth'>>
++#define SENS_STALE_MS         200   // no good pressure (D1) read this long -> STALE
++                                    //   (D1 lands every 30 ms, 60 ms across a D2, so ~6
++                                    //   consecutive misses; rides through the odd timeout)
++#define SENS_T_STALE_MS      2000   // no good temperature (D2) read this long -> STALE
++                                    //   (D2 lands ~every 0.5 s)
++#define SENS_FROZEN_N          30   // this many IDENTICAL consecutive raw D1 counts -> FROZEN
++                                    //   (~1 s). At OSR 8192 a live -02BA's raw noise is tens
++                                    //   of LSB, so an exact repeat run this long means a
++                                    //   stuck part / stuck bus, not a quiet sensor.
++#define SENS_D1_JUMP_MAX   100000UL // raw D1 counts; a read differing from the previous good
++                                    //   one (< SENS_STALE_MS old) by more is a SPIKE: rejected
++                                    //   and counted as a failed read (no bus CRC on I2C).
++                                    //   ~0.00044 mbar/count on a typical -02BA -> ~44 mbar in
++                                    //   30 ms. A real step is accepted on the NEXT read if that
++                                    //   read confirms the new level (costs ~30 ms).
++#define SENS_D2_JUMP_MAX   160000UL // raw D2 counts; same rule for temperature (~5 C per
++                                    //   ~0.5 s D2 interval on a typical -02BA). A corrupt D2
++                                    //   would otherwise skew compensation until the next D2.
++#define SENS_FAIL_WEIGHT        2   // loss-rate score: +this per failed read, -1 per good read
++#define SENS_FAIL_TRIP         60   //   -> LOSSY while score >= this. Trips when more than
++                                    //   ~1/(1+WEIGHT) = 1/3 of reads fail, sustained.
++#define SENS_RECOVER_MS       500   // a slot must stay clean this long after ANY fault
++                                    //   before its venturi counts as valid again (anti-flap)
++#define VENTURI_DP_NEG_MAX   5.0f   // mbar; zero-corrected dp below -this -> IMPLAUSIBLE
++                                    //   (throat reading above upstream: swapped / failed
++                                    //   sensor). Needs 'zero' captured, or raw sensor
++                                    //   offsets can approach this margin.
++
++// 'zero' guards: an offset this large is a sensor/port fault, not an offset to
++// absorb; and it needs genuinely still air -- the rotor COASTS after disarm and
++// coast-down isn't observable over the link, so wait this long after disarm.
++#define ZERO_MAX_OFFSET     10.0f   // mbar  <<tighten to ~3x observed pair spread>>
++#define ZERO_SETTLE_MS      30000   // ms after the last armed moment  <<set from measured coast-down>>
++
+ #define R_AIR             287.05f // J/(kg K), dry-air specific gas constant
+                                   //   beta 0.7, D=2.54 cm -> K~0.18). Geometry w/ Cd=0.98
+                                   //   predicts ~2x less dp, so Cd is uncertain: CALIBRATE
+@@ -208,11 +256,16 @@
+ #define MDOT_TARGET_DEFAULT  40.0f  // g/s (used until a source commands otherwise)
+ #define MDOT_PLAUSIBLE_MIN    0.0f  // g/s  aggregate plausibility window
+ #define MDOT_PLAUSIBLE_MAX  400.0f  // g/s
+-#define MIN_VALID_VALVES        4   // fewer valid valves than this -> untrustworthy
++#define MIN_VALID_VALVES VALVE_COUNT // fewer valid venturis than this -> untrustworthy ->
++                                    //   RPM_FALLBACK. = ALL six (was 4): an invalid venturi
++                                    //   contributes 0 to mdot_total, so tracking on a partial
++                                    //   sum would UNDER-read flow and the mdot PI would drive
++                                    //   rpm up to chase flow it can't see. Lower this only
++                                    //   together with a missing-flow estimate for dead venturis.
+ #define FLOW_PI_KP           50.0f  // rpm per (g/s) error
+ #define FLOW_PI_KI           20.0f  // rpm per (g/s * s)
+ #define FLOW_FALLBACK_HOLD_MS 250   // hysteresis into/out of fallback (anti-chatter)
+-#define COMP_MDOT_LOOP        0   // 0 = stub (armed -> RPM_FALLBACK); 1 = re-enable mdot PI (needs venturi-loss handling)
++#define COMP_MDOT_LOOP        0   // 0 = stub (armed -> RPM_FALLBACK); 1 = mdot PI (tracks only with all venturis valid)
+ 
+ // Spin-up/spin-down shaping lives on the TEENSY (reference rate limit, ~5 s to
+ // 30k). The Tiny does NOT ramp from 0 on a run edge; it sends the target and the
+diff --git a/rp2350_valve_node/console.ino b/rp2350_valve_node/console.ino
+index 5d81e2a..d97b3f0 100644
+--- a/rp2350_valve_node/console.ino
++++ b/rp2350_valve_node/console.ino
+@@ -71,7 +71,14 @@ static void print_help() {
+     "  step <A|B|C> <ch> [min max step_us hold_ms]  step one channel (default 1000 2000 100 200)\n"
+     "  save                    persist current calibration to LittleFS\n"
+     "  zero                    capture no-flow dp offset per valve, then save\n"
+-    "  calshow                 show calibration source + servo0 coeffs + dp_zero"));
++    "  calshow                 show calibration source + servo0 coeffs + dp_zero\n"
++    "  vhealth                 per-venturi validity reason + per-sensor read/fault counters"));
++#if BENCH_HOOKS
++  Serial.println(F(
++    "bench hooks (BENCH_HOOKS=1 -- not a flight build):\n"
++    "  hang core0|core1        stall a core -> watchdog reset (T-S3 / T-S7)\n"
++    "  tdrop N                 skip the next N Teensy frames, 20 ms each (T-C4 / T-C5)"));
++#endif
+ }
+ 
+ static bool eq(const char* a, const char* b) { return strcmp(a, b) == 0; }
+@@ -108,11 +115,39 @@ static void dispatch(char* line) {
+   else if (eq(tok[0], "status")) { print_status(); }
+   else if (eq(tok[0], "health")) {
+     Serial.println(F("RP2350 valve/sensor node -- health"));
++    Serial.printf("[health] last reset cause=%s  uptime=%lu s\n",
++                  g_reset_cause, (unsigned long)(millis() / 1000));
+     Serial.printf("[health] core1 heartbeat=%lu (should advance between calls)\n",
+                   (unsigned long)g_core1_heartbeat);
+     Serial.printf("[health] cal source=%s\n", g_cal_from_flash ? "flash" : "default");
+     sensors_health_print();
+     servos_health_print();
++    sensors_vhealth_print();
++  }
++  else if (eq(tok[0], "vhealth")) { sensors_vhealth_print(); }
++  else if (eq(tok[0], "hang") || eq(tok[0], "tdrop")) {
++#if BENCH_HOOKS
++    if (eq(tok[0], "hang") && n >= 2 && eq(tok[1], "core0")) {
++      // Core 0 stops here: no more WDT pets -> hardware reset in ~WDT_TIMEOUT_MS.
++      // Core 1 keeps running and, after CMD_TIMEOUT_MS, drives the safe pose.
++      Serial.println(F("[hang] core0 spinning; expect safe pose, then WATCHDOG reset"));
++      Serial.flush();
++      for (;;) { tight_loop_contents(); }
++    } else if (eq(tok[0], "hang") && n >= 2 && eq(tok[1], "core1")) {
++      // Core 1 stops; core 0 sees the heartbeat stall (CORE1_STALL_TRIP_MS),
++      // withholds the pet -> reset. PCA9685s hold their last pulse meanwhile.
++      g_hang_core1 = true;
++      Serial.println(F("[hang] core1 spinning; expect WATCHDOG reset"));
++    } else if (eq(tok[0], "tdrop") && n >= 2) {
++      int k = atoi(tok[1]);
++      if (k < 1 || k > 250) Serial.println(F("[tdrop] N must be 1..250"));
++      else { g_tdrop = (uint16_t)k;
++             Serial.printf("[tdrop] skipping next %d Teensy frame(s) (~%d ms; only while armed)\n",
++                           k, k * (1000 / TEENSY_STREAM_HZ)); }
++    } else Serial.println(F("usage: hang core0|core1 | tdrop N"));
++#else
++    Serial.println(F("[bench] hooks not compiled in (BENCH_HOOKS=0)"));
++#endif
+   }
+   else if (eq(tok[0], "mon") && n >= 2)  { onoff(tok[1], con_mon_on); }
+   else if (eq(tok[0], "pstream") && n >= 2) {
+@@ -237,21 +272,42 @@ static void dispatch(char* line) {
+       Serial.printf("[sens] v%d pu=%.2f pl=%.2f dpraw=%.2f dpz=%.2f dpcorr=%.2f mbar t=%.2f C mdot=%.3f g/s %s\n",
+         v, (double)fr.p_up[v], (double)fr.p_lo[v], (double)dpraw,
+         (double)g_dp_zero[v], (double)dpcorr, (double)fr.t_die[v],
+-        (double)fr.mdot[v], fr.valid[v] ? "OK" : "--");
++        (double)fr.mdot[v], vh_name(fr.why[v]));
+     }
+     Serial.printf("[sens] total=%.3f g/s  nvalid=%u\n", (double)fr.mdot_total, fr.n_valid); 
+   }           
+-  else if (eq(tok[0], "save")) { Serial.println(cal_save() ? F("[cal] saved") : F("[cal] SAVE FAILED")); }
++  else if (eq(tok[0], "save")) {
++    // Flash writes pause core 1 (sensor reads + servo writes): never while armed.
++    if (g_status.armed) { Serial.println(F("[cal] refused: disarm first")); return; }
++    Serial.println(cal_save() ? F("[cal] saved") : F("[cal] SAVE FAILED"));
++  }
+   else if (eq(tok[0], "zero")) {
+     // Capture the current no-flow (p_up - p_lo) per valve as the offset. MUST be
+     // done at genuine no-flow (compressor stopped, still air).
++    if (g_status.armed) { Serial.println(F("[zero] refused: disarm first (needs no flow)")); return; }
++    if (g_last_armed_ms != 0 && (millis() - g_last_armed_ms) < ZERO_SETTLE_MS) {
++      Serial.printf("[zero] refused: rotor may still be coasting; wait %lu s after disarm\n",
++                    (unsigned long)((ZERO_SETTLE_MS - (millis() - g_last_armed_ms)) / 1000 + 1));
++      return;
++    }
+     SensorFrame fr;
+     if (!g_sensor_pub.snapshot(fr)) { Serial.println(F("[zero] no sensor frame")); return; }
+     int n = 0;
+     for (int v = 0; v < VALVE_COUNT; ++v) {
+-      if (fr.p_up[v] > 0.0f && fr.p_lo[v] > 0.0f) {   // a paired valve is present
+-        g_dp_zero[v] = fr.p_up[v] - fr.p_lo[v];
++      // Only from a venturi whose sensors are healthy: an offset captured from a
++      // stale / frozen sensor would bias dp for good. DPNEG is the exception --
++      // a large raw offset between the pair is exactly what 'zero' removes.
++      bool healthy = (fr.why[v] == VH_OK || fr.why[v] == VH_DPNEG);
++      float off = fr.p_up[v] - fr.p_lo[v];
++      if (healthy && fr.p_up[v] > 0.0f && fr.p_lo[v] > 0.0f && fabsf(off) > ZERO_MAX_OFFSET) {
++        Serial.printf("[zero] v%d refused: offset %.2f mbar > %.1f -- check sensors/ports (kept %.2f)\n",
++                      v, (double)off, (double)ZERO_MAX_OFFSET, (double)g_dp_zero[v]);
++      } else if (healthy && fr.p_up[v] > 0.0f && fr.p_lo[v] > 0.0f) {
++        g_dp_zero[v] = off;
+         n++;
++      } else if (fr.p_up[v] > 0.0f || fr.p_lo[v] > 0.0f) {
++        Serial.printf("[zero] v%d skipped: %s (kept %.2f mbar)\n", v, vh_name(fr.why[v]),
++                      (double)g_dp_zero[v]);
+       }
+     }
+     bool ok = cal_save();
+diff --git a/rp2350_valve_node/rp2350_valve_node.ino b/rp2350_valve_node/rp2350_valve_node.ino
+index 008ebf6..b86a39e 100644
+--- a/rp2350_valve_node/rp2350_valve_node.ino
++++ b/rp2350_valve_node/rp2350_valve_node.ino
+@@ -51,6 +51,15 @@ volatile uint32_t g_current_rpm_cmd = 0;   // core 0 -> core 1 (closes sim flow
+ volatile bool     g_core0_ready = false;
+ volatile bool     g_core1_ready = false;
+ uint32_t          g_tlm_dropped = 0;            // count of contended SensorFrame telemetry reads
++uint32_t          g_last_armed_ms = 0;          // last moment the compressor was allowed to run
++const char*       g_reset_cause = "?";          // captured at boot; shown by 'health' (USB is
++                                                //   rarely open in time to see the boot print)
++
++#if BENCH_HOOKS
++// Bench fault hooks (console 'hang', 'tdrop'); compiled out of flight builds.
++volatile bool     g_hang_core1 = false;   // core 1 spins forever -> core 0 withholds WDT pet
++volatile uint16_t g_tdrop      = 0;       // skip this many upcoming Teensy frames
++#endif
+ 
+ // -----------------------------------------------------------------------------
+ //  Command / arm "inboxes" -- written by the sim OR by real binary frames,
+@@ -123,7 +132,23 @@ void led_setup();
+ // =============================================================================
+ //  CORE 0
+ // =============================================================================
++static const char* reset_cause_name() {
++  // Core API: on RP2350 it also checks the bootrom boot type, so a UF2 /
++  // picotool reboot is not misreported as a watchdog reset.
++  switch (rp2040.getResetReason()) {
++    case RP2040::WDT_RESET:      return "WATCHDOG";
++    case RP2040::PWRON_RESET:    return "POWER-ON";
++    case RP2040::RUN_PIN_RESET:  return "RUN PIN";
++    case RP2040::SOFT_RESET:     return "SOFT (reflash/reboot)";
++    case RP2040::BROWNOUT_RESET: return "BROWNOUT";
++    case RP2040::GLITCH_RESET:   return "GLITCH";
++    case RP2040::DEBUG_RESET:    return "DEBUG";
++    default:                     return "UNKNOWN";
++  }
++}
++
+ void setup() {
++  g_reset_cause = reset_cause_name();   // before anything else can reboot us
+   Serial.begin(115200);
+   led_setup();
+   framing_setup();
+@@ -154,6 +179,11 @@ void setup() {
+ 
+   Serial.println();
+   Serial.println(F("RP2350 valve/sensor node -- ALPHA"));
++  // WATCHDOG here = a core hung (or a 'hang' bench hook). Also in 'health'.
++  Serial.printf("[boot] reset cause: %s\n", g_reset_cause);
++#if BENCH_HOOKS
++  Serial.println(F("[boot] *** BENCH_HOOKS ENABLED -- NOT A FLIGHT BUILD ***"));
++#endif
+   Serial.println(F("type 'help' for the bench console"));
+ 
+   watchdog_setup();   // arm the hardware watchdog LAST
+@@ -242,6 +272,9 @@ void setup1() {
+ }
+ 
+ void loop1() {
++#if BENCH_HOOKS
++  if (g_hang_core1) { for (;;) { tight_loop_contents(); } }   // bench: core-1 stall
++#endif
+   static uint32_t tick = 0;
+   static uint32_t next_deadline_us = 0;
+   if (next_deadline_us == 0) next_deadline_us = micros() + TICK_US;
+diff --git a/rp2350_valve_node/sensors.ino b/rp2350_valve_node/sensors.ino
+index 4638718..651aab6 100644
+--- a/rp2350_valve_node/sensors.ino
++++ b/rp2350_valve_node/sensors.ino
+@@ -24,6 +24,7 @@
+ 
+ #if USE_REAL_I2C
+ #include <Wire.h>
++#include "vent_health.h"
+ 
+ // ---------------------------------------------------------------------------
+ //  SENSOR MAP  --  EDIT as the tree populates (open decision #1).
+@@ -65,6 +66,11 @@ static bool     s_ema_init[SENSOR_COUNT];
+ // ---- per-valve slot lookup ----
+ static int8_t   s_up[VALVE_COUNT], s_lo[VALVE_COUNT];
+ 
++// ---- health (vent_health.h) ----
++static SlotHealth s_h[SENSOR_COUNT];
++static VentGate   s_gate[VALVE_COUNT];
++static uint8_t    s_why[VALVE_COUNT];     // last published reason (console)
++
+ // ---- Valve constants ----
+ //ET and MMC calibration using Alicat mass flow sensor, 9/10/2026
+ static float K_VENTURI[6] =   {0.8963f,0.8425f,0.876f,0.8425f,0.8705f,0.8496f}; //~31 mBar at 400 SLPM
+@@ -175,11 +181,34 @@ void sensors_health_print() {
+                   s_prom_ok[k] ? "OK" : "FAIL");
+ }
+ 
++// Per-venturi reason + per-sensor counters ('vhealth'). Runs on core 0 and
++// reads core-1 counters without a lock: 32-bit reads are atomic, so each
++// number is real, but a line can mix values from adjacent ticks. Diagnostic only.
++void sensors_vhealth_print() {
++  uint32_t now = millis();
++  Serial.println(F("[vh] venturi  reason     (valid = OK; fallback if fewer than MIN_VALID_VALVES)"));
++  for (int v = 0; v < VALVE_COUNT; ++v)
++    Serial.printf("[vh] v%d       %s\n", v, vh_name(s_why[v]));
++  Serial.println(F("[vh] slot mux  ch valve role state    ok      fail    spike  stale_ev frozen_ev lossy_ev score same d1_age_ms"));
++  for (int k = 0; k < N_SLOTS; ++k) {
++    const SlotHealth& h = s_h[k];
++    Serial.printf("[vh] %-4d 0x%02X %-2u %-5u %-4s %-8s %-7lu %-7lu %-6lu %-8lu %-9lu %-8lu %-5u %-4u %ld\n",
++      k, SENSOR_MAP[k].mux, SENSOR_MAP[k].ch, SENSOR_MAP[k].valve,
++      SENSOR_MAP[k].role == ROLE_UP ? "UP" : "LO", vh_name(h.state),
++      (unsigned long)h.n_ok, (unsigned long)h.n_fail, (unsigned long)h.n_spike,
++      (unsigned long)h.n_stale_ev, (unsigned long)h.n_frozen_ev, (unsigned long)h.n_lossy_ev,
++      (unsigned)h.fail_score, (unsigned)h.same_d1,
++      h.seen_d1 ? (long)(now - h.last_d1_ms) : -1L);
++  }
++}
++
+ // ---------------------------------------------------------------------------
+ //  Setup: build mux list + valve lookup, cache PROM per sensor
+ // ---------------------------------------------------------------------------
+ void sensors_setup() {
+-  for (int v = 0; v < VALVE_COUNT; ++v) { s_up[v] = -1; s_lo[v] = -1; }
++  static_assert(sizeof(SENSOR_MAP) / sizeof(SENSOR_MAP[0]) <= SENSOR_COUNT,
++                "SENSOR_MAP has more slots than SENSOR_COUNT");
++  for (int v = 0; v < VALVE_COUNT; ++v) { s_up[v] = -1; s_lo[v] = -1; s_why[v] = VH_NODATA; }
+   s_nmux = 0;
+ 
+   for (int k = 0; k < N_SLOTS; ++k) {
+@@ -203,13 +232,17 @@ void sensors_setup() {
+ //  100 Hz tick
+ // ---------------------------------------------------------------------------
+ void sensors_tick(uint32_t tick) {
++  uint32_t now = millis();
++
+   // ---- 1) read back a conversion that has become ready ----
+   if (s_conv_pending && (int32_t)(tick - s_conv_ready_tick) >= 0) {
+     for (int k = 0; k < N_SLOTS; ++k) {
+       if (!s_prom_ok[k]) continue;
+       mux_select_only(SENSOR_MAP[k].mux, SENSOR_MAP[k].ch);
+-      uint32_t raw;
+-      if (ms_read_adc(raw)) {
++      uint32_t raw = 0;
++      bool xfer = ms_read_adc(raw);
++      // Bad transfers, 0 / 0xFFFFFF and D1 spikes never reach compensation.
++      if (sh_on_read(s_h[k], s_conv_type, xfer, raw, now)) {
+         if (s_conv_type == 0) { s_rawD1[k] = raw; s_have1[k] = true; }
+         else                  { s_rawD2[k] = raw; s_have2[k] = true; }
+       }
+@@ -225,13 +258,26 @@ void sensors_tick(uint32_t tick) {
+     mux_close_all();
+   }
+ 
+-  // ---- 2) assemble + publish per-valve frame (every tick; holds between updates) ----
++  // ---- 2) health: evaluate every sensor slot ----
++  uint8_t sh[SENSOR_COUNT];
++  for (int k = 0; k < SENSOR_COUNT; ++k) sh[k] = VH_UNMAPPED;
++  for (int k = 0; k < N_SLOTS; ++k) {
++    sh[k] = sh_eval(s_h[k], s_prom_ok[k], now);
++    // A faulted slot restarts its EMA on recovery instead of blending from a
++    // value that may be long stale.
++    if (sh[k] == VH_STALE || sh[k] == VH_FROZEN || sh[k] == VH_LOSSY) s_ema_init[k] = false;
++  }
++
++  // ---- 3) assemble + publish per-valve frame (every tick; holds between updates) ----
+   SensorFrame& out = g_sensor_pub.begin_write();
+   float total = 0.0f; uint8_t nvalid = 0;
+ 
+   for (int v = 0; v < VALVE_COUNT; ++v) {
+     int up = s_up[v], lo = s_lo[v];
+-    bool paired = (up >= 0 && lo >= 0 && s_prom_ok[up] && s_prom_ok[lo] && s_have1[up] && s_have1[lo]);
++    bool mapped = (up >= 0 && lo >= 0);
++    // Values are published whenever data exists (so a frozen / stale reading
++    // stays visible for diagnosis); VALIDITY is decided separately below.
++    bool paired = mapped && s_prom_ok[up] && s_prom_ok[lo] && s_have1[up] && s_have1[lo];
+ 
+     float pu = paired ? s_P[up] : 0.0f;
+     float pl = paired ? s_P[lo] : 0.0f;
+@@ -242,15 +288,20 @@ void sensors_tick(uint32_t tick) {
+                     pl >= MS_P_RANGE_MIN && pl <= MS_P_RANGE_MAX &&
+                     td >= MS_T_RANGE_MIN && td <= MS_T_RANGE_MAX;
+ 
+-    // VALIDITY = sensor health only. Flow presence is a separate deadband test,
+-    // so a healthy sensor at low/zero flow still counts toward n_valid.
+-    bool valid = range_ok && !g_fault_valve[v] && !g_fault_aggregate;
+-
+-
+- //float pu_adjusted =  pu - g_dp_zero[v];
+-
+     float dp = ((pu - pl) - g_dp_zero[v]);          // zero-corrected differential (mbar)
+-//float dp = pl - pu_adjusted; // - g_dp_zero[v];          // zero-corrected differential (mbar)
++
++    // VALIDITY = sensor + pair health only. Flow presence is a separate
++    // deadband test, so a healthy venturi at zero flow still counts.
++    VentInputs vin;
++    vin.mapped   = mapped;
++    vin.sh_up    = mapped ? sh[up] : (uint8_t)VH_UNMAPPED;
++    vin.sh_lo    = mapped ? sh[lo] : (uint8_t)VH_UNMAPPED;
++    vin.injected = g_fault_valve[v] || g_fault_aggregate;
++    vin.range_ok = range_ok;
++    vin.dp_corr  = dp;
++    uint8_t why  = vent_gate(s_gate[v], vent_reason(vin), now);
++    bool valid   = (why == VH_OK);
++    s_why[v]     = why;
+ 
+     float mdot = 0.0f;
+     if (valid) {
+@@ -268,6 +319,7 @@ void sensors_tick(uint32_t tick) {
+     out.t_lo[v]  = paired ? s_T[lo] : 0.0f;              // throat (cal/tempco)
+     out.mdot[v]  = mdot;
+     out.valid[v] = valid ? 1 : 0;
++    out.why[v]   = why;
+   }
+ 
+   out.mdot_total = total;
+@@ -275,7 +327,7 @@ void sensors_tick(uint32_t tick) {
+   for (int s = 0; s < SERVO_COUNT; ++s) out.servo_us[s] = g_servo_us_echo[s];
+   g_sensor_pub.end_write();
+ 
+-  // ---- 3) if nothing is in flight, kick the next conversion (broadcast) ----
++  // ---- 4) if nothing is in flight, kick the next conversion (broadcast) ----
+   if (!s_conv_pending) {
+     int type = ((s_conv_count % D2_CADENCE_TICKS) == 0) ? 1 : 0;   // D2 temp vs D1 pressure
+     mux_open_all_populated();
+diff --git a/rp2350_valve_node/sensors_sim.ino b/rp2350_valve_node/sensors_sim.ino
+index 74f062d..0a92135 100644
+--- a/rp2350_valve_node/sensors_sim.ino
++++ b/rp2350_valve_node/sensors_sim.ino
+@@ -75,6 +75,11 @@ static void sim_convert(uint32_t tick, int type) {
+   }
+ }
+ 
++// Sim has no per-sensor state; 'vhealth' just says so.
++void sensors_vhealth_print() {
++  Serial.println(F("[vh] USE_REAL_I2C=0 (simulated sensors): per-sensor health n/a; see 'sens'"));
++}
++
+ void sensors_tick(uint32_t tick) {
+   // ---- 1) read back the conversion kicked on the PREVIOUS tick ----
+   if (s_pend_have) {
+@@ -120,6 +125,8 @@ void sensors_tick(uint32_t tick) {
+     out.t_lo[v]  = td;                                   // sim: one die temp for the pair
+     out.mdot[v]  = mdot;
+     out.valid[v] = valid ? 1 : 0;
++    out.why[v]   = valid ? VH_OK : ((g_fault_aggregate || g_fault_valve[v]) ? VH_INJECTED
++                 : (range_ok ? VH_DPNEG : VH_RANGE));
+   }
+ 
+   out.mdot_total = total;      // summed over VALID valves only
+diff --git a/rp2350_valve_node/types.h b/rp2350_valve_node/types.h
+index c766109..c469e59 100644
+--- a/rp2350_valve_node/types.h
++++ b/rp2350_valve_node/types.h
+@@ -16,6 +16,39 @@ struct ValveCmd {
+   uint32_t stamp_ms;             // set by core 0; core 1 checks staleness
+ };
+ 
++// Why a venturi is (in)valid -- per valve, in SensorFrame.why[]. Worst-first
++// order is not implied; the first failing check wins (see sensors.ino).
++enum VentHealth : uint8_t {
++  VH_OK = 0,
++  VH_UNMAPPED,     // no up/lo pair in SENSOR_MAP
++  VH_NOPROM,       // a sensor's PROM read/CRC failed at boot (never usable)
++  VH_NODATA,       // no reading yet since boot
++  VH_STALE,        // a sensor stopped answering (no good read within SENS_*STALE_MS)
++  VH_FROZEN,       // a sensor returns identical raw counts (SENS_FROZEN_N)
++  VH_LOSSY,        // a sensor fails too many reads (SENS_FAIL_WEIGHT / SENS_FAIL_TRIP)
++  VH_RANGE,        // pressure / temperature outside physical limits
++  VH_DPNEG,        // throat above upstream beyond VENTURI_DP_NEG_MAX
++  VH_RECOVER,      // was faulty; waiting out SENS_RECOVER_MS clean time
++  VH_INJECTED,     // console 'fault' injection
++};
++
++inline const char* vh_name(uint8_t w) {
++  switch (w) {
++    case VH_OK:       return "OK";
++    case VH_UNMAPPED: return "UNMAPPED";
++    case VH_NOPROM:   return "NOPROM";
++    case VH_NODATA:   return "NODATA";
++    case VH_STALE:    return "STALE";
++    case VH_FROZEN:   return "FROZEN";
++    case VH_LOSSY:    return "LOSSY";
++    case VH_RANGE:    return "RANGE";
++    case VH_DPNEG:    return "DPNEG";
++    case VH_RECOVER:  return "RECOVER";
++    case VH_INJECTED: return "INJECTED";
++    default:          return "?";
++  }
++}
++
+ // core 1 -> core 0 : sensor + resolved-servo frame
+ struct SensorFrame {
+   float    p_up[VALVE_COUNT];    // upstream pressure  (mbar)
+@@ -26,6 +59,7 @@ struct SensorFrame {
+   float    mdot_total;           // summed over VALID valves only
+   uint16_t servo_us[SERVO_COUNT];// resolved servo commands (telemetry echo)
+   uint8_t  valid[VALVE_COUNT];   // per-valve validity flag (see sensors_sim)
++  uint8_t  why[VALVE_COUNT];     // VentHealth reason (VH_OK when valid)
+   uint8_t  n_valid;              // count of valid valves
+ };
+ 
+diff --git a/rp2350_valve_node/vent_health.h b/rp2350_valve_node/vent_health.h
+new file mode 100644
+index 0000000..d9e1c1d
+--- /dev/null
++++ b/rp2350_valve_node/vent_health.h
+@@ -0,0 +1,145 @@
++// =============================================================================
++//  vent_health.h  --  per-sensor and per-venturi health state machines
++//
++//  Pure logic (no I2C, no Arduino calls) so it runs unchanged in the host test
++//  (host_tools/test_vent_health.cpp). sensors.ino owns one SlotHealth per MS5837
++//  and one VentGate per venturi, all on core 1.
++//
++//  Slot (one sensor):
++//    * every read-back attempt is reported with sh_on_read(); a failed transfer,
++//      a 0 / 0xFFFFFF result (MS5837 returns 0 if read with no conversion
++//      running), or a SPIKE (D1 / D2 jump > SENS_D1/D2_JUMP_MAX from the
++//      previous good read) counts as a FAIL and refreshes nothing. A jump is
++//      accepted as a REAL STEP when the next read confirms it (lands within the
++//      jump limit of the rejected value): a real step costs one read (~30 ms),
++//      a one-off corrupt read is dropped. sh_on_read() returns whether the value
++//      may be used;
++//    * STALE  = no good D1 within SENS_STALE_MS, or no good D2 within
++//               SENS_T_STALE_MS (the node would otherwise keep publishing the
++//               last value forever -- the pre-2026-09-26 behaviour);
++//    * FROZEN = SENS_FROZEN_N identical consecutive good D1 counts;
++//    * LOSSY  = sustained read-failure rate above ~1/(1+SENS_FAIL_WEIGHT)
++//               (leaky score), for a sensor that answers often enough to
++//               dodge STALE but loses a large share of its reads.
++//  Venturi: first failing reason wins; any fault arms a SENS_RECOVER_MS
++//  clean-time gate before the venturi counts as valid again (anti-flap).
++// =============================================================================
++#pragma once
++#include <stdint.h>
++#include "config.h"
++#include "types.h"
++
++struct SlotHealth {
++  bool     seen_d1 = false, seen_d2 = false;
++  uint32_t last_d1_ms = 0, last_d2_ms = 0;
++  uint32_t prev_d1 = 0;
++  uint32_t prev_d2 = 0;
++  uint32_t cand[2] = {0, 0};     // last REJECTED jump per type (D1, D2): step confirmation
++  bool     has_cand[2] = {false, false};
++  uint16_t same_d1 = 0;          // identical consecutive good D1 counts
++  uint16_t fail_score = 0;       // leaky failure score (LOSSY)
++  uint8_t  state = VH_NODATA;    // last evaluated slot state
++  // counters (monotonic; read by the console on core 0 -- diagnostic only)
++  uint32_t n_ok = 0, n_fail = 0, n_spike = 0;
++  uint32_t n_stale_ev = 0, n_frozen_ev = 0, n_lossy_ev = 0;
++};
++
++struct VentGate {
++  uint32_t bad_until_ms = 0;     // valid only once now >= this
++  bool     armed = false;        // a fault has been seen at least once
++};
++
++inline bool sh_raw_ok(bool xfer_ok, uint32_t raw) {
++  return xfer_ok && raw != 0u && raw != 0xFFFFFFu;
++}
++
++static inline void sh_fail(SlotHealth& h) {
++  h.n_fail++;
++  uint32_t s = (uint32_t)h.fail_score + SENS_FAIL_WEIGHT;
++  h.fail_score = (uint16_t)(s > 2u * SENS_FAIL_TRIP ? 2u * SENS_FAIL_TRIP : s);   // capped
++}
++
++// Report one read-back attempt. type: 0 = D1 (pressure), 1 = D2 (temperature).
++// Returns true if the raw value may be used (stored + compensated).
++static inline uint32_t absdiff(uint32_t a, uint32_t b) { return a > b ? a - b : b - a; }
++
++inline bool sh_on_read(SlotHealth& h, int type, bool xfer_ok, uint32_t raw, uint32_t now) {
++  if (!sh_raw_ok(xfer_ok, raw)) { sh_fail(h); return false; }
++  const int t = type ? 1 : 0;
++  const bool     seen = t ? h.seen_d2 : h.seen_d1;
++  const uint32_t prev = t ? h.prev_d2 : h.prev_d1;
++  const uint32_t age  = now - (t ? h.last_d2_ms : h.last_d1_ms);
++  const uint32_t jmax = t ? SENS_D2_JUMP_MAX : SENS_D1_JUMP_MAX;
++  const uint32_t amax = t ? SENS_T_STALE_MS : SENS_STALE_MS;
++  if (seen && age <= amax && absdiff(raw, prev) > jmax) {
++    bool confirmed = h.has_cand[t] && absdiff(raw, h.cand[t]) <= jmax;
++    if (!confirmed) {                      // first read at a new level: hold it
++      h.cand[t] = raw; h.has_cand[t] = true;
++      h.n_spike++; sh_fail(h); return false;
++    }
++    // else: two consecutive reads agree on the new level -> real step, accept
++  }
++  h.has_cand[t] = false;
++  h.n_ok++;
++  if (h.fail_score) h.fail_score--;
++  if (type == 0) {
++    if (h.seen_d1 && raw == h.prev_d1) { if (h.same_d1 < 0xFFFF) h.same_d1++; }
++    else                                 h.same_d1 = 0;
++    h.prev_d1    = raw;
++    h.last_d1_ms = now;
++    h.seen_d1    = true;
++  } else {
++    h.prev_d2    = raw;
++    h.last_d2_ms = now;
++    h.seen_d2    = true;
++  }
++  return true;
++}
++
++// Evaluate one sensor. Counts STALE / FROZEN entry events.
++inline uint8_t sh_eval(SlotHealth& h, bool prom_ok, uint32_t now) {
++  uint8_t s;
++  if (!prom_ok)                                        s = VH_NOPROM;
++  else if (!h.seen_d1 || !h.seen_d2)                   s = VH_NODATA;
++  else if ((uint32_t)(now - h.last_d1_ms) > SENS_STALE_MS ||
++           (uint32_t)(now - h.last_d2_ms) > SENS_T_STALE_MS) s = VH_STALE;
++  else if (h.same_d1 >= SENS_FROZEN_N)                 s = VH_FROZEN;
++  else if (h.fail_score >= SENS_FAIL_TRIP)             s = VH_LOSSY;
++  else                                                 s = VH_OK;
++  if (s != h.state) {
++    if (s == VH_STALE)  h.n_stale_ev++;
++    if (s == VH_FROZEN) h.n_frozen_ev++;
++    if (s == VH_LOSSY)  h.n_lossy_ev++;
++    h.state = s;
++  }
++  return s;
++}
++
++// Venturi-level inputs, already reduced to numbers by the caller.
++struct VentInputs {
++  bool    mapped;      // both up and lo slots exist in SENSOR_MAP
++  uint8_t sh_up, sh_lo;// slot states from sh_eval
++  bool    injected;    // console fault injection
++  bool    range_ok;    // p/T within MS_P_RANGE_* / MS_T_RANGE_*
++  float   dp_corr;     // (p_up - p_lo) - g_dp_zero, mbar
++};
++
++inline uint8_t vent_reason(const VentInputs& in) {
++  if (!in.mapped)                       return VH_UNMAPPED;
++  if (in.injected)                      return VH_INJECTED;
++  if (in.sh_up != VH_OK)                return in.sh_up;
++  if (in.sh_lo != VH_OK)                return in.sh_lo;
++  if (!in.range_ok)                     return VH_RANGE;
++  if (in.dp_corr < -VENTURI_DP_NEG_MAX) return VH_DPNEG;
++  return VH_OK;
++}
++
++// Anti-flap gate: a fault (re)arms SENS_RECOVER_MS of required clean time.
++inline uint8_t vent_gate(VentGate& g, uint8_t why, uint32_t now) {
++  if (why != VH_OK) { g.bad_until_ms = now + SENS_RECOVER_MS; g.armed = true; return why; }
++  if (g.armed) {
++    if ((int32_t)(g.bad_until_ms - now) > 0) return VH_RECOVER;
++    g.armed = false;   // disarm once served, so the signed compare can't re-trip ~24.8 days later
++  }
++  return VH_OK;
++}
