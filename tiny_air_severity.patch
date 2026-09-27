@@ -1,0 +1,643 @@
+diff --git a/host_tools/test_air_state.cpp b/host_tools/test_air_state.cpp
+new file mode 100644
+index 0000000..9242a3e
+--- /dev/null
++++ b/host_tools/test_air_state.cpp
+@@ -0,0 +1,90 @@
++// Host test for rp2350_valve_node/air_state.h (air-delivery severity).
++// Build + run from repo root:
++//   g++ -std=c++17 -Wall -Wextra -I host_tools/stub -I rp2350_valve_node
++//       host_tools/test_air_state.cpp -o /tmp/tas && /tmp/tas
++#include <cstdio>
++#include "air_state.h"
++
++static int fails = 0;
++static void check(const char* n, bool ok) { printf("  [%s] %s\n", ok ? "PASS" : "FAIL", n); if (!ok) fails++; }
++
++static AirInputs base() {   // armed, past both graces, everything healthy, flow nominal
++  AirInputs a{};
++  a.armed = true; a.terminated = false; a.tlm_grace_done = true; a.flow_grace_done = true;
++  a.comp_link_ok = true; a.comp_err = 0; a.sensor_stale = false; a.n_valid = VALVE_COUNT; a.mdot_total = 40.0f;
++  return a;
++}
++static uint8_t sev(const AirInputs& a, uint8_t* c = nullptr) { uint8_t x; return air_eval(a, c ? c : &x); }
++
++int main() {
++  printf("the ranking (decision 2026-09-27)\n");
++  AirInputs a = base(); uint8_t c;
++  check("all healthy -> OK", sev(a) == AIR_OK);
++
++  a = base(); a.comp_err = ESCPID_ERR_NO_TLM;
++  check("telemetry lost, venturis all good, flow ok -> ADVISORY", sev(a, &c) == AIR_ADVISORY && (c & AIR_C_TLM_LOST));
++
++  a = base(); a.n_valid = 4;
++  check("some venturis invalid, telemetry ok -> ADVISORY", sev(a, &c) == AIR_ADVISORY && (c & AIR_C_VENT_PARTIAL));
++
++  a = base(); a.n_valid = 0;
++  check("venturis lost, telemetry ok -> CAUTION (outranks lost telemetry)", sev(a, &c) == AIR_CAUTION && (c & AIR_C_VENT_LOST));
++
++  a = base(); a.sensor_stale = true;
++  check("sensor frame stale counts as venturis lost -> CAUTION", sev(a, &c) == AIR_CAUTION && (c & AIR_C_SENSOR_STALE));
++
++  a = base(); a.comp_err = ESCPID_ERR_NO_TLM; a.n_valid = 3;
++  check("telemetry lost AND venturis partial -> CAUTION", sev(a) == AIR_CAUTION);
++
++  a = base(); a.comp_err = ESCPID_ERR_NO_TLM; a.n_valid = 0;
++  check("telemetry lost AND venturis lost -> WARNING", sev(a) == AIR_WARNING);
++
++  a = base(); a.comp_err = ESCPID_ERR_NO_TLM; a.mdot_total = 2.0f;
++  check("telemetry lost, venturis good but NO FLOW (rotor not delivering) -> WARNING",
++        sev(a, &c) == AIR_WARNING && (c & AIR_C_FLOW_LOW));
++
++  a = base(); a.mdot_total = 2.0f;
++  check("rpm fine but venturis show no flow (blockage/leak) -> WARNING", sev(a) == AIR_WARNING);
++
++  a = base(); a.n_valid = 3; a.mdot_total = 20.0f;   // 3 valid carrying 20 -> ~40 extrapolated
++  check("flow check extrapolates from valid venturis (3 x ~6.7 g/s is fine)", sev(a) == AIR_ADVISORY);
++
++  printf("link / emulation\n");
++  a = base(); a.comp_link_ok = false;
++  check("no Teensy replies while armed -> treated as telemetry lost", sev(a, &c) == AIR_ADVISORY && (c & AIR_C_TEENSY_LINK));
++  a = base(); a.comp_err = ESCPID_ERR_EMULATION;
++  check("emulation build: rpm unverified -> ADVISORY", sev(a, &c) == AIR_ADVISORY && (c & AIR_C_TLM_EMU));
++  a = base(); a.comp_err = -10;
++  check("ordinary telemetry error (-10) alone is not 'lost'", sev(a) == AIR_OK);
++
++  printf("grace periods / states\n");
++  a = base(); a.tlm_grace_done = false; a.flow_grace_done = false; a.comp_link_ok = false; a.mdot_total = 0.0f;
++  check("just armed: link and flow not judged yet -> OK", sev(a) == AIR_OK);
++  a = base(); a.flow_grace_done = false; a.mdot_total = 0.0f;
++  check("during spin-up grace: low flow not flagged", sev(a) == AIR_OK);
++  a = base(); a.armed = false; a.comp_link_ok = false; a.mdot_total = 0.0f;
++  check("disarmed, healthy: Teensy silence and zero flow are normal -> OK", sev(a) == AIR_OK);
++  a = base(); a.armed = false; a.n_valid = 5;
++  check("disarmed with a bad venturi -> ADVISORY (pre-flight notice)", sev(a) == AIR_ADVISORY);
++  a = base(); a.terminated = true; a.n_valid = 0; a.comp_link_ok = false;
++  check("terminated -> OK (air off by design; mode shows TERMINATED)", sev(a) == AIR_OK);
++
++  printf("debounce\n");
++  AirDebounce d;
++  check("starts OK", air_debounce(d, AIR_OK, 0) == AIR_OK);
++  air_debounce(d, AIR_WARNING, 1000);
++  check("raise not before AIR_RAISE_MS", air_debounce(d, AIR_WARNING, 1000 + AIR_RAISE_MS - 1) == AIR_OK);
++  check("raise at AIR_RAISE_MS", air_debounce(d, AIR_WARNING, 1000 + AIR_RAISE_MS) == AIR_WARNING);
++  air_debounce(d, AIR_OK, 5000);
++  check("fall not before AIR_FALL_MS", air_debounce(d, AIR_OK, 5000 + AIR_FALL_MS - 1) == AIR_WARNING);
++  check("fall at AIR_FALL_MS", air_debounce(d, AIR_OK, 5000 + AIR_FALL_MS) == AIR_OK);
++  AirDebounce f; uint8_t shown_max = 0;
++  for (uint32_t t = 0; t < 5000; t += 10) {               // 100 ms blips of CAUTION
++    uint8_t cand = ((t / 100) % 3 == 0) ? AIR_CAUTION : AIR_OK;
++    uint8_t o = air_debounce(f, cand, t); if (o > shown_max) shown_max = o;
++  }
++  check("100 ms blips never reach the display", shown_max == AIR_OK);
++
++  printf("\n%s\n", fails ? "SOME CHECKS FAILED" : "all checks passed");
++  return fails ? 1 : 0;
++}
+diff --git a/rp2350_valve_node/README.md b/rp2350_valve_node/README.md
+index 8cbb65f..87c9fa6 100644
+--- a/rp2350_valve_node/README.md
++++ b/rp2350_valve_node/README.md
+@@ -74,6 +74,7 @@ help                         list commands
+ status                       one-shot status line (src/arm/elig, comp rpm + THERMAL, valves, surf)
+ health                       reprint boot/health summary (incl. last reset cause, vhealth)
+ vhealth                      per-venturi validity reason + per-sensor read/fault counters
++air                          air-delivery severity (OK/ADVISORY/CAUTION/WARNING), causes, inputs
+ mon on|off                   periodic status line (2 Hz)
+ src auto|primary|sbus|safe   force / release the active source (never leave forced)
+ surf on|off|auto             force traditional surfaces / follow the SBUS switch (bench)
+diff --git a/rp2350_valve_node/air_state.h b/rp2350_valve_node/air_state.h
+new file mode 100644
+index 0000000..4edfc3c
+--- /dev/null
++++ b/rp2350_valve_node/air_state.h
+@@ -0,0 +1,107 @@
++// =============================================================================
++//  air_state.h  --  "is air being delivered?" severity (core 0)
++//
++//  Pure logic (no Arduino calls) so it runs unchanged in the host test
++//  (host_tools/test_air_state.cpp). compressor_update() feeds it once per loop.
++//
++//  Two independent views of air delivery:
++//    * ESC telemetry (Teensy): rpm tracked, or open loop (err -11), or the
++//      Teensy link itself silent while armed;
++//    * venturis (Tiny): measured mass flow, per-venturi validity.
++//  Severity ranks how well air delivery is CONFIRMED, not which sensor failed
++//  (decision 2026-09-27). Lost telemetry with healthy venturis is only an
++//  advisory -- flow is still measured, and the (future) mdot loop can still
++//  drive the compressor through the Teensy's target-scaled open loop. Lost
++//  venturis mean we don't know whether air is flowing: caution. Neither, or
++//  venturis reporting no flow while running: warning (engage surfaces).
++//
++//    armed, not terminated:
++//      WARNING  (tlm lost AND venturis lost)  or  flow low (any telemetry state)
++//      CAUTION  venturis lost (tlm ok)        or  tlm lost AND venturis partial
++//      ADVISORY tlm lost AND venturis all ok  or  venturis partial (tlm ok)
++//    disarmed: venturis partial/lost -> ADVISORY (pre-flight notice); else OK
++//    terminated: OK (air is off by design; the MODE pill says TERMINATED)
++//
++//  Reporting only: nothing here changes control.
++// =============================================================================
++#pragma once
++#include <stdint.h>
++#include "config.h"
++
++enum AirSev : uint8_t { AIR_OK = 0, AIR_ADVISORY = 1, AIR_CAUTION = 2, AIR_WARNING = 3 };
++
++// Cause bits (CTRL_TLM byte 55, /afc/ctrl_tlm.air_causes)
++#define AIR_C_TLM_LOST      0x01   // Teensy reports no ESC telemetry (err -11, open loop)
++#define AIR_C_TLM_EMU       0x02   // Teensy is an ESC-emulation build (err -12): rpm is fake
++#define AIR_C_VENT_PARTIAL  0x04   // some venturis invalid
++#define AIR_C_VENT_LOST     0x08   // no valid venturis (or sensor frame stale)
++#define AIR_C_FLOW_LOW      0x10   // venturis healthy but flow implausibly low while running
++#define AIR_C_SENSOR_STALE  0x20   // core-1 sensor frame not updating
++#define AIR_C_TEENSY_LINK   0x40   // no reply from the Teensy while armed
++
++#define ESCPID_ERR_NO_TLM     (-11)   // mirror of teensy_escpid ESCPID_ERROR_NO_TLM
++#define ESCPID_ERR_EMULATION  (-12)   // mirror of teensy_escpid ESCPID_ERROR_EMULATION
++
++struct AirInputs {
++  bool    armed;
++  bool    terminated;
++  bool    tlm_grace_done;    // running >= AIR_TLM_GRACE_MS (Teensy acquisition ~0.5 s)
++  bool    flow_grace_done;   // running >= COMP_SPINUP_GRACE_MS (flow has had time to build)
++  bool    comp_link_ok;      // g_comp.ok: Teensy replied within its stale window
++  int8_t  comp_err;          // g_comp.err
++  bool    sensor_stale;      // core-1 SensorFrame not advancing
++  uint8_t n_valid;           // valid venturis (0..VALVE_COUNT)
++  float   mdot_total;        // g/s, sum over valid venturis
++};
++
++inline uint8_t air_eval(const AirInputs& in, uint8_t* causes_out) {
++  uint8_t c = 0;
++  const bool vent_lost    = in.sensor_stale || in.n_valid == 0;
++  const bool vent_partial = !vent_lost && in.n_valid < VALVE_COUNT;
++  if (in.sensor_stale) c |= AIR_C_SENSOR_STALE;
++  if (vent_lost)       c |= AIR_C_VENT_LOST;
++  if (vent_partial)    c |= AIR_C_VENT_PARTIAL;
++
++  if (in.terminated) { *causes_out = c; return AIR_OK; }
++  if (!in.armed) {
++    *causes_out = c;
++    return (vent_lost || vent_partial) ? AIR_ADVISORY : AIR_OK;
++  }
++
++  bool tlm_lost = false;
++  if (in.tlm_grace_done) {
++    if (!in.comp_link_ok)                          { tlm_lost = true; c |= AIR_C_TEENSY_LINK; }
++    else if (in.comp_err == ESCPID_ERR_NO_TLM)     { tlm_lost = true; c |= AIR_C_TLM_LOST; }
++    else if (in.comp_err == ESCPID_ERR_EMULATION)  { tlm_lost = true; c |= AIR_C_TLM_EMU; }
++  }
++
++  // Flow plausibility, extrapolated from the valid venturis to all of them.
++  bool flow_low = false;
++  if (in.flow_grace_done && !vent_lost) {
++    float est = in.mdot_total * (float)VALVE_COUNT / (float)in.n_valid;
++    if (est < AIR_MDOT_MIN_GPS) { flow_low = true; c |= AIR_C_FLOW_LOW; }
++  }
++
++  *causes_out = c;
++  if (flow_low || (tlm_lost && vent_lost))  return AIR_WARNING;
++  if (vent_lost || (tlm_lost && vent_partial)) return AIR_CAUTION;
++  if (tlm_lost || vent_partial)             return AIR_ADVISORY;
++  return AIR_OK;
++}
++
++// Debounce: a new level must persist AIR_RAISE_MS to raise, AIR_FALL_MS to lower.
++struct AirDebounce { uint8_t out = AIR_OK, cand = AIR_OK; uint32_t since = 0; };
++
++inline uint8_t air_debounce(AirDebounce& d, uint8_t cand, uint32_t now) {
++  if (cand == d.out) { d.cand = cand; d.since = now; return d.out; }
++  if (cand != d.cand) { d.cand = cand; d.since = now; return d.out; }
++  uint32_t need = (cand > d.out) ? AIR_RAISE_MS : AIR_FALL_MS;
++  if ((uint32_t)(now - d.since) >= need) d.out = cand;
++  return d.out;
++}
++
++inline const char* air_name(uint8_t s) {
++  switch (s) { case AIR_OK: return "OK"; case AIR_ADVISORY: return "ADVISORY";
++               case AIR_CAUTION: return "CAUTION"; case AIR_WARNING: return "WARNING"; }
++  return "?";
++}
+diff --git a/rp2350_valve_node/compressor.ino b/rp2350_valve_node/compressor.ino
+index 4e298a1..9dbaa17 100644
+--- a/rp2350_valve_node/compressor.ino
++++ b/rp2350_valve_node/compressor.ino
+@@ -20,6 +20,7 @@
+ // -----------------------------------------------------------------------------
+ #include "config.h"
+ #include "types.h"
++#include "air_state.h"
+ 
+ // ---- outer-loop + fallback state ----
+ static float    comp_integ      = 0.0f;   // PI integral (rpm)
+@@ -69,7 +70,9 @@ static bool thermal_update(uint32_t now, bool running, uint32_t run_since, float
+   static bool     flag      = false;
+   static uint32_t sag_since = 0;
+ 
+-  bool eval = running && g_comp.ok && target > 0.0f &&
++  // Not while the Teensy is in its no-telemetry open loop (err -11): the
++  // temperature and rpm it reports are then the last good values, not current.
++  bool eval = running && g_comp.ok && g_comp.err != ESCPID_ERR_NO_TLM && target > 0.0f &&
+               (now - run_since) >= COMP_SPINUP_GRACE_MS;
+   if (!eval) { sag_since = 0; flag = false; return false; }
+ 
+@@ -190,6 +193,25 @@ void compressor_update(uint32_t now) {
+   g_current_rpm_cmd      = want_run ? (uint32_t)comp_rpm : 0;   // core 1 sim reads this
+   g_status.comp_thermal  = thermal_update(now, want_run, run_since, comp_rpm);
+ 
++  // ---- air-delivery severity (reporting only; air_state.h) ----
++  {
++    static AirDebounce air_db;
++    AirInputs ai;
++    ai.armed           = want_run;
++    ai.terminated      = g_status.terminated;
++    ai.tlm_grace_done  = want_run && (now - run_since) >= AIR_TLM_GRACE_MS;
++    ai.flow_grace_done = want_run && (now - run_since) >= COMP_SPINUP_GRACE_MS;
++    ai.comp_link_ok    = g_comp.ok;
++    ai.comp_err        = g_comp.err;
++    ai.sensor_stale    = sensor_stale;
++    ai.n_valid         = n_valid;
++    ai.mdot_total      = mdot_total;
++    uint8_t causes = 0;
++    uint8_t cand   = air_eval(ai, &causes);
++    g_status.air_sev    = air_debounce(air_db, cand, now);
++    g_status.air_causes = causes;
++  }
++
+   // ---- stream to Teensy at 50 Hz while running; SILENCE when stopped (= stop) ----
+   if (want_run) {
+     if ((now - comp_last_stream_ms) >= (1000 / TEENSY_STREAM_HZ)) {
+diff --git a/rp2350_valve_node/config.h b/rp2350_valve_node/config.h
+index 50c1e56..0c9a4bf 100644
+--- a/rp2350_valve_node/config.h
++++ b/rp2350_valve_node/config.h
+@@ -267,6 +267,16 @@
+ #define FLOW_FALLBACK_HOLD_MS 250   // hysteresis into/out of fallback (anti-chatter)
+ #define COMP_MDOT_LOOP        0   // 0 = stub (armed -> RPM_FALLBACK); 1 = mdot PI (tracks only with all venturis valid)
+ 
++// Air-delivery severity (air_state.h; reporting only, decision 2026-09-27).
++#define AIR_TLM_GRACE_MS      1000  // after a run edge, before telemetry/link loss counts
++                                    //   (Teensy's own acquisition timeout is 0.5 s)
++#define AIR_MDOT_MIN_GPS       8.0f // g/s, whole-vehicle flow (extrapolated from the valid
++                                    //   venturis) below which "running but no air" is flagged
++                                    //   after COMP_SPINUP_GRACE_MS. <<PLACEHOLDER: ~20% of the
++                                    //   flow measured at 30k during venturi calibration>>
++#define AIR_RAISE_MS           300  // a higher severity must persist this long to show
++#define AIR_FALL_MS           1000  // a lower one this long (anti-flap)
++
+ // Spin-up/spin-down shaping lives on the TEENSY (reference rate limit, ~5 s to
+ // 30k). The Tiny does NOT ramp from 0 on a run edge; it sends the target and the
+ // Teensy shapes it. RPM_SLEW_PER_S above only shapes in-run target changes.
+diff --git a/rp2350_valve_node/console.ino b/rp2350_valve_node/console.ino
+index d97b3f0..1b304cf 100644
+--- a/rp2350_valve_node/console.ino
++++ b/rp2350_valve_node/console.ino
+@@ -6,6 +6,7 @@
+ //  sensor faults, and save calibration. Line-based; type 'help'.
+ // -----------------------------------------------------------------------------
+ #include "config.h"
++#include "air_state.h"
+ 
+ static bool    con_mon_on = false;
+ static bool    con_pstream = false;   // 2 Hz LabVIEW pressure stream
+@@ -32,12 +33,13 @@ static const char* mode_name(CompMode m) {
+ 
+ static void print_status() {
+   Serial.printf(
+-    "[st] src=%-7s arm=%d(live=%d) term=%d prim=%d | elig fc=%d sbus=%d sw=%d | comp=%-8s rpm=%5u%s | mdot=%.1f/%.1f g/s nvalid=%u%s%s | v=[%d %d %d %d %d %d] surf=%s[%d %d %d %d] desat=%.2f/%.2f | cal=%s | hb=%lu drop=%lu\n",
++    "[st] src=%-7s arm=%d(live=%d) term=%d prim=%d | elig fc=%d sbus=%d sw=%d | comp=%-8s rpm=%5u%s | mdot=%.1f/%.1f g/s nvalid=%u%s%s | air=%s(0x%02X) | v=[%d %d %d %d %d %d] surf=%s[%d %d %d %d] desat=%.2f/%.2f | cal=%s | hb=%lu drop=%lu\n",
+     src_name(g_status.source), g_status.armed?1:0, g_status.arm_live?1:0, g_status.terminated?1:0, g_status.primary_present?1:0,
+     arb_fc_eligible()?1:0, g_sbus_arm_seen_disarmed?1:0, g_sbus_arm?1:0,
+     mode_name(g_status.comp_mode), g_status.rpm_target, g_status.comp_thermal ? " THERMAL" : "",
+     (double)g_status.mdot_total, (double)g_status.mdot_target, g_status.n_valid,
+     g_status.flow_fallback ? " FALLBACK" : "", g_status.sensor_stale ? " STALE" : "",
++    air_name(g_status.air_sev), g_status.air_causes,
+     g_valve_dbg[0], g_valve_dbg[1], g_valve_dbg[2], g_valve_dbg[3], g_valve_dbg[4], g_valve_dbg[5],
+     g_status.surf_active ? (g_surf_force >= 0 ? "ON(forced)" : "ON")
+       : g_status.surf_engaged ? "sw-on/idle" : (g_surf_force >= 0 ? "off(forced)" : "off"),
+@@ -72,7 +74,8 @@ static void print_help() {
+     "  save                    persist current calibration to LittleFS\n"
+     "  zero                    capture no-flow dp offset per valve, then save\n"
+     "  calshow                 show calibration source + servo0 coeffs + dp_zero\n"
+-    "  vhealth                 per-venturi validity reason + per-sensor read/fault counters"));
++    "  vhealth                 per-venturi validity reason + per-sensor read/fault counters\n"
++    "  air                     air-delivery severity, causes and the inputs behind them"));
+ #if BENCH_HOOKS
+   Serial.println(F(
+     "bench hooks (BENCH_HOOKS=1 -- not a flight build):\n"
+@@ -125,6 +128,17 @@ static void dispatch(char* line) {
+     sensors_vhealth_print();
+   }
+   else if (eq(tok[0], "vhealth")) { sensors_vhealth_print(); }
++  else if (eq(tok[0], "air")) {
++    uint8_t c = g_status.air_causes;
++    Serial.printf("[air] severity=%s  causes=0x%02X%s%s%s%s%s%s%s\n", air_name(g_status.air_sev), c,
++      (c & AIR_C_TLM_LOST)     ? " TLM_LOST"     : "", (c & AIR_C_TLM_EMU)     ? " TLM_EMU"     : "",
++      (c & AIR_C_VENT_PARTIAL) ? " VENT_PARTIAL" : "", (c & AIR_C_VENT_LOST)   ? " VENT_LOST"   : "",
++      (c & AIR_C_FLOW_LOW)     ? " FLOW_LOW"     : "", (c & AIR_C_SENSOR_STALE)? " SENSOR_STALE": "",
++      (c & AIR_C_TEENSY_LINK)  ? " TEENSY_LINK"  : "");
++    Serial.printf("[air] inputs: armed=%d term=%d teensy_ok=%d err=%d nvalid=%u stale=%d mdot=%.1f g/s (min %.1f)\n",
++      g_status.armed?1:0, g_status.terminated?1:0, g_comp.ok?1:0, (int)g_comp.err,
++      g_status.n_valid, g_status.sensor_stale?1:0, (double)g_status.mdot_total, (double)AIR_MDOT_MIN_GPS);
++  }
+   else if (eq(tok[0], "hang") || eq(tok[0], "tdrop")) {
+ #if BENCH_HOOKS
+     if (eq(tok[0], "hang") && n >= 2 && eq(tok[1], "core0")) {
+diff --git a/rp2350_valve_node/framing.ino b/rp2350_valve_node/framing.ino
+index 587548e..4230f04 100644
+--- a/rp2350_valve_node/framing.ino
++++ b/rp2350_valve_node/framing.ino
+@@ -154,7 +154,8 @@ void tlm_service(uint32_t now) {
+                   | (g_sbus_arm_seen_disarmed  ? 0x04 : 0)   // bit2 SBUS arm eligible
+                   | (g_sbus_arm                ? 0x08 : 0)   // bit3 SBUS switch now
+                   | (g_status.surf_active      ? 0x10 : 0)   // bit4 surfaces ACTIVE (allocated)
+-                  | (g_status.surf_engaged     ? 0x20 : 0);  // bit5 surface switch on
++                  | (g_status.surf_engaged     ? 0x20 : 0)   // bit5 surface switch on
++                  | (uint8_t)((g_status.air_sev & 0x03) << 6);   // bits6-7 air-delivery severity
+     fput_u8(pl, i, flags);
+     float srp  = g_alloc_s_rp  < 0.f ? 0.f : (g_alloc_s_rp  > 1.f ? 1.f : g_alloc_s_rp);
+     float syaw = g_alloc_s_yaw < 0.f ? 0.f : (g_alloc_s_yaw > 1.f ? 1.f : g_alloc_s_yaw);
+@@ -162,7 +163,9 @@ void tlm_service(uint32_t now) {
+     fput_u8(pl, i, (uint8_t)(syaw * 100.f + 0.5f));
+     // ---- surfaces (APPENDED): commanded position, [-1000,1000], 0 = center ----
+     for (int k = 0; k < SURF_COUNT; ++k) fput_i16(pl, i, g_surf_dbg[k]);
+-    send_frame(FT_CTRL_TLM, pl, (uint8_t)i);   // i == 55
++    // ---- air-delivery causes (APPENDED 2026-09-27): AIR_C_* bits ----
++    fput_u8(pl, i, g_status.air_causes);
++    send_frame(FT_CTRL_TLM, pl, (uint8_t)i);   // i == 56
+   } else {
+     i = 0;
+     for (int v = 0; v < VALVE_COUNT; ++v) fput_i16(pl, i, (int16_t)lroundf((got?fr.p_up[v]:0)  * 10.0f));
+diff --git a/rp2350_valve_node/types.h b/rp2350_valve_node/types.h
+index c469e59..4c2f871 100644
+--- a/rp2350_valve_node/types.h
++++ b/rp2350_valve_node/types.h
+@@ -106,6 +106,8 @@ struct NodeStatus {
+   bool     surf_engaged    = false;      // surface switch state (SBUS switch or console force)
+   bool     surf_active     = false;      // surfaces actually allocated (switch && live source && !term)
+   bool     comp_thermal    = false;      // ESC thermal-derate suspected (advisory)
++  uint8_t  air_sev         = 0;          // air-delivery severity (AirSev, air_state.h), debounced
++  uint8_t  air_causes      = 0;          // AIR_C_* bits behind it (instantaneous)
+ };
+ 
+ // Measured compressor telemetry, latched from the Motor Teensy's ESCPID_comm.
+diff --git a/rpi_ros2/src/afc_bridge/afc_bridge/bridge_node.py b/rpi_ros2/src/afc_bridge/afc_bridge/bridge_node.py
+index 85a82e8..477bca8 100644
+--- a/rpi_ros2/src/afc_bridge/afc_bridge/bridge_node.py
++++ b/rpi_ros2/src/afc_bridge/afc_bridge/bridge_node.py
+@@ -138,6 +138,8 @@ class BridgeNode(Node):
+         self._last_desat_yaw = 1.0
+         self._last_surf = False
+         self._last_thermal = False
++        self._last_air_sev = 0
++        self._last_air_causes = 0
+         self._health_t = time.monotonic()
+ 
+         # ---- publishers ----
+@@ -329,6 +331,8 @@ class BridgeNode(Node):
+         m.surf_engaged = d["surf_engaged"]
+         m.surf_switch = d["surf_switch"]
+         m.surf = d["surf"]
++        m.air_sev = d["air_sev"]
++        m.air_causes = d["air_causes"]
+         self._ctrl_pub.publish(m)
+         self._ctrl_count += 1
+         self._frames_ok += 1
+@@ -342,6 +346,8 @@ class BridgeNode(Node):
+         self._last_desat_rp = d["desat_rp"]
+         self._last_desat_yaw = d["desat_yaw"]
+         self._last_surf = d["surf_engaged"]
++        self._last_air_sev = d["air_sev"]
++        self._last_air_causes = d["air_causes"]
+ 
+     def _publish_sensor(self, payload: bytes):
+         try:
+@@ -428,6 +434,10 @@ class BridgeNode(Node):
+         m.desat_rp = float(self._last_desat_rp)
+         m.desat_yaw = float(self._last_desat_yaw)
+         m.surf_engaged = bool(self._last_surf)
++        m.air_sev = int(self._last_air_sev)
++        m.air_causes = int(self._last_air_causes)
++        m.air_str = F.AIR_NAMES.get(m.air_sev, "?") + "".join(
++            " " + name for bit, name in F.AIR_CAUSES.items() if m.air_causes & bit)
+         m.cmd_fresh = bool(cmd_fresh)
+         m.arm_fresh = bool(arm_fresh)
+         m.arm_counter = int(self._armtx.counter)
+@@ -443,7 +453,7 @@ class BridgeNode(Node):
+             f"mode={m.mode_str} src={src} armed={m.last_armed} term={m.terminated} "
+             f"elig[fc={m.elig_fc} sbus={m.elig_sbus} sw={m.sbus_sw}] "
+             f"cmd_fresh={m.cmd_fresh} arm_fresh={m.arm_fresh} "
+-            f"desat={m.desat_rp:.2f}/{m.desat_yaw:.2f} surf={m.surf_engaged} "
++            f"desat={m.desat_rp:.2f}/{m.desat_yaw:.2f} surf={m.surf_engaged} air=[{m.air_str}] "
+             f"armctr={m.arm_counter} off={m.tlm_offset_ms}ms")
+ 
+ 
+diff --git a/rpi_ros2/src/afc_bridge/afc_bridge/framing.py b/rpi_ros2/src/afc_bridge/afc_bridge/framing.py
+index 2680504..607faff 100644
+--- a/rpi_ros2/src/afc_bridge/afc_bridge/framing.py
++++ b/rpi_ros2/src/afc_bridge/afc_bridge/framing.py
+@@ -186,6 +186,13 @@ SURF_COUNT = 4
+ CTRL_TLM_LEN = 43
+ CTRL_TLM_LEN_EXT = 47
+ CTRL_TLM_LEN_EXT2 = 55
++CTRL_TLM_LEN_EXT3 = 56          # + air_causes byte (air-delivery severity rides flags bits 6-7)
++
++# Air-delivery severity (tiny air_state.h). Reporting only.
++AIR_OK, AIR_ADVISORY, AIR_CAUTION, AIR_WARNING = 0, 1, 2, 3
++AIR_NAMES = {0: "OK", 1: "ADVISORY", 2: "CAUTION", 3: "WARNING"}
++AIR_CAUSES = {0x01: "TLM_LOST", 0x02: "TLM_EMU", 0x04: "VENT_PARTIAL", 0x08: "VENT_LOST",
++              0x10: "FLOW_LOW", 0x20: "SENSOR_STALE", 0x40: "TEENSY_LINK"}
+ SENSOR_TLM_LEN = 56
+ COMP_TLM_LEN = 13
+ COMP_TLM_LEN_EXT = 14
+@@ -204,7 +211,7 @@ def decode_ctrl_tlm(payload: bytes) -> dict:
+              mode=0, terminated=False, elig_fc=False, elig_sbus=False,
+              sbus_sw=False, surf_engaged=False, surf_switch=False,
+              desat_rp=1.0, desat_yaw=1.0,
+-             surf=[0] * SURF_COUNT)
++             surf=[0] * SURF_COUNT, air_sev=0, air_causes=0)
+     if len(payload) >= CTRL_TLM_LEN_EXT:
+         mode, flags, drp, dyaw = struct.unpack_from("<BBBB", payload, 43)
+         d.update(mode=mode, terminated=bool(flags & 0x01),
+@@ -212,8 +219,12 @@ def decode_ctrl_tlm(payload: bytes) -> dict:
+                  sbus_sw=bool(flags & 0x08), surf_engaged=bool(flags & 0x10),
+                  surf_switch=bool(flags & 0x20),
+                  desat_rp=drp / 100.0, desat_yaw=dyaw / 100.0)
++        # bits 6-7 were always 0 on older firmware -> AIR_OK, so no length gate needed
++        d.update(air_sev=(flags >> 6) & 0x03)
+     if len(payload) >= CTRL_TLM_LEN_EXT2:
+         d.update(surf=list(struct.unpack_from("<4h", payload, 47)))
++    if len(payload) >= CTRL_TLM_LEN_EXT3:
++        d.update(air_causes=payload[55])
+     return d
+ 
+ 
+diff --git a/rpi_ros2/src/afc_bridge/tools/wire_check.py b/rpi_ros2/src/afc_bridge/tools/wire_check.py
+index a2276ea..aab66e6 100644
+--- a/rpi_ros2/src/afc_bridge/tools/wire_check.py
++++ b/rpi_ros2/src/afc_bridge/tools/wire_check.py
+@@ -66,14 +66,17 @@ def tiny_pack_ctrl(source, armed, comp_mode, flow_fb, rpm_target, n_valid,
+ 
+ 
+ def tiny_pack_ctrl_full(source, armed, comp_mode, flow_fb, rpm_target, n_valid,
+-                        valve, servo_us, mode, flags, drp, dyaw, surf):
+-    """Current firmware layout: 43 base + 4 fault-tree + 8 surfaces = 55 B."""
++                        valve, servo_us, mode, flags, drp, dyaw, surf, air_causes=None):
++    """Firmware layout: 43 base + 4 fault-tree + 8 surfaces (= 55 B) + 1 air_causes (= 56 B)."""
+     pl = struct.pack("<BBBBHB", source, armed, comp_mode, flow_fb, rpm_target, n_valid)
+     pl += struct.pack("<6h", *valve)
+     pl += struct.pack("<12H", *servo_us)
+     pl += struct.pack("<BBBB", mode, flags, drp, dyaw)
+     pl += struct.pack("<4h", *surf)
+     assert len(pl) == F.CTRL_TLM_LEN_EXT2
++    if air_causes is not None:
++        pl += struct.pack("<B", air_causes)
++        assert len(pl) == F.CTRL_TLM_LEN_EXT3
+     return F.build_frame(F.FT_CTRL_TLM, pl)
+ 
+ 
+@@ -153,6 +156,27 @@ def test_ctrl_tlm_ext():
+     check("47-byte frame: surf defaults to centered", d47["surf"] == [0, 0, 0, 0])
+ 
+ 
++def test_ctrl_tlm_air():
++    print("CTRL_TLM in: air-delivery severity (flags bits 6-7) + causes byte")
++    valve = [0] * 6; servo = [1500] * 12; surf = [0, 0, 0, 0]
++    flags = 0x02 | (2 << 6)                 # FC eligible + severity CAUTION
++    frame = tiny_pack_ctrl_full(0, 1, 3, 1, 30000, 0, valve, servo, 1, flags, 100, 100, surf,
++                                air_causes=0x08 | 0x20)
++    got = list(F.FrameReader().feed(frame))
++    check("one 56-byte frame", len(got) == 1 and len(got[0].payload) == 56)
++    d = F.decode_ctrl_tlm(got[0].payload)
++    check("air_sev = CAUTION", d["air_sev"] == F.AIR_CAUTION)
++    check("air_causes = VENT_LOST|SENSOR_STALE", d["air_causes"] == 0x28)
++    check("severity bits don't leak into other flags",
++          d["elig_fc"] is True and d["terminated"] is False and d["surf_engaged"] is False
++          and d["surf_switch"] is False)
++    d55 = F.decode_ctrl_tlm(got[0].payload[:55])
++    check("55-byte frame: causes default 0, severity still read", d55["air_causes"] == 0
++          and d55["air_sev"] == F.AIR_CAUTION)
++    d47 = F.decode_ctrl_tlm(got[0].payload[:43] + bytes([1, 0x02, 100, 100]))
++    check("older firmware (bits 6-7 = 0) -> AIR_OK", d47["air_sev"] == F.AIR_OK)
++
++
+ def test_comp_tlm():
+     print("COMP_TLM in: byte-exact round-trip (+ thermal flag ext)")
+     frame = tiny_pack_comp(2520, 4550, 3012, 91, -8, 1, 7654321, flags=0x01)
+@@ -232,7 +256,7 @@ def test_arm_token():
+ 
+ 
+ def main():
+-    for fn in [test_cmd_and_resync, test_ctrl_tlm, test_ctrl_tlm_ext, test_comp_tlm,
++    for fn in [test_cmd_and_resync, test_ctrl_tlm, test_ctrl_tlm_ext, test_ctrl_tlm_air, test_comp_tlm,
+                test_sensor_tlm, test_arm_token]:
+         fn()
+     print()
+diff --git a/rpi_ros2/src/afc_bridge_msgs/msg/ValveNodeCtrl.msg b/rpi_ros2/src/afc_bridge_msgs/msg/ValveNodeCtrl.msg
+index 1890e20..628ef71 100644
+--- a/rpi_ros2/src/afc_bridge_msgs/msg/ValveNodeCtrl.msg
++++ b/rpi_ros2/src/afc_bridge_msgs/msg/ValveNodeCtrl.msg
+@@ -30,3 +30,20 @@ bool surf_engaged           # surfaces ACTIVE: allocated with AFC (switch on, li
+ bool surf_switch            # surface switch position (SBUS / console force), regardless of mode
+ int16[4] surf               # surface commands [-1000,1000], 0 = configured center
+                             # order: L wing, R wing, L canard, R canard
++
++# ---- air-delivery severity (tiny air_state.h, 2026-09-27). Reporting only. ----
++# Ranks how well air delivery is CONFIRMED: lost ESC telemetry with healthy
++# venturis < lost venturis < both / venturis showing no flow while running.
++uint8 AIR_OK       = 0
++uint8 AIR_ADVISORY = 1
++uint8 AIR_CAUTION  = 2
++uint8 AIR_WARNING  = 3
++uint8 air_sev               # debounced on the tiny
++uint8 AIR_C_TLM_LOST     = 1    # Teensy: no ESC telemetry, open loop (err -11)
++uint8 AIR_C_TLM_EMU      = 2    # Teensy: emulation build (err -12)
++uint8 AIR_C_VENT_PARTIAL = 4    # some venturis invalid
++uint8 AIR_C_VENT_LOST    = 8    # no valid venturis
++uint8 AIR_C_FLOW_LOW     = 16   # venturis healthy but flow implausibly low while running
++uint8 AIR_C_SENSOR_STALE = 32   # sensor frame not updating
++uint8 AIR_C_TEENSY_LINK  = 64   # no Teensy replies while armed
++uint8 air_causes            # bitmask of AIR_C_* (instantaneous)
+diff --git a/rpi_ros2/src/afc_bridge_msgs/msg/ValveNodeHealth.msg b/rpi_ros2/src/afc_bridge_msgs/msg/ValveNodeHealth.msg
+index c1645e0..5f395dc 100644
+--- a/rpi_ros2/src/afc_bridge_msgs/msg/ValveNodeHealth.msg
++++ b/rpi_ros2/src/afc_bridge_msgs/msg/ValveNodeHealth.msg
+@@ -41,3 +41,6 @@ bool sbus_sw                   # current SBUS arm-switch state
+ float32 desat_rp               # roll/pitch desaturation scale (1.0 = not clipping)
+ float32 desat_yaw              # yaw desaturation scale (1.0 = not clipping)
+ bool surf_engaged              # traditional surfaces ACTIVE (switch on, live source, not terminated)
++uint8 air_sev                  # air-delivery severity (see ValveNodeCtrl AIR_*)
++uint8 air_causes               # AIR_C_* bitmask (see ValveNodeCtrl)
++string air_str                 # e.g. "CAUTION VENT_LOST", for echo/dashboards
+diff --git a/rpi_ros2/tools/afc_dashboard.html b/rpi_ros2/tools/afc_dashboard.html
+index beb48dd..aae3b3b 100644
+--- a/rpi_ros2/tools/afc_dashboard.html
++++ b/rpi_ros2/tools/afc_dashboard.html
+@@ -48,6 +48,9 @@
+           letter-spacing:.5px;background:rgba(248,81,73,.18);border:1px solid var(--bad);color:var(--bad)}
+   .banner.on{display:block;animation:blink 1s steps(2,start) infinite}
+   @keyframes blink{to{border-color:transparent}}
++  /* air-delivery levels: advisory/caution amber & steady, warning red & blinking (.banner default) */
++  .banner.air-adv,.banner.air-cau{background:rgba(210,153,34,.15);border-color:var(--warn);color:var(--warn);animation:none}
++  .banner.air-cau{font-size:15px}
+   .big{font-size:22px;font-weight:700}
+ </style>
+ </head>
+@@ -63,7 +66,11 @@
+   <span class="pill" id="srcPill">SRC ?</span>
+   <span class="pill" id="surfPill">SURF ?</span>
+   <span class="pill" id="thermPill">ESC ?</span>
++  <span class="pill" id="airPill">AIR ?</span>
+ </header>
++<div class="banner" id="airBanner">
++  <span id="airHead"></span> <span id="airWhy" style="font-weight:400"></span>
++</div>
+ <div class="banner" id="thermBanner">
+   ESC THERMAL-DERATE SUSPECTED &mdash; ESC hot and compressor rpm sagging below target.
+   Consider engaging surfaces / reducing demand / landing.
+@@ -284,8 +291,35 @@ function onSensor(m){
+   }
+   document.getElementById("mdotTotal").textContent=m.mdot_total.toFixed(1);
+ }
++// Air-delivery severity from the tiny (air_state.h). Reporting only.
++const AIR = {
++  names: ["OK","ADVISORY","CAUTION","WARNING"],
++  pill:  ["ok","warn","warn","bad"],
++  head: [ "",
++    "AIR ADVISORY &mdash; degraded sensing; air delivery still confirmed.",
++    "AIR CAUTION &mdash; airflow NOT measured (venturis lost/degraded). Air delivery uncertain.",
++    "AIR WARNING &mdash; air delivery unobserved or failed. Engage surfaces / reduce demand / land." ],
++  causes: {1:"ESC telemetry lost (compressor open loop)", 2:"ESC emulation build (rpm fake)",
++           4:"some venturis invalid", 8:"no valid venturis", 16:"flow implausibly low while running",
++           32:"sensor frame stale", 64:"no replies from the Teensy"},
++};
++function onAir(sev, causes, armed){
++  const p=document.getElementById("airPill");
++  p.textContent = "AIR "+(AIR.names[sev]||sev);
++  p.className = "pill "+(AIR.pill[sev]||"");
++  const b=document.getElementById("airBanner");
++  b.classList.toggle("on", sev>0);
++  b.classList.toggle("air-adv", sev===1);
++  b.classList.toggle("air-cau", sev===2);
++  document.getElementById("airHead").innerHTML = (sev===1 && !armed)
++    ? "PRE-FLIGHT &mdash; venturi sensing not fully healthy (check <code>vhealth</code> before arming)."
++    : (AIR.head[sev]||"");
++  const why=[]; for(const bit in AIR.causes) if(causes & bit) why.push(AIR.causes[bit]);
++  document.getElementById("airWhy").textContent = why.length ? "("+why.join("; ")+")" : "";
++}
+ function onCtrl(m){
+   lastCtrlT=performance.now();
++  if(m.air_sev!==undefined) onAir(m.air_sev, m.air_causes||0, m.armed);
+   for(let i=0;i<6;i++) setValve(i, m.valve[i], lastValid[i]);
+   document.getElementById("servoRow").textContent =
+     "servo us: "+Array.from(m.servo_us).join(" ");
+@@ -315,7 +349,7 @@ setInterval(()=>{
+     document.getElementById("emuBanner").classList.remove("on");
+   }
+   if(lastCtrlT && now-lastCtrlT>1500){
+-    for(const id of ["surfPill","armPill","srcPill"]){
++    for(const id of ["surfPill","armPill","srcPill","airPill"]){
+       const e=document.getElementById(id); e.textContent=e.textContent.replace(/ \(stale\)$/,"")+" (stale)"; e.className="pill warn";
+     }
+   }

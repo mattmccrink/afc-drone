@@ -74,6 +74,7 @@ help                         list commands
 status                       one-shot status line (src/arm/elig, comp rpm + THERMAL, valves, surf)
 health                       reprint boot/health summary (incl. last reset cause, vhealth)
 vhealth                      per-venturi validity reason + per-sensor read/fault counters
+air                          air-delivery severity (OK/ADVISORY/CAUTION/WARNING), causes, inputs
 mon on|off                   periodic status line (2 Hz)
 src auto|primary|sbus|safe   force / release the active source (never leave forced)
 surf on|off|auto             force traditional surfaces / follow the SBUS switch (bench)

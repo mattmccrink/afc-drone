@@ -27,7 +27,7 @@
 // exercise the watchdog / reset / dropped-frame paths (T-S3, T-S7, T-C4, T-C5).
 // MUST be 0 in any build that flies: a hook left reachable is a way to hang a
 // core or starve the compressor from the console (the LINK_TEST lesson).
-#define BENCH_HOOKS      1
+#define BENCH_HOOKS      0
 #if BENCH_HOOKS
   #warning "BENCH_HOOKS=1: bench fault hooks compiled in -- NOT a flight build"
 #endif
@@ -266,6 +266,16 @@
 #define FLOW_PI_KI           20.0f  // rpm per (g/s * s)
 #define FLOW_FALLBACK_HOLD_MS 250   // hysteresis into/out of fallback (anti-chatter)
 #define COMP_MDOT_LOOP        0   // 0 = stub (armed -> RPM_FALLBACK); 1 = mdot PI (tracks only with all venturis valid)
+
+// Air-delivery severity (air_state.h; reporting only, decision 2026-09-27).
+#define AIR_TLM_GRACE_MS      1000  // after a run edge, before telemetry/link loss counts
+                                    //   (Teensy's own acquisition timeout is 0.5 s)
+#define AIR_MDOT_MIN_GPS       8.0f // g/s, whole-vehicle flow (extrapolated from the valid
+                                    //   venturis) below which "running but no air" is flagged
+                                    //   after COMP_SPINUP_GRACE_MS. <<PLACEHOLDER: ~20% of the
+                                    //   flow measured at 30k during venturi calibration>>
+#define AIR_RAISE_MS           300  // a higher severity must persist this long to show
+#define AIR_FALL_MS           1000  // a lower one this long (anti-flap)
 
 // Spin-up/spin-down shaping lives on the TEENSY (reference rate limit, ~5 s to
 // 30k). The Tiny does NOT ramp from 0 on a run edge; it sends the target and the

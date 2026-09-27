@@ -154,7 +154,8 @@ void tlm_service(uint32_t now) {
                   | (g_sbus_arm_seen_disarmed  ? 0x04 : 0)   // bit2 SBUS arm eligible
                   | (g_sbus_arm                ? 0x08 : 0)   // bit3 SBUS switch now
                   | (g_status.surf_active      ? 0x10 : 0)   // bit4 surfaces ACTIVE (allocated)
-                  | (g_status.surf_engaged     ? 0x20 : 0);  // bit5 surface switch on
+                  | (g_status.surf_engaged     ? 0x20 : 0)   // bit5 surface switch on
+                  | (uint8_t)((g_status.air_sev & 0x03) << 6);   // bits6-7 air-delivery severity
     fput_u8(pl, i, flags);
     float srp  = g_alloc_s_rp  < 0.f ? 0.f : (g_alloc_s_rp  > 1.f ? 1.f : g_alloc_s_rp);
     float syaw = g_alloc_s_yaw < 0.f ? 0.f : (g_alloc_s_yaw > 1.f ? 1.f : g_alloc_s_yaw);
@@ -162,7 +163,9 @@ void tlm_service(uint32_t now) {
     fput_u8(pl, i, (uint8_t)(syaw * 100.f + 0.5f));
     // ---- surfaces (APPENDED): commanded position, [-1000,1000], 0 = center ----
     for (int k = 0; k < SURF_COUNT; ++k) fput_i16(pl, i, g_surf_dbg[k]);
-    send_frame(FT_CTRL_TLM, pl, (uint8_t)i);   // i == 55
+    // ---- air-delivery causes (APPENDED 2026-09-27): AIR_C_* bits ----
+    fput_u8(pl, i, g_status.air_causes);
+    send_frame(FT_CTRL_TLM, pl, (uint8_t)i);   // i == 56
   } else {
     i = 0;
     for (int v = 0; v < VALVE_COUNT; ++v) fput_i16(pl, i, (int16_t)lroundf((got?fr.p_up[v]:0)  * 10.0f));

@@ -6,6 +6,7 @@
 //  sensor faults, and save calibration. Line-based; type 'help'.
 // -----------------------------------------------------------------------------
 #include "config.h"
+#include "air_state.h"
 
 static bool    con_mon_on = false;
 static bool    con_pstream = false;   // 2 Hz LabVIEW pressure stream
@@ -32,12 +33,13 @@ static const char* mode_name(CompMode m) {
 
 static void print_status() {
   Serial.printf(
-    "[st] src=%-7s arm=%d(live=%d) term=%d prim=%d | elig fc=%d sbus=%d sw=%d | comp=%-8s rpm=%5u%s | mdot=%.1f/%.1f g/s nvalid=%u%s%s | v=[%d %d %d %d %d %d] surf=%s[%d %d %d %d] desat=%.2f/%.2f | cal=%s | hb=%lu drop=%lu\n",
+    "[st] src=%-7s arm=%d(live=%d) term=%d prim=%d | elig fc=%d sbus=%d sw=%d | comp=%-8s rpm=%5u%s | mdot=%.1f/%.1f g/s nvalid=%u%s%s | air=%s(0x%02X) | v=[%d %d %d %d %d %d] surf=%s[%d %d %d %d] desat=%.2f/%.2f | cal=%s | hb=%lu drop=%lu\n",
     src_name(g_status.source), g_status.armed?1:0, g_status.arm_live?1:0, g_status.terminated?1:0, g_status.primary_present?1:0,
     arb_fc_eligible()?1:0, g_sbus_arm_seen_disarmed?1:0, g_sbus_arm?1:0,
     mode_name(g_status.comp_mode), g_status.rpm_target, g_status.comp_thermal ? " THERMAL" : "",
     (double)g_status.mdot_total, (double)g_status.mdot_target, g_status.n_valid,
     g_status.flow_fallback ? " FALLBACK" : "", g_status.sensor_stale ? " STALE" : "",
+    air_name(g_status.air_sev), g_status.air_causes,
     g_valve_dbg[0], g_valve_dbg[1], g_valve_dbg[2], g_valve_dbg[3], g_valve_dbg[4], g_valve_dbg[5],
     g_status.surf_active ? (g_surf_force >= 0 ? "ON(forced)" : "ON")
       : g_status.surf_engaged ? "sw-on/idle" : (g_surf_force >= 0 ? "off(forced)" : "off"),
@@ -72,7 +74,8 @@ static void print_help() {
     "  save                    persist current calibration to LittleFS\n"
     "  zero                    capture no-flow dp offset per valve, then save\n"
     "  calshow                 show calibration source + servo0 coeffs + dp_zero\n"
-    "  vhealth                 per-venturi validity reason + per-sensor read/fault counters"));
+    "  vhealth                 per-venturi validity reason + per-sensor read/fault counters\n"
+    "  air                     air-delivery severity, causes and the inputs behind them"));
 #if BENCH_HOOKS
   Serial.println(F(
     "bench hooks (BENCH_HOOKS=1 -- not a flight build):\n"
@@ -125,6 +128,17 @@ static void dispatch(char* line) {
     sensors_vhealth_print();
   }
   else if (eq(tok[0], "vhealth")) { sensors_vhealth_print(); }
+  else if (eq(tok[0], "air")) {
+    uint8_t c = g_status.air_causes;
+    Serial.printf("[air] severity=%s  causes=0x%02X%s%s%s%s%s%s%s\n", air_name(g_status.air_sev), c,
+      (c & AIR_C_TLM_LOST)     ? " TLM_LOST"     : "", (c & AIR_C_TLM_EMU)     ? " TLM_EMU"     : "",
+      (c & AIR_C_VENT_PARTIAL) ? " VENT_PARTIAL" : "", (c & AIR_C_VENT_LOST)   ? " VENT_LOST"   : "",
+      (c & AIR_C_FLOW_LOW)     ? " FLOW_LOW"     : "", (c & AIR_C_SENSOR_STALE)? " SENSOR_STALE": "",
+      (c & AIR_C_TEENSY_LINK)  ? " TEENSY_LINK"  : "");
+    Serial.printf("[air] inputs: armed=%d term=%d teensy_ok=%d err=%d nvalid=%u stale=%d mdot=%.1f g/s (min %.1f)\n",
+      g_status.armed?1:0, g_status.terminated?1:0, g_comp.ok?1:0, (int)g_comp.err,
+      g_status.n_valid, g_status.sensor_stale?1:0, (double)g_status.mdot_total, (double)AIR_MDOT_MIN_GPS);
+  }
   else if (eq(tok[0], "hang") || eq(tok[0], "tdrop")) {
 #if BENCH_HOOKS
     if (eq(tok[0], "hang") && n >= 2 && eq(tok[1], "core0")) {

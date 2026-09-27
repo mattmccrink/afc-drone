@@ -138,6 +138,8 @@ class BridgeNode(Node):
         self._last_desat_yaw = 1.0
         self._last_surf = False
         self._last_thermal = False
+        self._last_air_sev = 0
+        self._last_air_causes = 0
         self._health_t = time.monotonic()
 
         # ---- publishers ----
@@ -329,6 +331,8 @@ class BridgeNode(Node):
         m.surf_engaged = d["surf_engaged"]
         m.surf_switch = d["surf_switch"]
         m.surf = d["surf"]
+        m.air_sev = d["air_sev"]
+        m.air_causes = d["air_causes"]
         self._ctrl_pub.publish(m)
         self._ctrl_count += 1
         self._frames_ok += 1
@@ -342,6 +346,8 @@ class BridgeNode(Node):
         self._last_desat_rp = d["desat_rp"]
         self._last_desat_yaw = d["desat_yaw"]
         self._last_surf = d["surf_engaged"]
+        self._last_air_sev = d["air_sev"]
+        self._last_air_causes = d["air_causes"]
 
     def _publish_sensor(self, payload: bytes):
         try:
@@ -428,6 +434,10 @@ class BridgeNode(Node):
         m.desat_rp = float(self._last_desat_rp)
         m.desat_yaw = float(self._last_desat_yaw)
         m.surf_engaged = bool(self._last_surf)
+        m.air_sev = int(self._last_air_sev)
+        m.air_causes = int(self._last_air_causes)
+        m.air_str = F.AIR_NAMES.get(m.air_sev, "?") + "".join(
+            " " + name for bit, name in F.AIR_CAUSES.items() if m.air_causes & bit)
         m.cmd_fresh = bool(cmd_fresh)
         m.arm_fresh = bool(arm_fresh)
         m.arm_counter = int(self._armtx.counter)
@@ -443,7 +453,7 @@ class BridgeNode(Node):
             f"mode={m.mode_str} src={src} armed={m.last_armed} term={m.terminated} "
             f"elig[fc={m.elig_fc} sbus={m.elig_sbus} sw={m.sbus_sw}] "
             f"cmd_fresh={m.cmd_fresh} arm_fresh={m.arm_fresh} "
-            f"desat={m.desat_rp:.2f}/{m.desat_yaw:.2f} surf={m.surf_engaged} "
+            f"desat={m.desat_rp:.2f}/{m.desat_yaw:.2f} surf={m.surf_engaged} air=[{m.air_str}] "
             f"armctr={m.arm_counter} off={m.tlm_offset_ms}ms")
 
 

@@ -106,6 +106,8 @@ struct NodeStatus {
   bool     surf_engaged    = false;      // surface switch state (SBUS switch or console force)
   bool     surf_active     = false;      // surfaces actually allocated (switch && live source && !term)
   bool     comp_thermal    = false;      // ESC thermal-derate suspected (advisory)
+  uint8_t  air_sev         = 0;          // air-delivery severity (AirSev, air_state.h), debounced
+  uint8_t  air_causes      = 0;          // AIR_C_* bits behind it (instantaneous)
 };
 
 // Measured compressor telemetry, latched from the Motor Teensy's ESCPID_comm.

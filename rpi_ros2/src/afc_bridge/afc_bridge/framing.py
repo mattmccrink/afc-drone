@@ -186,6 +186,13 @@ SURF_COUNT = 4
 CTRL_TLM_LEN = 43
 CTRL_TLM_LEN_EXT = 47
 CTRL_TLM_LEN_EXT2 = 55
+CTRL_TLM_LEN_EXT3 = 56          # + air_causes byte (air-delivery severity rides flags bits 6-7)
+
+# Air-delivery severity (tiny air_state.h). Reporting only.
+AIR_OK, AIR_ADVISORY, AIR_CAUTION, AIR_WARNING = 0, 1, 2, 3
+AIR_NAMES = {0: "OK", 1: "ADVISORY", 2: "CAUTION", 3: "WARNING"}
+AIR_CAUSES = {0x01: "TLM_LOST", 0x02: "TLM_EMU", 0x04: "VENT_PARTIAL", 0x08: "VENT_LOST",
+              0x10: "FLOW_LOW", 0x20: "SENSOR_STALE", 0x40: "TEENSY_LINK"}
 SENSOR_TLM_LEN = 56
 COMP_TLM_LEN = 13
 COMP_TLM_LEN_EXT = 14
@@ -204,7 +211,7 @@ def decode_ctrl_tlm(payload: bytes) -> dict:
              mode=0, terminated=False, elig_fc=False, elig_sbus=False,
              sbus_sw=False, surf_engaged=False, surf_switch=False,
              desat_rp=1.0, desat_yaw=1.0,
-             surf=[0] * SURF_COUNT)
+             surf=[0] * SURF_COUNT, air_sev=0, air_causes=0)
     if len(payload) >= CTRL_TLM_LEN_EXT:
         mode, flags, drp, dyaw = struct.unpack_from("<BBBB", payload, 43)
         d.update(mode=mode, terminated=bool(flags & 0x01),
@@ -212,8 +219,12 @@ def decode_ctrl_tlm(payload: bytes) -> dict:
                  sbus_sw=bool(flags & 0x08), surf_engaged=bool(flags & 0x10),
                  surf_switch=bool(flags & 0x20),
                  desat_rp=drp / 100.0, desat_yaw=dyaw / 100.0)
+        # bits 6-7 were always 0 on older firmware -> AIR_OK, so no length gate needed
+        d.update(air_sev=(flags >> 6) & 0x03)
     if len(payload) >= CTRL_TLM_LEN_EXT2:
         d.update(surf=list(struct.unpack_from("<4h", payload, 47)))
+    if len(payload) >= CTRL_TLM_LEN_EXT3:
+        d.update(air_causes=payload[55])
     return d
 
 

@@ -20,6 +20,7 @@
 // -----------------------------------------------------------------------------
 #include "config.h"
 #include "types.h"
+#include "air_state.h"
 
 // ---- outer-loop + fallback state ----
 static float    comp_integ      = 0.0f;   // PI integral (rpm)
@@ -69,7 +70,9 @@ static bool thermal_update(uint32_t now, bool running, uint32_t run_since, float
   static bool     flag      = false;
   static uint32_t sag_since = 0;
 
-  bool eval = running && g_comp.ok && target > 0.0f &&
+  // Not while the Teensy is in its no-telemetry open loop (err -11): the
+  // temperature and rpm it reports are then the last good values, not current.
+  bool eval = running && g_comp.ok && g_comp.err != ESCPID_ERR_NO_TLM && target > 0.0f &&
               (now - run_since) >= COMP_SPINUP_GRACE_MS;
   if (!eval) { sag_since = 0; flag = false; return false; }
 
@@ -189,6 +192,25 @@ void compressor_update(uint32_t now) {
   g_status.sensor_stale  = sensor_stale;
   g_current_rpm_cmd      = want_run ? (uint32_t)comp_rpm : 0;   // core 1 sim reads this
   g_status.comp_thermal  = thermal_update(now, want_run, run_since, comp_rpm);
+
+  // ---- air-delivery severity (reporting only; air_state.h) ----
+  {
+    static AirDebounce air_db;
+    AirInputs ai;
+    ai.armed           = want_run;
+    ai.terminated      = g_status.terminated;
+    ai.tlm_grace_done  = want_run && (now - run_since) >= AIR_TLM_GRACE_MS;
+    ai.flow_grace_done = want_run && (now - run_since) >= COMP_SPINUP_GRACE_MS;
+    ai.comp_link_ok    = g_comp.ok;
+    ai.comp_err        = g_comp.err;
+    ai.sensor_stale    = sensor_stale;
+    ai.n_valid         = n_valid;
+    ai.mdot_total      = mdot_total;
+    uint8_t causes = 0;
+    uint8_t cand   = air_eval(ai, &causes);
+    g_status.air_sev    = air_debounce(air_db, cand, now);
+    g_status.air_causes = causes;
+  }
 
   // ---- stream to Teensy at 50 Hz while running; SILENCE when stopped (= stop) ----
   if (want_run) {

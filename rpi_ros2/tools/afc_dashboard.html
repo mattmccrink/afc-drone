@@ -48,6 +48,9 @@
           letter-spacing:.5px;background:rgba(248,81,73,.18);border:1px solid var(--bad);color:var(--bad)}
   .banner.on{display:block;animation:blink 1s steps(2,start) infinite}
   @keyframes blink{to{border-color:transparent}}
+  /* air-delivery levels: advisory/caution amber & steady, warning red & blinking (.banner default) */
+  .banner.air-adv,.banner.air-cau{background:rgba(210,153,34,.15);border-color:var(--warn);color:var(--warn);animation:none}
+  .banner.air-cau{font-size:15px}
   .big{font-size:22px;font-weight:700}
 </style>
 </head>
@@ -63,7 +66,11 @@
   <span class="pill" id="srcPill">SRC ?</span>
   <span class="pill" id="surfPill">SURF ?</span>
   <span class="pill" id="thermPill">ESC ?</span>
+  <span class="pill" id="airPill">AIR ?</span>
 </header>
+<div class="banner" id="airBanner">
+  <span id="airHead"></span> <span id="airWhy" style="font-weight:400"></span>
+</div>
 <div class="banner" id="thermBanner">
   ESC THERMAL-DERATE SUSPECTED &mdash; ESC hot and compressor rpm sagging below target.
   Consider engaging surfaces / reducing demand / landing.
@@ -284,8 +291,35 @@ function onSensor(m){
   }
   document.getElementById("mdotTotal").textContent=m.mdot_total.toFixed(1);
 }
+// Air-delivery severity from the tiny (air_state.h). Reporting only.
+const AIR = {
+  names: ["OK","ADVISORY","CAUTION","WARNING"],
+  pill:  ["ok","warn","warn","bad"],
+  head: [ "",
+    "AIR ADVISORY &mdash; degraded sensing; air delivery still confirmed.",
+    "AIR CAUTION &mdash; airflow NOT measured (venturis lost/degraded). Air delivery uncertain.",
+    "AIR WARNING &mdash; air delivery unobserved or failed. Engage surfaces / reduce demand / land." ],
+  causes: {1:"ESC telemetry lost (compressor open loop)", 2:"ESC emulation build (rpm fake)",
+           4:"some venturis invalid", 8:"no valid venturis", 16:"flow implausibly low while running",
+           32:"sensor frame stale", 64:"no replies from the Teensy"},
+};
+function onAir(sev, causes, armed){
+  const p=document.getElementById("airPill");
+  p.textContent = "AIR "+(AIR.names[sev]||sev);
+  p.className = "pill "+(AIR.pill[sev]||"");
+  const b=document.getElementById("airBanner");
+  b.classList.toggle("on", sev>0);
+  b.classList.toggle("air-adv", sev===1);
+  b.classList.toggle("air-cau", sev===2);
+  document.getElementById("airHead").innerHTML = (sev===1 && !armed)
+    ? "PRE-FLIGHT &mdash; venturi sensing not fully healthy (check <code>vhealth</code> before arming)."
+    : (AIR.head[sev]||"");
+  const why=[]; for(const bit in AIR.causes) if(causes & bit) why.push(AIR.causes[bit]);
+  document.getElementById("airWhy").textContent = why.length ? "("+why.join("; ")+")" : "";
+}
 function onCtrl(m){
   lastCtrlT=performance.now();
+  if(m.air_sev!==undefined) onAir(m.air_sev, m.air_causes||0, m.armed);
   for(let i=0;i<6;i++) setValve(i, m.valve[i], lastValid[i]);
   document.getElementById("servoRow").textContent =
     "servo us: "+Array.from(m.servo_us).join(" ");
@@ -315,7 +349,7 @@ setInterval(()=>{
     document.getElementById("emuBanner").classList.remove("on");
   }
   if(lastCtrlT && now-lastCtrlT>1500){
-    for(const id of ["surfPill","armPill","srcPill"]){
+    for(const id of ["surfPill","armPill","srcPill","airPill"]){
       const e=document.getElementById(id); e.textContent=e.textContent.replace(/ \(stale\)$/,"")+" (stale)"; e.className="pill warn";
     }
   }

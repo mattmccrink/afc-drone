@@ -66,14 +66,17 @@ def tiny_pack_ctrl(source, armed, comp_mode, flow_fb, rpm_target, n_valid,
 
 
 def tiny_pack_ctrl_full(source, armed, comp_mode, flow_fb, rpm_target, n_valid,
-                        valve, servo_us, mode, flags, drp, dyaw, surf):
-    """Current firmware layout: 43 base + 4 fault-tree + 8 surfaces = 55 B."""
+                        valve, servo_us, mode, flags, drp, dyaw, surf, air_causes=None):
+    """Firmware layout: 43 base + 4 fault-tree + 8 surfaces (= 55 B) + 1 air_causes (= 56 B)."""
     pl = struct.pack("<BBBBHB", source, armed, comp_mode, flow_fb, rpm_target, n_valid)
     pl += struct.pack("<6h", *valve)
     pl += struct.pack("<12H", *servo_us)
     pl += struct.pack("<BBBB", mode, flags, drp, dyaw)
     pl += struct.pack("<4h", *surf)
     assert len(pl) == F.CTRL_TLM_LEN_EXT2
+    if air_causes is not None:
+        pl += struct.pack("<B", air_causes)
+        assert len(pl) == F.CTRL_TLM_LEN_EXT3
     return F.build_frame(F.FT_CTRL_TLM, pl)
 
 
@@ -151,6 +154,27 @@ def test_ctrl_tlm_ext():
     # old 47-byte firmware still decodes, with surfaces defaulted
     d47 = F.decode_ctrl_tlm(got[0].payload[:47])
     check("47-byte frame: surf defaults to centered", d47["surf"] == [0, 0, 0, 0])
+
+
+def test_ctrl_tlm_air():
+    print("CTRL_TLM in: air-delivery severity (flags bits 6-7) + causes byte")
+    valve = [0] * 6; servo = [1500] * 12; surf = [0, 0, 0, 0]
+    flags = 0x02 | (2 << 6)                 # FC eligible + severity CAUTION
+    frame = tiny_pack_ctrl_full(0, 1, 3, 1, 30000, 0, valve, servo, 1, flags, 100, 100, surf,
+                                air_causes=0x08 | 0x20)
+    got = list(F.FrameReader().feed(frame))
+    check("one 56-byte frame", len(got) == 1 and len(got[0].payload) == 56)
+    d = F.decode_ctrl_tlm(got[0].payload)
+    check("air_sev = CAUTION", d["air_sev"] == F.AIR_CAUTION)
+    check("air_causes = VENT_LOST|SENSOR_STALE", d["air_causes"] == 0x28)
+    check("severity bits don't leak into other flags",
+          d["elig_fc"] is True and d["terminated"] is False and d["surf_engaged"] is False
+          and d["surf_switch"] is False)
+    d55 = F.decode_ctrl_tlm(got[0].payload[:55])
+    check("55-byte frame: causes default 0, severity still read", d55["air_causes"] == 0
+          and d55["air_sev"] == F.AIR_CAUTION)
+    d47 = F.decode_ctrl_tlm(got[0].payload[:43] + bytes([1, 0x02, 100, 100]))
+    check("older firmware (bits 6-7 = 0) -> AIR_OK", d47["air_sev"] == F.AIR_OK)
 
 
 def test_comp_tlm():
@@ -232,7 +256,7 @@ def test_arm_token():
 
 
 def main():
-    for fn in [test_cmd_and_resync, test_ctrl_tlm, test_ctrl_tlm_ext, test_comp_tlm,
+    for fn in [test_cmd_and_resync, test_ctrl_tlm, test_ctrl_tlm_ext, test_ctrl_tlm_air, test_comp_tlm,
                test_sensor_tlm, test_arm_token]:
         fn()
     print()

@@ -41,3 +41,6 @@ bool sbus_sw                   # current SBUS arm-switch state
 float32 desat_rp               # roll/pitch desaturation scale (1.0 = not clipping)
 float32 desat_yaw              # yaw desaturation scale (1.0 = not clipping)
 bool surf_engaged              # traditional surfaces ACTIVE (switch on, live source, not terminated)
+uint8 air_sev                  # air-delivery severity (see ValveNodeCtrl AIR_*)
+uint8 air_causes               # AIR_C_* bitmask (see ValveNodeCtrl)
+string air_str                 # e.g. "CAUTION VENT_LOST", for echo/dashboards
