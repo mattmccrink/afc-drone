@@ -165,7 +165,16 @@ void tlm_service(uint32_t now) {
     for (int k = 0; k < SURF_COUNT; ++k) fput_i16(pl, i, g_surf_dbg[k]);
     // ---- air-delivery causes (APPENDED 2026-09-27): AIR_C_* bits ----
     fput_u8(pl, i, g_status.air_causes);
-    send_frame(FT_CTRL_TLM, pl, (uint8_t)i);   // i == 56
+    // ---- flags2 (APPENDED 2026-09-27): RC link + build configuration notices ----
+    uint8_t flags2 = ((g_sbus_failsafe || g_sbus_framelost) ? 0x01 : 0)   // bit0 SBUS failsafe/frame-lost
+                   | (g_sbus_in.valid        ? 0x02 : 0)                  // bit1 SBUS clean frames arriving
+                   | (BENCH_HOOKS            ? 0x04 : 0)                  // bit2 bench-hook build (not flight)
+                   | (g_cal_from_flash       ? 0x08 : 0)                  // bit3 calibration loaded from flash
+                   | (USE_REAL_I2C     ? 0 : 0x10)                        // bit4 SIMULATED sensors/servos
+                   | (USE_REAL_SBUS    ? 0 : 0x20)                        // bit5 SIMULATED SBUS
+                   | (USE_REAL_PRIMARY ? 0 : 0x40);                       // bit6 SIMULATED primary (Pi) input
+    fput_u8(pl, i, flags2);
+    send_frame(FT_CTRL_TLM, pl, (uint8_t)i);   // i == 57
   } else {
     i = 0;
     for (int v = 0; v < VALVE_COUNT; ++v) fput_i16(pl, i, (int16_t)lroundf((got?fr.p_up[v]:0)  * 10.0f));
@@ -177,7 +186,9 @@ void tlm_service(uint32_t now) {
     for (int v = 0; v < VALVE_COUNT; ++v) if (got && fr.valid[v]) mask |= (1u << v);
     fput_u16(pl, i, mask);
     fput_u32(pl, i, now);
-    send_frame(FT_SENSOR_TLM, pl, (uint8_t)i);
+    // ---- per-venturi validity reason (APPENDED 2026-09-27): VentHealth, VH_OK when valid ----
+    for (int v = 0; v < VALVE_COUNT; ++v) fput_u8(pl, i, got ? fr.why[v] : (uint8_t)VH_NODATA);
+    send_frame(FT_SENSOR_TLM, pl, (uint8_t)i);   // i == 62
   }
   which ^= 1;
     // ---- COMP_TLM: measured compressor telemetry, own 25 Hz cadence ----

@@ -10,8 +10,12 @@ import sys
 
 from afc_bridge import framing as F
 from afc_bridge.arm_token import ArmTokenTx
+from afc_bridge.qgc_alert import AirAlerter, alert_text, encode_text
 
-ARM_LOSS_TIMEOUT_MS = 10000
+# Tiny arm-token semantics (Q5, 2026-09-22; config.h):
+ARM_TOKEN_FRESH_MS = 1500     # the token is OBEYED only if it advanced this recently
+ARM_LOSS_TIMEOUT_MS = 10000   # token stalled this long -> reversion (SBUS if usable, else
+                              #   hold PRIMARY). A stall NEVER disarms by itself.
 
 PASS, FAIL = "\033[32mPASS\033[0m", "\033[31mFAIL\033[0m"
 _fails = 0
@@ -50,10 +54,19 @@ class TinyRx:
                     self._last_counter = self.arm_counter
                     self._last_advance_ms = now_ms
 
-    def armed_live(self, now_ms):
-        if self.arm_state != 1 or self._last_advance_ms is None:
-            return False
-        return (now_ms - self._last_advance_ms) <= ARM_LOSS_TIMEOUT_MS
+    def token_fresh(self, now_ms):
+        return (self._last_advance_ms is not None
+                and (now_ms - self._last_advance_ms) <= ARM_TOKEN_FRESH_MS)
+
+    def obeyed(self, now_ms):
+        """Arm state the tiny ACTS on: the token's value if fresh, else None
+        (tiny holds its current state -- an old token is never obeyed)."""
+        return self.arm_state if self.token_fresh(now_ms) else None
+
+    def stalled(self, now_ms):
+        """Past ARM_LOSS_TIMEOUT_MS: tiny reverts (SBUS / hold PRIMARY) -- not a disarm."""
+        return (self._last_advance_ms is None
+                or (now_ms - self._last_advance_ms) > ARM_LOSS_TIMEOUT_MS)
 
 
 # ---- mirror of the tiny's TX side (tlm_service) -----------------------------
@@ -218,7 +231,7 @@ def test_sensor_tlm():
 
 # ---- 3. arm-token TX (fresh / on-change / stale window) --------------------
 def test_arm_token():
-    print("ARM token: heartbeat, on-change disarm, stale->window->disarm")
+    print("ARM token (Q5): heartbeat, on-change, withheld when stale, obeyed only if fresh")
     tiny = TinyRx()
     now_ms = [0]
     tx = ArmTokenTx(lambda a, c: tiny.feed(F.build_arm(a, c), now_ms[0]),
@@ -232,31 +245,97 @@ def test_arm_token():
             tx.note_state(True, t)
         tx.tick(t)
         t += 0.1
-    check("armed_live while fresh", tiny.armed_live(now_ms[0]))
+    check("fresh ARMED token is obeyed", tiny.obeyed(now_ms[0]) == 1)
+    check("heartbeat keeps it inside the 1.5 s freshness window",
+          tiny.token_fresh(now_ms[0]))
     check("counter advanced ~1 Hz", 5 <= tx.counter <= 7)
 
     # on-change disarm
     now_ms[0] = 5200
     tx.note_state(False, 5.2); tx.tick(5.2)
-    check("disarms immediately on-change", not tiny.armed_live(now_ms[0]))
+    check("disarm is sent on-change and obeyed immediately", tiny.obeyed(now_ms[0]) == 0)
 
-    # re-arm, then stale link -> ride window -> auto disarm
+    # re-arm, then vehicle_status goes stale at the Pi
     for k in range(20):
         t = 6.0 + k * 0.1
         now_ms[0] = int(t * 1000)
         tx.note_state(True, t); tx.tick(t)
     last = tx.counter
-    adv_ms = tiny._last_advance_ms
-    now_ms[0] = int((6.0 + 10.0) * 1000); tx.tick(16.0)   # >0.5s since last state
-    check("token withheld once stale", tx.frozen and tx.counter == last)
-    now_ms[0] = adv_ms + ARM_LOSS_TIMEOUT_MS - 100; tx.tick(now_ms[0] / 1000)
-    check("armed_live just inside window", tiny.armed_live(now_ms[0]))
-    now_ms[0] = adv_ms + ARM_LOSS_TIMEOUT_MS + 100; tx.tick(now_ms[0] / 1000)
-    check("auto-disarmed past window", not tiny.armed_live(now_ms[0]))
+    adv_ms = tiny._last_advance_ms           # last token the tiny saw advance (<= 7.9 s)
+    now_ms[0] = 9000; tx.tick(9.0)           # 1.1 s since the last vehicle_status (> 0.5 s)
+    check("Pi withholds the token once vehicle_status is stale",
+          tx.frozen and tx.counter == last and tiny._last_advance_ms == adv_ms)
+    check("within 1.5 s: last token still obeyed", tiny.obeyed(adv_ms + ARM_TOKEN_FRESH_MS - 100) == 1)
+    check("after 1.5 s: old token NOT obeyed (tiny holds its state; no disarm)",
+          tiny.obeyed(adv_ms + ARM_TOKEN_FRESH_MS + 100) is None)
+    check("before 10 s: not yet a stall", not tiny.stalled(adv_ms + ARM_LOSS_TIMEOUT_MS - 100))
+    check("after 10 s: stall -> reversion (SBUS / hold PRIMARY), still not a disarm",
+          tiny.stalled(adv_ms + ARM_LOSS_TIMEOUT_MS + 100)
+          and tiny.obeyed(adv_ms + ARM_LOSS_TIMEOUT_MS + 100) is None)
+    # link recovers: the next fresh token is obeyed again
+    now_ms[0] = adv_ms + 12000
+    tx.note_state(True, now_ms[0] / 1000); tx.tick(now_ms[0] / 1000)
+    check("fresh token after recovery is obeyed again", tiny.obeyed(now_ms[0]) == 1)
+
+
+def test_flags2_and_venturi_reason():
+    print("CTRL_TLM flags2 (57 B) + SENSOR_TLM per-venturi reason (62 B)")
+    valve = [0] * 6; servo = [1500] * 12; surf = [0, 0, 0, 0]
+    pl = struct.pack("<BBBBHB", 0, 1, 3, 1, 30000, 5)
+    pl += struct.pack("<6h", *valve) + struct.pack("<12H", *servo)
+    pl += struct.pack("<BBBB", 1, 0x02 | (1 << 6), 100, 100) + struct.pack("<4h", *surf)
+    pl += bytes([0x04])                                   # air_causes: VENT_PARTIAL
+    pl += bytes([0x01 | 0x04 | 0x10])                     # flags2: sbus_lost, bench, sim sensors
+    got = list(F.FrameReader().feed(F.build_frame(F.FT_CTRL_TLM, pl)))
+    check("one 57-byte CTRL frame", len(got) == 1 and len(got[0].payload) == 57)
+    d = F.decode_ctrl_tlm(got[0].payload)
+    check("flags2 decoded", d["flags2_valid"] and d["sbus_lost"] and d["bench_build"]
+          and d["sim_sensors"] and not d["sbus_ok"] and not d["cal_flash"]
+          and not d["sim_sbus"] and not d["sim_primary"])
+    check("air fields unaffected", d["air_sev"] == 1 and d["air_causes"] == 0x04)
+    d56 = F.decode_ctrl_tlm(got[0].payload[:56])
+    check("56-byte (older) frame: flags2_valid False, nothing flagged",
+          not d56["flags2_valid"] and not d56["bench_build"] and not d56["sbus_lost"])
+
+    why = [0, 0, 4, 0, 10, 9]                            # OK OK STALE OK INJECTED RECOVER
+    valid = [w == 0 for w in why]
+    frame = tiny_pack_sensor([1000.0] * 6, [990.0] * 6, [25.0] * 6, [7.0] * 6, 28.0, valid, 1234)
+    pl = list(F.FrameReader().feed(frame))[0].payload + bytes(why)
+    got = list(F.FrameReader().feed(F.build_frame(F.FT_SENSOR_TLM, pl)))
+    check("one 62-byte SENSOR frame", len(got) == 1 and len(got[0].payload) == 62)
+    ds = F.decode_sensor_tlm(got[0].payload)
+    check("why[] round-trip", ds["why"] == why and ds["valid"] == valid)
+    check("names", [F.VH_NAMES[w] for w in ds["why"]][2] == "STALE")
+    ds56 = F.decode_sensor_tlm(got[0].payload[:56])
+    check("56-byte (older) frame: why = 0 for valid, 255 (unknown) for invalid",
+          ds56["why"] == [0 if v else 255 for v in valid])
+
+
+def test_qgc_alerter():
+    print("QGC alert policy (air severity -> mavlink_log -> STATUSTEXT)")
+    a = AirAlerter(min_gap_s=2.0)
+    check("OK / ADVISORY send nothing", a.update(0, 0, 0.0) == [] and a.update(1, 0x01, 0.5) == [])
+    out = a.update(2, 0x08, 1.0)
+    check("CAUTION -> one MAV_SEVERITY_WARNING (4)", len(out) == 1 and out[0][0] == 4
+          and "CAUTION" in out[0][1] and "VENTURIS LOST" in out[0][1])
+    check("same state -> no repeat", a.update(2, 0x08, 1.5) == [])
+    check("rate limit: escalation within 2 s of the last send waits", a.update(3, 0x09, 2.5) == [])
+    out = a.update(3, 0x09, 3.1)
+    check("then WARNING -> MAV_SEVERITY_CRITICAL (2) with both causes", len(out) == 1
+          and out[0][0] == 2 and "ESC TLM LOST" in out[0][1] and "VENTURIS LOST" in out[0][1])
+    out = a.update(3, 0x19, 9.5)
+    check("cause change while alerting -> re-sent", len(out) == 1 and "NO FLOW" in out[0][1])
+    out = a.update(1, 0x01, 12.0)
+    check("drop below CAUTION -> one INFO (6) recovered", len(out) == 1 and out[0][0] == 6)
+    check("...and only once", a.update(0, 0, 20.0) == [])
+    t = alert_text(3, 0x7F)
+    check("text fits char[127]", len(t) <= 126 and len(encode_text(t)) == 127
+          and encode_text(t)[len(t)] == 0)
 
 
 def main():
-    for fn in [test_cmd_and_resync, test_ctrl_tlm, test_ctrl_tlm_ext, test_ctrl_tlm_air, test_comp_tlm,
+    for fn in [test_cmd_and_resync, test_ctrl_tlm, test_ctrl_tlm_ext, test_ctrl_tlm_air,
+               test_flags2_and_venturi_reason, test_qgc_alerter, test_comp_tlm,
                test_sensor_tlm, test_arm_token]:
         fn()
     print()

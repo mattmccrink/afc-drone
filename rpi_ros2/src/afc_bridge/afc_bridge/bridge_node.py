@@ -46,6 +46,7 @@ from std_msgs.msg import Header
 
 from afc_bridge import framing as F
 from afc_bridge.arm_token import ArmTokenTx
+from afc_bridge.qgc_alert import AirAlerter, encode_text
 
 # All FC I/O is px4_msgs over uXRCE-DDS now (no MAVROS). Resolved lazily so a
 # plain `colcon build` doesn't hard-require px4_msgs at build time.
@@ -54,6 +55,10 @@ try:
                               VehicleStatus, OffboardControlMode)
 except Exception:  # pragma: no cover - present at runtime once px4_msgs is built
     VehicleTorqueSetpoint = VehicleThrustSetpoint = VehicleStatus = OffboardControlMode = None
+try:
+    from px4_msgs.msg import MavlinkLog
+except Exception:  # pragma: no cover
+    MavlinkLog = None
 
 from afc_bridge_msgs.msg import ValveNodeCtrl, ValveNodeSensor, ValveNodeHealth, ValveNodeComp
 
@@ -118,6 +123,10 @@ class BridgeNode(Node):
         self._tlm_offset_ms = None       # est. (node_ms - ros_ms), for logging
         self._tlm_offset0_ms = None
         self.health_out = p("health_topic", "/afc/health").value
+        # Air-delivery CAUTION/WARNING -> QGC via PX4 (mavlink_log -> STATUSTEXT).
+        # Needs /fmu/in/mavlink_log in the FC's dds_topics.yaml; harmless without.
+        self.qgc_alerts = bool(p("qgc_alerts", True).value)
+        self.qgc_alert_topic = p("qgc_alert_topic", "/fmu/in/mavlink_log").value
 
         # ---- health/observability counters ----
         # With the console gone, a silent framing desync looks identical to
@@ -147,6 +156,13 @@ class BridgeNode(Node):
         self._sensor_pub = self.create_publisher(ValveNodeSensor, self.sensor_out, 10)
         self._health_pub = self.create_publisher(ValveNodeHealth, self.health_out, 10)
         self._keepalive_pub = self.create_publisher(OffboardControlMode, "/fmu/in/offboard_control_mode",QoSPresetProfiles.SENSOR_DATA.value)
+        self._alerter = AirAlerter()
+        self._fc_ts_us = None            # latest FC timestamp (vehicle_status), for mavlink_log
+        self._fc_ts_mono = 0.0
+        self._qgc_pub = None
+        if self.qgc_alerts and MavlinkLog is not None:
+            self._qgc_pub = self.create_publisher(MavlinkLog, self.qgc_alert_topic,
+                                                  QoSPresetProfiles.SENSOR_DATA.value)
         self.comp_out  = p("comp_topic", "/afc/compressor").value
         self._comp_pub = self.create_publisher(ValveNodeComp, self.comp_out, 10)
         self._comp_count = 0    # COMP_TLM frames since last health tick -> comp_hz
@@ -257,6 +273,10 @@ class BridgeNode(Node):
         # propagates through this one field. Freshness keyed on receipt time.
         armed = (msg.arming_state == VehicleStatus.ARMING_STATE_ARMED)
         self._armtx.note_state(armed, time.monotonic())
+        # FC clock reference: PX4 drops a mavlink_log older than 5 s by ITS clock,
+        # and with DDS timesync off the Pi must stamp in FC time itself.
+        self._fc_ts_us = int(msg.timestamp)
+        self._fc_ts_mono = time.monotonic()
 
     def _on_torque(self, msg):
         self._torque = (float(msg.xyz[0]), float(msg.xyz[1]), float(msg.xyz[2]))
@@ -333,7 +353,11 @@ class BridgeNode(Node):
         m.surf = d["surf"]
         m.air_sev = d["air_sev"]
         m.air_causes = d["air_causes"]
+        for k in ("flags2_valid", "sbus_lost", "sbus_ok", "bench_build", "cal_flash",
+                  "sim_sensors", "sim_sbus", "sim_primary"):
+            setattr(m, k, bool(d[k]))
         self._ctrl_pub.publish(m)
+        self._qgc_alert(d["air_sev"], d["air_causes"], d["armed"])
         self._ctrl_count += 1
         self._frames_ok += 1
         self._last_source = d["source"]     # tiny's readback of our CMD path
@@ -348,6 +372,20 @@ class BridgeNode(Node):
         self._last_surf = d["surf_engaged"]
         self._last_air_sev = d["air_sev"]
         self._last_air_causes = d["air_causes"]
+
+    def _qgc_alert(self, level: int, causes: int, armed: bool):
+        if self._qgc_pub is None:
+            return
+        for sev, text in self._alerter.update(int(level), int(causes), time.monotonic()):
+            if self._fc_ts_us is None:
+                self.get_logger().warn(f"[qgc] no FC clock yet, not sent: {text}")
+                continue
+            m = MavlinkLog()
+            m.timestamp = self._fc_ts_us + int((time.monotonic() - self._fc_ts_mono) * 1e6)
+            m.text = encode_text(text)
+            m.severity = sev
+            self._qgc_pub.publish(m)
+            self.get_logger().info(f"[qgc] sev={sev} {text}")
 
     def _publish_sensor(self, payload: bytes):
         try:
@@ -364,6 +402,7 @@ class BridgeNode(Node):
         m.mdot = [float(x) for x in d["mdot"]]
         m.mdot_total = float(d["mdot_total"])
         m.valid = d["valid"]
+        m.why = [int(x) & 0xFF for x in d["why"]]
         self._sensor_pub.publish(m)
 
         self._sensor_count += 1

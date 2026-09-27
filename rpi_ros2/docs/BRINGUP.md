@@ -86,6 +86,24 @@ Edit `src/modules/uxrce_dds_client/dds_topics.yaml`, under `publications:`
   - topic: /fmu/out/vehicle_thrust_setpoint
     type: px4_msgs::msg::VehicleThrustSetpoint
 ```
+And under `subscriptions:` (2026-09-27) -- lets the bridge push air-delivery
+CAUTION/WARNING into QGC: PX4's mavlink module turns every `mavlink_log` into a
+STATUSTEXT on all links (so it arrives through the Doodle C2 link like any vehicle
+message, and QGC shows/speaks it):
+```yaml
+  - topic: /fmu/in/mavlink_log
+    type: px4_msgs::msg::MavlinkLog
+```
+Fold this into the S14 rebuild (release/1.17 + #25873 keep-alive + #26848 reconnect),
+together with any low-rate state topics wanted in bags (use `rate_limit:` on each,
+and keep TELEM2 load well below the torque/thrust stream -- that link is the CMD path).
+The bridge stamps each MavlinkLog with an FC-clock estimate taken from
+`vehicle_status` (DDS timesync is off); PX4 drops a log line older than 5 s by its
+own clock, so an unstamped / Pi-clock message would be discarded silently.
+Check after the rebuild: `ros2 topic info /fmu/in/mavlink_log` shows the agent as a
+subscriber; force an AIR CAUTION on the bench (`fault agg on` while armed) and the
+text "AFC AIR CAUTION: VENTURIS LOST" appears in QGC.
+
 Then rebuild/reflash (or rebuild SITL). Set `UXRCE_DDS_CFG` so the client points
 at the agent's transport. CONFIRMED: PX4 1.17, transport = **serial** (USB/TELEM2);
 this FC has no UDP DDS path. `uxrce_dds_client` module was disabled for flash on the

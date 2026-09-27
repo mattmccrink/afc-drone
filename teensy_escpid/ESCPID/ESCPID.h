@@ -58,7 +58,7 @@
                                                     //   PID, breaks a hand-back run (CRC8 lets ~1/256
                                                     //   garbage packets through)
 #ifndef ESCPID_OL_THROTTLE
-#define ESCPID_OL_THROTTLE        1400              // <<SET>> throttle (0..1999) for ~30k rpm
+#define ESCPID_OL_THROTTLE        0              // <<SET>> throttle (0..1999) for ~30k rpm
                                                     //   under compressor load. 0 = unset: the
                                                     //   fallback holds PID_MIN (reports only).
 #endif

@@ -36,3 +36,28 @@ shell). It never starts at boot. Start it before or after the stack — the
 recorder picks the topics up when they appear.
 
 Pull bags to the desktop: `scp -r pi@10.223.250.2:~/bags/afc_<name> .`
+
+---
+
+# Bridge + rosbridge as a boot service (S14)
+
+The agent already runs as `microxrce-agent.service`. This adds the bridge and
+rosbridge as a second, independent service, so the whole stack comes up at boot
+and restarting the bridge can never cycle the agent.
+
+```bash
+cd ~/afc-drone/rpi_ros2/tools
+chmod +x afc_bridge_run.sh
+sudo cp afc-bridge.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now afc-bridge
+journalctl -u afc-bridge -f          # expect "opened /dev/ttyAMA1 (exclusive)" and the 1 Hz [health] line
+```
+
+Same `Environment=` caveat as the recorder. To run the bridge by hand (debugging),
+`sudo systemctl stop afc-bridge` first -- it holds the Tiny's UART exclusively.
+
+Checks: reboot the Pi and confirm the dashboard connects with no manual steps;
+`sudo systemctl restart afc-bridge` while armed recovers PRIMARY without an FC
+reboot (repeat of T-C2); `systemctl status microxrce-agent` shows the agent's
+uptime unchanged by bridge restarts.

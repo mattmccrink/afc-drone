@@ -187,6 +187,12 @@ CTRL_TLM_LEN = 43
 CTRL_TLM_LEN_EXT = 47
 CTRL_TLM_LEN_EXT2 = 55
 CTRL_TLM_LEN_EXT3 = 56          # + air_causes byte (air-delivery severity rides flags bits 6-7)
+CTRL_TLM_LEN_EXT4 = 57          # + flags2 (SBUS link + build-configuration notices)
+SENSOR_TLM_LEN_EXT = 62         # + per-venturi validity reason (6 x u8, VentHealth)
+
+# Tiny VentHealth reasons (types.h) -- why a venturi is (in)valid
+VH_NAMES = {0: "OK", 1: "UNMAPPED", 2: "NOPROM", 3: "NODATA", 4: "STALE", 5: "FROZEN",
+            6: "LOSSY", 7: "RANGE", 8: "DPNEG", 9: "RECOVER", 10: "INJECTED"}
 
 # Air-delivery severity (tiny air_state.h). Reporting only.
 AIR_OK, AIR_ADVISORY, AIR_CAUTION, AIR_WARNING = 0, 1, 2, 3
@@ -211,7 +217,10 @@ def decode_ctrl_tlm(payload: bytes) -> dict:
              mode=0, terminated=False, elig_fc=False, elig_sbus=False,
              sbus_sw=False, surf_engaged=False, surf_switch=False,
              desat_rp=1.0, desat_yaw=1.0,
-             surf=[0] * SURF_COUNT, air_sev=0, air_causes=0)
+             surf=[0] * SURF_COUNT, air_sev=0, air_causes=0,
+             # flags2 defaults (pre-2026-09-27 firmware): unknown -> benign
+             sbus_lost=False, sbus_ok=False, bench_build=False, cal_flash=False,
+             sim_sensors=False, sim_sbus=False, sim_primary=False, flags2_valid=False)
     if len(payload) >= CTRL_TLM_LEN_EXT:
         mode, flags, drp, dyaw = struct.unpack_from("<BBBB", payload, 43)
         d.update(mode=mode, terminated=bool(flags & 0x01),
@@ -225,6 +234,11 @@ def decode_ctrl_tlm(payload: bytes) -> dict:
         d.update(surf=list(struct.unpack_from("<4h", payload, 47)))
     if len(payload) >= CTRL_TLM_LEN_EXT3:
         d.update(air_causes=payload[55])
+    if len(payload) >= CTRL_TLM_LEN_EXT4:
+        f2 = payload[56]
+        d.update(sbus_lost=bool(f2 & 0x01), sbus_ok=bool(f2 & 0x02), bench_build=bool(f2 & 0x04),
+                 cal_flash=bool(f2 & 0x08), sim_sensors=bool(f2 & 0x10), sim_sbus=bool(f2 & 0x20),
+                 sim_primary=bool(f2 & 0x40), flags2_valid=True)
     return d
 
 
@@ -239,9 +253,14 @@ def decode_sensor_tlm(payload: bytes) -> dict:
     (mask,) = struct.unpack_from("<H", payload, 50)
     (node_stamp_ms,) = struct.unpack_from("<I", payload, 52)
     valid = [bool((mask >> v) & 1) for v in range(VALVE_COUNT)]
+    # per-venturi reason (62-byte firmware); older frames: 0 (OK) if valid else 255 (unknown)
+    if len(payload) >= SENSOR_TLM_LEN_EXT:
+        why = list(payload[56:56 + VALVE_COUNT])
+    else:
+        why = [0 if ok else 255 for ok in valid]
     return dict(p_up=p_up, p_lo=p_lo, t_die=t_die, mdot=mdot,
                 mdot_total=mdot_total / 10.0, valid=valid,
-                node_stamp_ms=node_stamp_ms)
+                node_stamp_ms=node_stamp_ms, why=why)
 
 def decode_comp_tlm(payload: bytes) -> dict:
     if len(payload) < COMP_TLM_LEN:

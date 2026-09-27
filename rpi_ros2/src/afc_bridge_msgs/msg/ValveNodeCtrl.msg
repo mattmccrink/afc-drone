@@ -47,3 +47,13 @@ uint8 AIR_C_FLOW_LOW     = 16   # venturis healthy but flow implausibly low whil
 uint8 AIR_C_SENSOR_STALE = 32   # sensor frame not updating
 uint8 AIR_C_TEENSY_LINK  = 64   # no Teensy replies while armed
 uint8 air_causes            # bitmask of AIR_C_* (instantaneous)
+
+# ---- RC link + build configuration (CTRL_TLM flags2, 2026-09-27) ----
+bool flags2_valid           # false on older firmware (fields below then meaningless)
+bool sbus_lost              # SBUS receiver reports failsafe / frame-lost
+bool sbus_ok                # clean SBUS frames arriving
+bool bench_build            # tiny built with BENCH_HOOKS=1 -- NOT a flight build
+bool cal_flash              # calibration loaded from flash (false = compiled defaults)
+bool sim_sensors            # tiny built with SIMULATED sensors/servos (USE_REAL_I2C=0)
+bool sim_sbus               # tiny built with SIMULATED SBUS (USE_REAL_SBUS=0)
+bool sim_primary            # tiny built with SIMULATED primary input (USE_REAL_PRIMARY=0)

@@ -278,11 +278,11 @@ function buildBars(container,n,color){
 }
 const mdotRows=buildBars(document.getElementById("mdotBars"),6,"#3fb950");
 const pupRows =buildBars(document.getElementById("pupBars"),6,"#58a6ff");
-function setBar(rows,i,value,max,valid,unit){
+function setBar(rows,i,value,max,valid,why){
   const r=rows[i]; if(!r)return;
   r.row.classList.toggle("invalid",!valid);
   r.fill.style.width=Math.max(0,Math.min(100,100*value/max))+"%";
-  r.num.textContent=valid?value.toFixed(1):"x";
+  r.num.textContent=valid?value.toFixed(1):(why||"x");
 }
 
 // ---------------------------------------------------------------------------
@@ -312,9 +312,12 @@ function subscribe(){
 let lastValid=[true,true,true,true,true,true];
 function onSensor(m){
   lastValid = m.valid;
+  S.t_sensor = performance.now();
+  S.why = m.why ? Array.from(m.why) : null;
   for(let i=0;i<6;i++){
-    setBar(mdotRows,i,m.mdot[i],50,m.valid[i]);      // 50 g/s full-scale (tweak)
-    setBar(pupRows,i,m.p_up[i],1200,m.valid[i]);     // ~1200 mbar full-scale
+    const why = S.why ? vhName(S.why[i]) : "x";
+    setBar(mdotRows,i,m.mdot[i],50,m.valid[i],why);      // 50 g/s full-scale (tweak)
+    setBar(pupRows,i,m.p_up[i],1200,m.valid[i],why);     // ~1200 mbar full-scale
   }
   document.getElementById("mdotTotal").textContent=m.mdot_total.toFixed(1);
 }
@@ -340,7 +343,18 @@ const S = {                   // latest state, filled by the topic handlers belo
   cmd_fresh:null, arm_fresh:null, elig_fc:null, elig_sbus:null,
   esc_err:0, esc_tlm_ok:null, thermal:false, esc_temp:null, err11_t:-1e9, err12_t:-1e9,
   t_ctrl:0, t_health:0, t_comp:0, t_sensor:0, ros_up:false,
+  why:null, f2:false, sbus_lost:false, sbus_ok:false, bench:false, cal_flash:true,
+  sim_sensors:false, sim_sbus:false, sim_primary:false,
 };
+const VH = ["OK","UNMAPPED","NOPROM","NODATA","STALE","FROZEN","LOSSY","RANGE","DPNEG","RECOVER","INJECTED"];
+const vhName = w => w===255 ? "?" : (VH[w]||("#"+w));
+function ventVal(S){
+  if(S.n_valid===null) return "--";
+  let t=S.n_valid+"/6";
+  if(S.why){ const bad=S.why.map((w,i)=>[i,w]).filter(([i,w])=>w!==0);
+    if(bad.length) t+=" v"+(bad[0][0]+1)+" "+vhName(bad[0][1])+(bad.length>1?" +"+(bad.length-1):""); }
+  return t;
+}
 const AIR_CAUSES = {1:"ESC telemetry lost (compressor open loop)", 2:"ESC emulation build (rpm fake)",
   4:"some venturis invalid", 8:"no valid venturis", 16:"flow implausibly low while running",
   32:"sensor frame stale", 64:"no replies from the Teensy"};
@@ -357,7 +371,7 @@ const RULES = [
    when:S=>S.air_sev===2, msg:S=>"AIRFLOW NOT MEASURED - air delivery uncertain"+airWhy(S.air_causes)},
   {id:"airA", g:"Air delivery", cls:"A", label:"AIR DEGR",
    when:S=>S.air_sev===1, msg:S=>(S.armed?"Degraded sensing, air delivery still confirmed":"PRE-FLIGHT: venturi sensing not fully healthy (vhealth)")+airWhy(S.air_causes)},
-  {id:"vent", g:"Air delivery", cls:"S", label:"VENTURIS", val:S=>S.n_valid===null?"--":S.n_valid+"/6"},
+  {id:"vent", g:"Air delivery", cls:"S", label:"VENTURIS", val:ventVal},
   {id:"escOL", g:"Air delivery", cls:"A", label:"ESC OPEN LP", armed:true,
    when:S=>now()-S.err11_t<1000, msg:"ESC telemetry lost: compressor OPEN LOOP at the 30k point, rotor speed unknown"},
   {id:"escOT", g:"Air delivery", cls:"W", label:"ESC OVERTEMP",
@@ -366,8 +380,6 @@ const RULES = [
    when:S=>S.thermal, msg:S=>"ESC THERMAL DERATE SUSPECTED - ESC "+S.esc_temp+" C, rpm sagging below target"},
   {id:"teensy", g:"Air delivery", cls:"C", label:"TEENSY LINK", armed:true, holdMs:1000,
    when:S=>S.esc_tlm_ok===false, msg:"No replies from the compressor controller (Teensy) while armed"},
-  {id:"emu", g:"Air delivery", cls:"C", label:"ESC EMUL",
-   when:S=>now()-S.err12_t<1500, msg:"TEENSY IS AN ESC-EMULATION BUILD - telemetry is fake; reflash before any real ESC"},
   {id:"escT", g:"Air delivery", cls:"S", label:"ESC TEMP", val:S=>S.esc_temp===null?"--":S.esc_temp+" C"},
   // ---- command & arm -----------------------------------------------------
   {id:"term", g:"Command & arm", cls:"W", label:"TERMINATED",
@@ -382,10 +394,23 @@ const RULES = [
    when:S=>S.arm_fresh===false, msg:"FC arm token not advancing (vehicle_status stale)"},
   {id:"desat", g:"Command & arm", cls:"A", label:"DESAT", armed:true, holdMs:300,
    when:S=>S.desat_rp<0.99||S.desat_yaw<0.99, msg:S=>`AFC authority saturated (roll/pitch x${S.desat_rp.toFixed(2)}, yaw x${S.desat_yaw.toFixed(2)})`},
+  {id:"rc", g:"Command & arm", cls:"C", label:"RC LINK", armed:true, holdMs:500,
+   when:S=>S.f2 && S.sbus_lost, msg:"RC (SBUS) link lost - last-resort reversion unavailable"},
   {id:"mode", g:"Command & arm", cls:"S", label:"MODE", val:S=>S.mode===null?"--":(MODES[S.mode]||S.mode)},
   {id:"src",  g:"Command & arm", cls:"S", label:"SOURCE", val:S=>S.source===null?"--":(SRC[S.source]||S.source)},
   {id:"arm",  g:"Command & arm", cls:"S", label:"ARM", val:S=>S.armed?"ARMED":"disarmed"},
   {id:"surf", g:"Command & arm", cls:"S", label:"SURFACES", val:S=>S.surf?"ENGAGED":(S.surf_sw?"sw on/idle":"off")},
+  {id:"rcS",  g:"Command & arm", cls:"S", label:"RC", val:S=>!S.f2?"n/a":(S.sbus_lost?"LOST":(S.sbus_ok?"ok":"--"))},
+  // ---- configuration notices (build / calibration) -------------------------
+  {id:"bench", g:"Configuration", cls:"C", label:"BENCH BUILD",
+   when:S=>S.f2 && S.bench, msg:"TINY IS A BENCH_HOOKS BUILD - not a flight build; reflash with BENCH_HOOKS 0"},
+  {id:"sim", g:"Configuration", cls:"C", label:"SIM BUILD",
+   when:S=>S.f2 && (S.sim_sensors||S.sim_sbus||S.sim_primary),
+   msg:S=>"TINY RUNS SIMULATED "+[S.sim_sensors&&"SENSORS/SERVOS",S.sim_sbus&&"SBUS",S.sim_primary&&"PRIMARY INPUT"].filter(Boolean).join(" + ")+" - not a flight build"},
+  {id:"emu", g:"Configuration", cls:"C", label:"ESC EMUL",
+   when:S=>now()-S.err12_t<1500, msg:"TEENSY IS AN ESC-EMULATION BUILD - telemetry is fake; reflash before any real ESC"},
+  {id:"cal", g:"Configuration", cls:"A", label:"CAL DEFAULT",
+   when:S=>S.f2 && !S.cal_flash, msg:"Tiny calibration from compiled defaults (no flash cal loaded)"},
   // ---- links -------------------------------------------------------------
   {id:"data", g:"Links", cls:"C", label:"DASH DATA", noStale:true,
    when:S=>!S.ros_up || now()-S.t_ctrl>1500, msg:S=>S.ros_up?"Dashboard data stale (no vehicle telemetry for >1.5 s)":"Dashboard disconnected from rosbridge"},
@@ -498,7 +523,10 @@ function onCtrl(m){
   lastCtrlT=performance.now();
   Object.assign(S, {t_ctrl:lastCtrlT, armed:!!m.armed, source:m.source, n_valid:m.n_valid,
     surf:!!m.surf_engaged, surf_sw:!!m.surf_switch,
-    air_sev:(m.air_sev!==undefined?m.air_sev:0), air_causes:(m.air_causes||0)});
+    air_sev:(m.air_sev!==undefined?m.air_sev:0), air_causes:(m.air_causes||0),
+    f2:!!m.flags2_valid, sbus_lost:!!m.sbus_lost, sbus_ok:!!m.sbus_ok, bench:!!m.bench_build,
+    cal_flash:(m.flags2_valid?!!m.cal_flash:true), sim_sensors:!!m.sim_sensors,
+    sim_sbus:!!m.sim_sbus, sim_primary:!!m.sim_primary});
   for(let i=0;i<6;i++) setValve(i, m.valve[i], lastValid[i]);
   document.getElementById("servoRow").textContent =
     "servo us: "+Array.from(m.servo_us).join(" ");

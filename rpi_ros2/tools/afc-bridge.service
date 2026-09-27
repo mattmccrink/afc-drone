@@ -1,0 +1,34 @@
+# /etc/systemd/system/afc-bridge.service
+#
+# AFC bridge node + rosbridge websocket, started at boot (S14). The DDS agent is
+# a SEPARATE service (microxrce-agent.service) so stopping/restarting the bridge
+# can never take the agent down.
+#
+#   sudo systemctl status afc-bridge        # is it up?
+#   journalctl -u afc-bridge -f             # live log (the 1 Hz [health] line lands here)
+#   sudo systemctl restart afc-bridge       # safe (T-C2); NEVER restart the agent
+#   sudo systemctl stop afc-bridge          # before running the bridge by hand
+#                                           #   (it holds /dev/ttyAMA1 exclusively)
+
+[Unit]
+Description=AFC bridge (Tiny <-> ROS 2) + rosbridge
+After=network-online.target microxrce-agent.service
+Wants=network-online.target microxrce-agent.service
+# no Requires=/PartOf=: the two services live and die independently
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+SupplementaryGroups=dialout
+# Must match the shell that runs the ROS graph (same as afc-record@.service):
+#Environment=ROS_DOMAIN_ID=0
+#Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+ExecStart=/home/pi/afc-drone/rpi_ros2/tools/afc_bridge_run.sh
+KillSignal=SIGINT
+TimeoutStopSec=10
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
