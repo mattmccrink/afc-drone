@@ -44,13 +44,43 @@
   .num{text-align:right}
   svg text{fill:var(--ink);font:11px ui-monospace,monospace}
   .stale{color:var(--warn)}
-  .banner{display:none;margin:10px 10px 0;padding:10px 14px;border-radius:8px;font-weight:700;
-          letter-spacing:.5px;background:rgba(248,81,73,.18);border:1px solid var(--bad);color:var(--bad)}
-  .banner.on{display:block;animation:blink 1s steps(2,start) infinite}
-  @keyframes blink{to{border-color:transparent}}
-  /* air-delivery levels: advisory/caution amber & steady, warning red & blinking (.banner default) */
-  .banner.air-adv,.banner.air-cau{background:rgba(210,153,34,.15);border-color:var(--warn);color:var(--warn);animation:none}
-  .banner.air-cau{font-size:15px}
+  /* ---- annunciator / crew-alerting panel (14 CFR 25.1322 / AC 25.1322-1 conventions) ----
+     warning = red, caution = amber, advisory = cyan (not red/green), status = white. */
+  :root{--adv:#39c5cf}
+  .annun{display:grid;grid-template-columns:150px 1fr 1fr;gap:10px;margin:10px 10px 0}
+  .masters{display:flex;flex-direction:column;gap:8px}
+  .master{border:2px solid var(--edge);border-radius:6px;background:#0d1117;color:#484f58;
+          font:700 13px ui-monospace,monospace;padding:10px 4px;text-align:center;cursor:pointer;letter-spacing:1px}
+  .master.W.lit{background:rgba(248,81,73,.85);border-color:var(--bad);color:#fff}
+  .master.C.lit{background:rgba(210,153,34,.85);border-color:var(--warn);color:#111}
+  .master.flash{animation:mflash .5s steps(2,start) infinite}
+  @keyframes mflash{to{opacity:.35}}
+  .master small{display:block;font-weight:400;font-size:10px;letter-spacing:0}
+  .soundBtn{font-size:11px;padding:3px 6px}
+  .groups{display:flex;flex-direction:column;gap:8px}
+  .grp h3{font-size:10px;letter-spacing:1px;color:var(--dim);margin:0 0 4px;text-transform:uppercase}
+  .tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(96px,1fr));gap:5px}
+  .tile{border:1px solid var(--edge);border-radius:4px;padding:3px 5px;text-align:center;
+        font-weight:700;font-size:11px;color:#484f58;background:#0d1117;min-height:34px;line-height:1.25}
+  .tile .v{display:block;font-weight:400;font-size:10px}
+  .tile.S{color:var(--ink);border-color:#484f58}
+  .tile.A{background:rgba(57,197,207,.16);border-color:var(--adv);color:var(--adv)}
+  .tile.C{background:rgba(210,153,34,.22);border-color:var(--warn);color:var(--warn)}
+  .tile.W{background:rgba(248,81,73,.28);border-color:var(--bad);color:#ff7b72}
+  .tile.stale{opacity:.4}
+  .cas{background:#0d1117;border:1px solid var(--edge);border-radius:6px;padding:6px 8px;min-height:120px;
+       max-height:260px;overflow:auto}
+  .cas h3{font-size:10px;letter-spacing:1px;color:var(--dim);margin:0 0 4px;text-transform:uppercase}
+  .msg{display:grid;grid-template-columns:62px 1fr;gap:6px;padding:1px 0}
+  .msg .t{color:var(--dim)}
+  .msg.W{color:#ff7b72} .msg.C{color:var(--warn)} .msg.A{color:var(--adv)}
+  .msg.unack{font-weight:700}
+  .msg.unack .m::before{content:"\25CF  "}
+  .msg.stale{opacity:.5}
+  .casNone{color:var(--dim)}
+  details.hist{margin-top:6px;color:var(--dim)}
+  details.hist .msg{color:var(--dim)}
+  @media (max-width:1000px){.annun{grid-template-columns:1fr}.masters{flex-direction:row}}
   .big{font-size:22px;font-weight:700}
 </style>
 </head>
@@ -65,24 +95,21 @@
   <span class="pill" id="armPill">ARM ?</span>
   <span class="pill" id="srcPill">SRC ?</span>
   <span class="pill" id="surfPill">SURF ?</span>
-  <span class="pill" id="thermPill">ESC ?</span>
-  <span class="pill" id="airPill">AIR ?</span>
 </header>
-<div class="banner" id="airBanner">
-  <span id="airHead"></span> <span id="airWhy" style="font-weight:400"></span>
-</div>
-<div class="banner" id="thermBanner">
-  ESC THERMAL-DERATE SUSPECTED &mdash; ESC hot and compressor rpm sagging below target.
-  Consider engaging surfaces / reducing demand / landing.
-  <span id="thermDetail"></span>
-</div>
-<div class="banner" id="noTlmBanner">
-  NO ESC TELEMETRY &mdash; compressor commanded OPEN LOOP toward the 30k throttle point.
-  Actual rotor speed UNKNOWN; rpm / temp / current shown are the last good values and the
-  thermal flag is blind. Telemetry wire or ESC fault.
-</div>
-<div class="banner" id="emuBanner">
-  ESC EMULATION BUILD ON THE TEENSY &mdash; telemetry is FAKE. Bench only: reflash before connecting a real ESC.
+<!-- ANNUNCIATOR: master alerts | system tiles | crew-alert message list.
+     Rules (what lights, at which level) live in the RULES table in the script. -->
+<div class="annun">
+  <div class="masters">
+    <div class="master W" id="mW" title="click to acknowledge warnings">MASTER<br>WARNING<small id="mWn"></small></div>
+    <div class="master C" id="mC" title="click to acknowledge cautions">MASTER<br>CAUTION<small id="mCn"></small></div>
+    <button class="soundBtn" id="soundBtn" title="browsers need a click before they may play sound">SOUND OFF</button>
+  </div>
+  <div class="groups" id="groups"></div>
+  <div class="cas">
+    <h3>Alerts &mdash; warnings, cautions, advisories (newest first)</h3>
+    <div id="casList"><div class="casNone">no active alerts</div></div>
+    <details class="hist"><summary>history</summary><div id="histList"></div></details>
+  </div>
 </div>
 
 <div class="grid">
@@ -267,9 +294,9 @@ function connect(){
   const url=document.getElementById("url").value.trim();
   ros=new ROSLIB.Ros({url});
   const dot=document.getElementById("link"),txt=document.getElementById("linkTxt");
-  ros.on("connection",()=>{dot.classList.add("on");txt.textContent="connected "+url;subscribe();});
-  ros.on("error",()=>{dot.classList.remove("on");txt.textContent="error";});
-  ros.on("close",()=>{dot.classList.remove("on");txt.textContent="disconnected";});
+  ros.on("connection",()=>{dot.classList.add("on");txt.textContent="connected "+url;S.ros_up=true;subscribe();});
+  ros.on("error",()=>{dot.classList.remove("on");txt.textContent="error";S.ros_up=false;});
+  ros.on("close",()=>{dot.classList.remove("on");txt.textContent="disconnected";S.ros_up=false;});
 }
 function sub(t){return new ROSLIB.Topic({ros,name:t.name,messageType:t.type,
   throttle_rate:t.throttle,queue_length:1,queue_size:1});}
@@ -291,35 +318,187 @@ function onSensor(m){
   }
   document.getElementById("mdotTotal").textContent=m.mdot_total.toFixed(1);
 }
-// Air-delivery severity from the tiny (air_state.h). Reporting only.
-const AIR = {
-  names: ["OK","ADVISORY","CAUTION","WARNING"],
-  pill:  ["ok","warn","warn","bad"],
-  head: [ "",
-    "AIR ADVISORY &mdash; degraded sensing; air delivery still confirmed.",
-    "AIR CAUTION &mdash; airflow NOT measured (venturis lost/degraded). Air delivery uncertain.",
-    "AIR WARNING &mdash; air delivery unobserved or failed. Engage surfaces / reduce demand / land." ],
-  causes: {1:"ESC telemetry lost (compressor open loop)", 2:"ESC emulation build (rpm fake)",
-           4:"some venturis invalid", 8:"no valid venturis", 16:"flow implausibly low while running",
-           32:"sensor frame stale", 64:"no replies from the Teensy"},
+// ===========================================================================
+// ANNUNCIATOR -- crew-alerting conventions after 14 CFR 25.1322 / AC 25.1322-1:
+//   W warning  : immediate awareness + IMMEDIATE response   (red,   master WARNING)
+//   C caution  : immediate awareness + SUBSEQUENT response  (amber, master CAUTION)
+//   A advisory : awareness, MAY need subsequent response    (cyan)
+//   S status   : normal-condition readout, never an alert   (white)
+// Master lights flash until acknowledged (click), stay lit while any of their
+// alerts is active, and re-arm on each new occurrence. Alerts clear themselves
+// when the condition clears. The message list is ordered W, C, A and newest
+// first within each class. 'armed' rules are inhibited while disarmed (bench /
+// pre-flight). If dashboard data goes stale, tiles and messages are greyed
+// rather than shown as current.
+//
+// EDIT HERE: one row per annunciation. when(S) gets the latest vehicle state.
+// ===========================================================================
+const S = {                   // latest state, filled by the topic handlers below
+  armed:false, source:null, mode:null, terminated:false, air_sev:0, air_causes:0,
+  n_valid:null, surf:false, surf_sw:false, desat_rp:1, desat_yaw:1,
+  serial:null, ctrl_hz:null, sensor_hz:null, comp_hz:null, crc:null, crc_rise_t:-1e9,
+  cmd_fresh:null, arm_fresh:null, elig_fc:null, elig_sbus:null,
+  esc_err:0, esc_tlm_ok:null, thermal:false, esc_temp:null, err11_t:-1e9, err12_t:-1e9,
+  t_ctrl:0, t_health:0, t_comp:0, t_sensor:0, ros_up:false,
 };
-function onAir(sev, causes, armed){
-  const p=document.getElementById("airPill");
-  p.textContent = "AIR "+(AIR.names[sev]||sev);
-  p.className = "pill "+(AIR.pill[sev]||"");
-  const b=document.getElementById("airBanner");
-  b.classList.toggle("on", sev>0);
-  b.classList.toggle("air-adv", sev===1);
-  b.classList.toggle("air-cau", sev===2);
-  document.getElementById("airHead").innerHTML = (sev===1 && !armed)
-    ? "PRE-FLIGHT &mdash; venturi sensing not fully healthy (check <code>vhealth</code> before arming)."
-    : (AIR.head[sev]||"");
-  const why=[]; for(const bit in AIR.causes) if(causes & bit) why.push(AIR.causes[bit]);
-  document.getElementById("airWhy").textContent = why.length ? "("+why.join("; ")+")" : "";
+const AIR_CAUSES = {1:"ESC telemetry lost (compressor open loop)", 2:"ESC emulation build (rpm fake)",
+  4:"some venturis invalid", 8:"no valid venturis", 16:"flow implausibly low while running",
+  32:"sensor frame stale", 64:"no replies from the Teensy"};
+const airWhy = c => { const w=[]; for(const b in AIR_CAUSES) if(c & b) w.push(AIR_CAUSES[b]); return w.length?" ("+w.join("; ")+")":""; };
+const now = () => performance.now();
+const SRC = ["PRIMARY","SBUS","SAFE"];
+const MODES = {0:"DISARMED",1:"PRIMARY ARMED",2:"SBUS REVERSION",3:"SAFE HOLD",4:"TERMINATED"};
+
+const RULES = [
+  // ---- air delivery ------------------------------------------------------
+  {id:"airW", g:"Air delivery", cls:"W", label:"AIR FAIL",
+   when:S=>S.air_sev===3, msg:S=>"AIR DELIVERY UNOBSERVED OR FAILED - engage surfaces / reduce demand / land"+airWhy(S.air_causes)},
+  {id:"airC", g:"Air delivery", cls:"C", label:"AIR UNCERT",
+   when:S=>S.air_sev===2, msg:S=>"AIRFLOW NOT MEASURED - air delivery uncertain"+airWhy(S.air_causes)},
+  {id:"airA", g:"Air delivery", cls:"A", label:"AIR DEGR",
+   when:S=>S.air_sev===1, msg:S=>(S.armed?"Degraded sensing, air delivery still confirmed":"PRE-FLIGHT: venturi sensing not fully healthy (vhealth)")+airWhy(S.air_causes)},
+  {id:"vent", g:"Air delivery", cls:"S", label:"VENTURIS", val:S=>S.n_valid===null?"--":S.n_valid+"/6"},
+  {id:"escOL", g:"Air delivery", cls:"A", label:"ESC OPEN LP", armed:true,
+   when:S=>now()-S.err11_t<1000, msg:"ESC telemetry lost: compressor OPEN LOOP at the 30k point, rotor speed unknown"},
+  {id:"escOT", g:"Air delivery", cls:"W", label:"ESC OVERTEMP",
+   when:S=>S.esc_err===-8, msg:S=>"ESC OVER-TEMPERATURE (ESC limit reached)"},
+  {id:"therm", g:"Air delivery", cls:"C", label:"ESC THERMAL",
+   when:S=>S.thermal, msg:S=>"ESC THERMAL DERATE SUSPECTED - ESC "+S.esc_temp+" C, rpm sagging below target"},
+  {id:"teensy", g:"Air delivery", cls:"C", label:"TEENSY LINK", armed:true, holdMs:1000,
+   when:S=>S.esc_tlm_ok===false, msg:"No replies from the compressor controller (Teensy) while armed"},
+  {id:"emu", g:"Air delivery", cls:"C", label:"ESC EMUL",
+   when:S=>now()-S.err12_t<1500, msg:"TEENSY IS AN ESC-EMULATION BUILD - telemetry is fake; reflash before any real ESC"},
+  {id:"escT", g:"Air delivery", cls:"S", label:"ESC TEMP", val:S=>S.esc_temp===null?"--":S.esc_temp+" C"},
+  // ---- command & arm -----------------------------------------------------
+  {id:"term", g:"Command & arm", cls:"W", label:"TERMINATED",
+   when:S=>S.terminated, msg:"FLIGHT TERMINATED - total command loss; compressor stopped (latched)"},
+  {id:"safe", g:"Command & arm", cls:"W", label:"SAFE HOLD",
+   when:S=>S.mode===3, msg:"NO LIVE COMMAND SOURCE - terminates in 3 s unless PRIMARY or SBUS returns"},
+  {id:"sbus", g:"Command & arm", cls:"C", label:"SBUS REV",
+   when:S=>S.mode===2, msg:"SBUS REVERSION - pilot RC has control (FC command path lost or stalled)"},
+  {id:"cmd", g:"Command & arm", cls:"C", label:"FC CMD", armed:true, holdMs:500,
+   when:S=>S.cmd_fresh===false, msg:"FC torque/thrust setpoints stale at the Pi (DDS)"},
+  {id:"tok", g:"Command & arm", cls:"C", label:"ARM TOKEN", armed:true, holdMs:1500,
+   when:S=>S.arm_fresh===false, msg:"FC arm token not advancing (vehicle_status stale)"},
+  {id:"desat", g:"Command & arm", cls:"A", label:"DESAT", armed:true, holdMs:300,
+   when:S=>S.desat_rp<0.99||S.desat_yaw<0.99, msg:S=>`AFC authority saturated (roll/pitch x${S.desat_rp.toFixed(2)}, yaw x${S.desat_yaw.toFixed(2)})`},
+  {id:"mode", g:"Command & arm", cls:"S", label:"MODE", val:S=>S.mode===null?"--":(MODES[S.mode]||S.mode)},
+  {id:"src",  g:"Command & arm", cls:"S", label:"SOURCE", val:S=>S.source===null?"--":(SRC[S.source]||S.source)},
+  {id:"arm",  g:"Command & arm", cls:"S", label:"ARM", val:S=>S.armed?"ARMED":"disarmed"},
+  {id:"surf", g:"Command & arm", cls:"S", label:"SURFACES", val:S=>S.surf?"ENGAGED":(S.surf_sw?"sw on/idle":"off")},
+  // ---- links -------------------------------------------------------------
+  {id:"data", g:"Links", cls:"C", label:"DASH DATA", noStale:true,
+   when:S=>!S.ros_up || now()-S.t_ctrl>1500, msg:S=>S.ros_up?"Dashboard data stale (no vehicle telemetry for >1.5 s)":"Dashboard disconnected from rosbridge"},
+  {id:"ser", g:"Links", cls:"C", label:"PI-TINY",
+   when:S=>S.serial===false, msg:"Pi <-> Tiny serial link DOWN"},
+  {id:"rate", g:"Links", cls:"A", label:"TLM RATE", holdMs:2000,
+   when:S=>S.serial!==false && ((S.ctrl_hz!==null&&S.ctrl_hz<15)||(S.sensor_hz!==null&&S.sensor_hz<15)),
+   msg:S=>`Tiny telemetry rate low (ctrl ${S.ctrl_hz?.toFixed(1)} Hz, sensor ${S.sensor_hz?.toFixed(1)} Hz)`},
+  {id:"crc", g:"Links", cls:"A", label:"CRC ERR",
+   when:S=>now()-S.crc_rise_t<10000, msg:S=>`Pi <-> Tiny frames failing CRC (total ${S.crc})`},
+  {id:"hz", g:"Links", cls:"S", label:"CTRL/SENS", val:S=>S.ctrl_hz===null?"--":S.ctrl_hz.toFixed(0)+"/"+S.sensor_hz.toFixed(0)+" Hz"},
+];
+
+// ---- engine -------------------------------------------------------------
+const RS = {};                 // per-rule runtime state
+const HIST = [];               // raise/clear events
+let sound = false, audio = null, lastBeep = 0;
+function buildAnnunciator(){
+  const groups = document.getElementById("groups");
+  const byG = {};
+  for(const r of RULES){
+    if(!byG[r.g]){
+      const d=document.createElement("div"); d.className="grp";
+      d.innerHTML=`<h3>${r.g}</h3><div class="tiles"></div>`; groups.appendChild(d);
+      byG[r.g]=d.querySelector(".tiles");
+    }
+    const t=document.createElement("div"); t.className="tile"+(r.cls==="S"?" S":"");
+    t.innerHTML=`${r.label}<span class="v"></span>`; t.title=r.cls==="S"?"status":({W:"warning",C:"caution",A:"advisory"})[r.cls];
+    byG[r.g].appendChild(t);
+    RS[r.id]={tile:t, v:t.querySelector(".v"), active:false, ack:false, t:0, since:null, msg:""};
+  }
+  document.getElementById("mW").onclick=()=>ackClass("W");
+  document.getElementById("mC").onclick=()=>ackClass("C");
+  document.getElementById("soundBtn").onclick=()=>{
+    sound=!sound; document.getElementById("soundBtn").textContent=sound?"SOUND ON":"SOUND OFF";
+    if(sound && !audio){ try{ audio=new (window.AudioContext||window.webkitAudioContext)(); }catch(e){} }
+  };
 }
+function ackClass(c){ for(const r of RULES) if(r.cls===c && RS[r.id].active) RS[r.id].ack=true; render(); }
+function tone(freq, n){
+  if(!sound||!audio) return;
+  for(let k=0;k<n;k++){
+    const o=audio.createOscillator(), g=audio.createGain(), t=audio.currentTime+k*0.18;
+    o.frequency.value=freq; o.connect(g); g.connect(audio.destination);
+    g.gain.setValueAtTime(0.0001,t); g.gain.exponentialRampToValueAtTime(0.25,t+0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001,t+0.14); o.start(t); o.stop(t+0.15);
+  }
+}
+function dataStale(){ return !S.ros_up || now()-S.t_ctrl>1500; }
+function evaluate(){
+  const tnow=now(), stale=dataStale();
+  for(const r of RULES){
+    const st=RS[r.id];
+    if(r.cls==="S") continue;
+    if(stale && !r.noStale) continue;               // freeze on stale data (shown greyed)
+    let raw=false;
+    try{ raw = !!r.when(S) && !(r.armed && !S.armed); }catch(e){ raw=false; }
+    if(raw){ if(st.since===null) st.since=tnow; } else st.since=null;
+    const on = raw && (tnow-st.since >= (r.holdMs||0));
+    if(on && !st.active){
+      st.active=true; st.ack=false; st.t=Date.now();
+      st.msg = typeof r.msg==="function" ? r.msg(S) : r.msg;
+      HIST.unshift({t:st.t, cls:r.cls, m:"ON  "+st.msg}); if(HIST.length>100) HIST.pop();
+      if(r.cls==="W") tone(880,3); else if(r.cls==="C") tone(660,1);
+    } else if(on){
+      st.msg = typeof r.msg==="function" ? r.msg(S) : r.msg;   // keep causes current
+    } else if(!on && st.active){
+      st.active=false;
+      HIST.unshift({t:Date.now(), cls:r.cls, m:"OFF "+st.msg}); if(HIST.length>100) HIST.pop();
+    }
+  }
+  // repeat the warning tone until acknowledged
+  const unackW = RULES.some(r=>r.cls==="W" && RS[r.id].active && !RS[r.id].ack);
+  if(unackW && tnow-lastBeep>2500){ tone(880,3); lastBeep=tnow; }
+  render();
+}
+const fmtT = ms => new Date(ms).toLocaleTimeString([], {hour12:false});
+function render(){
+  const stale=dataStale();
+  for(const r of RULES){
+    const st=RS[r.id], greyed = stale && !r.noStale;
+    if(r.cls==="S"){
+      st.v.textContent = r.val(S); st.tile.className="tile S"+(greyed?" stale":"");
+    } else {
+      st.tile.className="tile"+(st.active?" "+r.cls:"")+(greyed?" stale":"");
+    }
+  }
+  for(const c of ["W","C"]){
+    const act=RULES.filter(r=>r.cls===c && RS[r.id].active);
+    const unack=act.some(r=>!RS[r.id].ack);
+    const m=document.getElementById("m"+c);
+    m.className="master "+c+(act.length?" lit":"")+(unack?" flash":"");
+    document.getElementById("m"+c+"n").textContent = act.length ? act.length+" active" : "";
+  }
+  const order={W:0,C:1,A:2};
+  const act=RULES.filter(r=>r.cls!=="S" && RS[r.id].active)
+    .sort((a,b)=>order[a.cls]-order[b.cls] || RS[b.id].t-RS[a.id].t);
+  const list=document.getElementById("casList");
+  list.innerHTML = act.length ? act.map(r=>{
+      const st=RS[r.id], cls="msg "+r.cls+(st.ack||r.cls==="A"?"":" unack")+(stale&&!r.noStale?" stale":"");
+      return `<div class="${cls}"><span class="t">${fmtT(st.t)}</span><span class="m">${st.msg}</span></div>`;
+    }).join("") : '<div class="casNone">no active alerts</div>';
+  document.getElementById("histList").innerHTML = HIST.map(h=>
+    `<div class="msg"><span class="t">${fmtT(h.t)}</span><span class="m">${h.cls} ${h.m}</span></div>`).join("");
+}
+buildAnnunciator();
+setInterval(evaluate, 200);
+
 function onCtrl(m){
   lastCtrlT=performance.now();
-  if(m.air_sev!==undefined) onAir(m.air_sev, m.air_causes||0, m.armed);
+  Object.assign(S, {t_ctrl:lastCtrlT, armed:!!m.armed, source:m.source, n_valid:m.n_valid,
+    surf:!!m.surf_engaged, surf_sw:!!m.surf_switch,
+    air_sev:(m.air_sev!==undefined?m.air_sev:0), air_causes:(m.air_causes||0)});
   for(let i=0;i<6;i++) setValve(i, m.valve[i], lastValid[i]);
   document.getElementById("servoRow").textContent =
     "servo us: "+Array.from(m.servo_us).join(" ");
@@ -341,22 +520,18 @@ function onCtrl(m){
 let lastCompT=0, lastCtrlT=0;
 // Staleness: a pill that stops updating must not keep saying "ok".
 setInterval(()=>{
-  const now=performance.now();
-  if(lastCompT && now-lastCompT>1500){
-    const tp=document.getElementById("thermPill"); tp.textContent="ESC stale"; tp.className="pill warn";
-    document.getElementById("thermBanner").classList.remove("on");
-    document.getElementById("noTlmBanner").classList.remove("on");
-    document.getElementById("emuBanner").classList.remove("on");
-  }
-  if(lastCtrlT && now-lastCtrlT>1500){
-    for(const id of ["surfPill","armPill","srcPill","airPill"]){
+  if(lastCtrlT && performance.now()-lastCtrlT>1500){
+    for(const id of ["surfPill","armPill","srcPill","modePill"]){
       const e=document.getElementById(id); e.textContent=e.textContent.replace(/ \(stale\)$/,"")+" (stale)"; e.className="pill warn";
     }
   }
 },500);
-let lastNoTlmT=-1e9;
 function onComp(m){
   lastCompT=performance.now();
+  Object.assign(S, {t_comp:lastCompT, esc_err:m.err, esc_tlm_ok:!!m.tlm_ok,
+    thermal:!!m.thermal_suspect, esc_temp:m.temp_c});
+  if(m.err===-11) S.err11_t=lastCompT;     // -1/-8 outrank -11/-12 for a reply: hold ~1 s
+  if(m.err===-12) S.err12_t=lastCompT;
   document.getElementById("cRpm").textContent = m.rpm;
   push(rpmCh,[m.rpm, lastRpmTarget]);
   const t=document.getElementById("cTemp");
@@ -367,19 +542,13 @@ function onComp(m){
     +(m.err===-8?' <span class="pill bad">ESC >=100C</span>':"")
     +(m.err===-11?' <span class="pill bad">NO TLM: OPEN LOOP</span>':"")
     +(m.err===-12?' <span class="pill bad">EMULATED ESC</span>':"");
-  // Teensy STATE codes (repeated every reply while true): -11 open-loop fallback, -12 emulation build
-  // -1/-8 outrank -11 for a reply; keep the banner up across that one frame.
-  if(m.err===-11) lastNoTlmT=performance.now();
-  document.getElementById("noTlmBanner").classList.toggle("on", performance.now()-lastNoTlmT<1000);
-  document.getElementById("emuBanner").classList.toggle("on", m.err===-12);
-  const th=!!m.thermal_suspect;
-  const tp=document.getElementById("thermPill");
-  tp.textContent = th ? "ESC THERMAL" : "ESC ok";
-  tp.className = "pill "+(th?"bad":"ok");
-  document.getElementById("thermBanner").classList.toggle("on", th);
-  document.getElementById("thermDetail").textContent = th ? `(${m.temp_c} C, ${m.rpm} rpm vs ${lastRpmTarget})` : "";
 }
 function onHealth(m){
+  if(S.crc!==null && m.crc_errors>S.crc) S.crc_rise_t=performance.now();   // rising, not the backlog
+  Object.assign(S, {t_health:performance.now(), mode:m.mode, terminated:!!m.terminated,
+    serial:!!m.serial_connected, ctrl_hz:m.ctrl_hz, sensor_hz:m.sensor_hz, comp_hz:m.comp_hz,
+    crc:m.crc_errors, cmd_fresh:!!m.cmd_fresh, arm_fresh:!!m.arm_fresh,
+    elig_fc:!!m.elig_fc, elig_sbus:!!m.elig_sbus, desat_rp:m.desat_rp, desat_yaw:m.desat_yaw});
   document.getElementById("hSer").innerHTML = m.serial_connected
     ? '<span class="pill ok">up</span>' : '<span class="pill bad">DOWN</span>';
   document.getElementById("hHz").textContent = m.ctrl_hz.toFixed(1)+" / "+m.sensor_hz.toFixed(1)
