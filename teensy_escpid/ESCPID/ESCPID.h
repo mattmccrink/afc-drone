@@ -35,7 +35,49 @@
 #define ESCPID_REF_MAX            6000              // reference clamp, 10 rpm units (= 60k rpm)
 #define ESCPID_USB_DEBUG          1                 // 1 = 10 Hz USB line: tgt ref rpm cmd wd err deg
 
+// Telemetry-loss fallback (S17, decision 2026-09-26: open loop to the 30k point).
+// With no fresh ESC telemetry the PID can't close, so instead of idling at
+// PID_MIN (airflow lost) the Teensy ramps OPEN LOOP to a fixed throttle known to
+// give ~30k rpm, and hands back to the PID bumplessly when telemetry returns.
+//   * acquisition: no fresh packet ESCPID_ACQ_TIMEOUT_MS after a (re)start;
+//   * mid-run: no GOOD new packet for ESCPID_TLM_STALE_MS while the PID is closed.
+// The open-loop target is the characterized point (scaled by target/OL_RPM), but
+// never below the ~100 ms average throttle the closed loop was using when it lost
+// telemetry (heavy load / >30k target must not lose airflow). Hand-back to the PID needs
+// ESCPID_HANDBACK_N consecutive good, plausible packets. The PID itself only
+// runs on ticks with a good NEW packet (never integrates a frozen reading).
+// Reported to the host as err = ESCPID_ERROR_NO_TLM on every reply while active.
+#define ESCPID_ACQ_TIMEOUT_MS     500               // ms, start -> first fresh sample
+#define ESCPID_TLM_STALE_MS       100               // ms, closed loop -> no GOOD new packet
+                                                    //   (ESC answers ~every tick; 'pkt/s' on the
+                                                    //   USB debug line -- confirm on hardware)
+#define ESCPID_HANDBACK_N         10                // consecutive good packets to leave open loop
+#define ESCPID_HANDBACK_GAP_MS    20                // ...each within this of the previous one
+#define ESCPID_RPM_PLAUS_MAX      6500              // 10 rpm units (65k rpm). A packet outside
+                                                    //   [0, this] is implausible: never fed to the
+                                                    //   PID, breaks a hand-back run (CRC8 lets ~1/256
+                                                    //   garbage packets through)
+#ifndef ESCPID_OL_THROTTLE
+#define ESCPID_OL_THROTTLE        1400              // <<SET>> throttle (0..1999) for ~30k rpm
+                                                    //   under compressor load. 0 = unset: the
+                                                    //   fallback holds PID_MIN (reports only).
+#endif
+#define ESCPID_OL_RPM             30000             // rpm the OL throttle was characterized at. The
+                                                    //   OL throttle scales with target/OL_RPM (capped
+                                                    //   at 1): flight target 30k -> full OL point; a low
+                                                    //   bench target doesn't jump to 30k; target 0 ->
+                                                    //   PID_MIN.
+#define ESCPID_OL_RAMP_S          5.0f              // PID_MIN -> OL throttle ramp time (~5 s spin-up)
+#if ESCPID_OL_THROTTLE > ESCPID_PID_MAX
+  #error "ESCPID_OL_THROTTLE above ESCPID_PID_MAX"
+#endif
+#if ESCPID_OL_THROTTLE <= ESCPID_PID_MIN
+  #warning "ESCPID_OL_THROTTLE not set: telemetry-loss fallback holds PID_MIN (report only)"
+#endif
+
 #define ESCPID_ERROR_MAGIC        -1                // Magic number error code
+#define ESCPID_ERROR_NO_TLM       -11               // no fresh ESC telemetry: open-loop fallback active
+#define ESCPID_ERROR_EMULATION    -12               // ESC-emulation build (fake telemetry) -- bench only
 
 // Teensy->host communication data structure
 // sizeof(ESCPID_comm)=64 to match USB 1.0 buffer size

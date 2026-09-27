@@ -123,6 +123,27 @@ void AWPID_reset( void )  {
 }
 
 //
+//  AFC: bumpless hand-over. Start PID i from control value u as if it had been
+//  producing u in steady state (integral = u, no error / derivative history).
+//  Used when leaving the open-loop telemetry fallback (ESCPID S17).
+//
+void AWPID_preset( uint8_t i, float u )  {
+  if ( i >= AWPID_n )
+    return;
+  AWPID_u0[i]  = u;
+  AWPID_e0[i]  = 0.0;
+  AWPID_e1[i]  = 0.0;
+  AWPID_ui0[i] = u;
+  AWPID_ui1[i] = u;
+  AWPID_ud0[i] = 0.0;
+  AWPID_ud1[i] = 0.0;
+  #ifdef AWPID_FILTERED_MES
+  AWPID_me1[i]  = 0.0;
+  AWPID_minit[i] = 0;
+  #endif
+}
+
+//
 //  Computation of the ith control signal
 //
 void AWPID_control( uint8_t i,

@@ -14,6 +14,12 @@
 
 // ESC emulation
 //#define ESCCMD_ESC_EMULATION                              // Uncomment to activate ESC emulation
+// !!! An EMULATION build closes the PID on made-up rpm. NEVER connect a real ESC
+// !!! to it. The build warns at compile time, prints a USB banner, and reports
+// !!! err = -12 (ESCPID_ERROR_EMULATION) to the host so the dashboard shows it.
+#ifdef ESCCMD_ESC_EMULATION
+  #warning "ESCCMD_ESC_EMULATION: telemetry is FAKE -- bench only, never drive a real ESC"
+#endif
 #define ESCCMD_ESC_EMU_PKT_LOSS                             // Uncomment to emulate packet loss
 #define ESCCMD_ESC_FRACTION_PKTLOSS       300               // One out of x packets lost
 
@@ -39,6 +45,10 @@ uint8_t             ESCCMD_tlm[ESCCMD_MAX_ESC];             // Set to 1 when ask
 uint8_t             ESCCMD_tlm_pend[ESCCMD_MAX_ESC];        // Flag indicating a pending telemetry data request
 uint8_t             ESCCMD_tlm_valid[ESCCMD_MAX_ESC];       // Flag indicating the validity of telemetry data
 uint8_t             ESCCMD_tlm_lost_cnt[ESCCMD_MAX_ESC];    // Lost packet counter of telemetry data
+uint32_t            ESCCMD_tlm_rx_cnt[ESCCMD_MAX_ESC];      // AFC: good (CRC-valid) packets received, monotonic.
+                                                            //   ESCCMD_tlm_valid only describes the LAST packet and
+                                                            //   stays set if packets stop arriving; this count is the
+                                                            //   freshness signal (ESCPID S17).
 uint64_t            ESCCMD_tic_counter = 0;                 // Counts the number of clock iterations
 
 volatile uint16_t   ESCCMD_tic_pend = 0;                    // Number of timer tic waiting for ackowledgement
@@ -565,6 +575,26 @@ int ESCCMD_read_cmd( uint8_t i, uint16_t *cmd )  {
 //
 //  Read telemetry status of ESC number i
 //
+//
+//  AFC: number of good telemetry packets received so far on ESC i (wraps).
+//  Compare two readings to tell whether a NEW packet has arrived.
+//
+uint32_t ESCCMD_read_tlm_rx_cnt( uint8_t i )  {
+  if ( i >= ESCCMD_MAX_ESC ) return 0;
+  return ESCCMD_tlm_rx_cnt[i];
+}
+
+//
+//  AFC: true if this is an ESC-emulation build (fake telemetry).
+//
+bool ESCCMD_is_emulated( void )  {
+#ifdef ESCCMD_ESC_EMULATION
+  return true;
+#else
+  return false;
+#endif
+}
+
 int ESCCMD_read_tlm_status( uint8_t i )  {
   static uint8_t local_state;
 
@@ -880,6 +910,8 @@ int ESCCMD_extract_packet_data( uint8_t i )  {
   ESCCMD_tlm_rpm[i]     = ( ESCCMD_bufferTlm[i][7] << 8 ) | ESCCMD_bufferTlm[i][8];
   ESCCMD_tlm_valid[i]   = ( ESCCMD_bufferTlm[i][9] == ESCCMD_crc8( ESCCMD_bufferTlm[i], ESCCMD_TLM_LENGTH - 1 ) );
 
+  if ( ESCCMD_tlm_valid[i] ) ESCCMD_tlm_rx_cnt[i]++;   // AFC: freshness counter
+
   // If crc is invalid, increment crc error counter
   // and flush UART buffer
   if ( !ESCCMD_tlm_valid[i] ) {
@@ -895,10 +927,13 @@ int ESCCMD_extract_packet_data( uint8_t i )  {
     
     // Flush UART incoming buffer
     // If ESC is transmitting, need to wait for some byte(s) to come in
+    // AFC: bounded (was unbounded): continuous noise on the telemetry line
+    // must not stall the main loop and with it the DShot throttle refresh.
+    int flush_rounds = 0;
     do {
       while ( ESCCMD_serial[i]->available( ) ) ESCCMD_serial[i]->read( );
       delayMicroseconds( ESCCMD_TLM_BYTE_TIME * 2 );
-    } while ( ESCCMD_serial[i]->available( ) );
+    } while ( ESCCMD_serial[i]->available( ) && ++flush_rounds < 4 );
     
     // Reset pending packet counter
     ESCCMD_tlm_pend[i] = 0;

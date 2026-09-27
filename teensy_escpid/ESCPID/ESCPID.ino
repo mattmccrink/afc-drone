@@ -22,6 +22,17 @@ float     ESCPID_Target[ESCPID_NB_ESC] = {};      // host target, clamped [0, ES
 float     ESCPID_Reference[ESCPID_NB_ESC] = {};   // rate-limited reference fed to the PID
 bool      ESCPID_Running[ESCPID_NB_ESC] = {};     // start sequence begun since the last MOTOR_STOP
 bool      ESCPID_Fresh[ESCPID_NB_ESC] = {};       // a post-start telemetry sample has seeded the loop
+// S17 telemetry-loss fallback (see ESCPID.h)
+bool      ESCPID_OpenLoop[ESCPID_NB_ESC] = {};    // open-loop fallback active
+float     ESCPID_OLTarget[ESCPID_NB_ESC] = {};    // throttle the open-loop ramp heads for
+uint16_t  ESCPID_AcqTicks[ESCPID_NB_ESC] = {};    // live ticks spent waiting for a first fresh sample
+uint16_t  ESCPID_StaleTicks[ESCPID_NB_ESC] = {};  // closed-loop ticks since the last NEW packet
+uint32_t  ESCPID_LastRx[ESCPID_NB_ESC] = {};      // telemetry packet count at the previous tick
+uint16_t  ESCPID_GoodRun[ESCPID_NB_ESC] = {};     // consecutive good packets (open-loop hand-back)
+uint16_t  ESCPID_GapTicks[ESCPID_NB_ESC] = {};    // ticks since the last good packet
+uint32_t  ESCPID_PktCount[ESCPID_NB_ESC] = {};    // good packets, for the pkt/s debug field
+float     ESCPID_CtrlFilt[ESCPID_NB_ESC] = {};    // ~100 ms average of the closed-loop throttle
+float     ESCPID_OLHold[ESCPID_NB_ESC] = {};      // open-loop floor captured at entry
 float     ESCPID_Measurement[ESCPID_NB_ESC] = {};
 float     ESCPID_Control[ESCPID_NB_ESC] = {};
 uint16_t  ESCPID_comm_wd = 0;
@@ -144,6 +155,16 @@ int ESCPID_comm_update( void ) {
         ESCCMD_read_volt( i, &ESCPID_comm.volt[i] );
         ESCCMD_read_amp( i, &ESCPID_comm.amp[i] );
         ESCCMD_read_rpm( i, &ESCPID_comm.rpm[i] );
+
+        // S17 / emulation: STATE codes, repeated on every reply while true (the
+        // ESCCMD error above is only "last event since the previous reply").
+        // A DShot output error (-1) or ESC over-temperature (-8) still wins.
+        int8_t e = ESCPID_comm.err[i];
+        bool urgent = ( e == ESCCMD_ERROR_DSHOT || e == ESCCMD_ERROR_TLM_TEMP );
+        if ( ESCPID_OpenLoop[i] && !urgent )
+          ESCPID_comm.err[i] = ESCPID_ERROR_NO_TLM;
+        else if ( ESCCMD_is_emulated( ) && !urgent )   // emulated packet loss is not news
+          ESCPID_comm.err[i] = ESCPID_ERROR_EMULATION;
       }
       
       // Send data structure to host
@@ -163,6 +184,8 @@ void setup() {
 
   // Initialize USB serial link
   Serial.begin( ESCPID_USB_UART_SPEED );
+  if ( ESCCMD_is_emulated( ) )
+    Serial.println( "*** ESC EMULATION BUILD: telemetry is FAKE -- never connect a real ESC ***" );
   Serial3.addMemoryForRead(serial3_rx_buf, sizeof(serial3_rx_buf));
   Serial3.begin(921600);
   
@@ -235,9 +258,26 @@ static void ESCPID_restart_bookkeeping( int i ) {
   ESCPID_Fresh[i]     = false;
   ESCPID_Reference[i] = 0.0f;
   ESCPID_Control[i]   = ESCPID_Min[i];   // never re-send a stale high throttle
+  ESCPID_OpenLoop[i]  = false;
+  ESCPID_AcqTicks[i]  = 0;
+  ESCPID_StaleTicks[i]= 0;
+  ESCPID_LastRx[i]    = ESCCMD_read_tlm_rx_cnt( i );
+  ESCPID_GoodRun[i]   = 0;
+  ESCPID_GapTicks[i]  = 0;
+  ESCPID_CtrlFilt[i]  = ESCPID_Min[i];
+  ESCPID_OLHold[i]    = ESCPID_Min[i];
 }
 
-// Returns true once the loop has a fresh measurement and may run the PID.
+// A telemetry sample is usable only if it is valid AND physically plausible
+// (CRC8 lets ~1 in 256 garbage packets through; rpm is read as int16).
+static bool ESCPID_sample_ok( int i, int16_t *rpm ) {
+  if ( ESCCMD_read_tlm_status( i ) != 0 ) return false;
+  if ( ESCCMD_read_rpm( i, rpm ) != 0 )   return false;
+  return ( *rpm >= 0 && *rpm <= ESCPID_RPM_PLAUS_MAX );
+}
+
+// Advance the rate-limited reference. Returns true once the loop is seeded.
+// Seeding (from a measured rpm) is done by the caller via ESCPID_seed().
 static bool ESCPID_shape_reference( int i ) {
   const float step = ( ESCPID_REF_RATE_RPM_S / 10.0f ) * ( ESCCMD_TIMER_PERIOD * 1e-6f );
 
@@ -246,25 +286,24 @@ static bool ESCPID_shape_reference( int i ) {
     ESCPID_Fresh[i]   = false;
     ESCPID_Control[i] = ESCPID_Min[i];
   }
-
-  if ( !ESCPID_Fresh[i] ) {
-    int16_t rpm;
-    if ( ESCCMD_read_tlm_status( i ) == 0 && ESCCMD_read_rpm( i, &rpm ) == 0 ) {
-      float seed = ( rpm > 0 ) ? (float)rpm : 0.0f;          // 10 rpm units
-      if ( seed > ESCPID_Target[i] ) seed = ESCPID_Target[i];
-      ESCPID_Reference[i] = seed;
-      ESCPID_comm.rpm[i]  = rpm;           // PID measurement = this fresh sample
-      ESCPID_Fresh[i]     = true;
-    } else {
-      return false;                        // still acquiring: throttle stays at PID_MIN
-    }
-  }
+  if ( !ESCPID_Fresh[i] ) return false;   // still acquiring: throttle stays put
 
   float d = ESCPID_Target[i] - ESCPID_Reference[i];
   if ( d >  step ) d =  step;
   if ( d < -step ) d = -step;
   ESCPID_Reference[i] += d;
   return true;
+}
+
+// Seed the reference from a measured rpm (10 rpm units). NOT clamped to the
+// target: a rotor already above target (coasting, or open loop on a light load)
+// is walked down by the rate limit instead of stepped -- no throttle dip.
+static void ESCPID_seed( int i, int16_t rpm ) {
+  float seed = ( rpm > 0 ) ? (float)rpm : 0.0f;
+  if ( seed > ESCPID_REF_MAX ) seed = ESCPID_REF_MAX;
+  ESCPID_Reference[i] = seed;
+  ESCPID_comm.rpm[i]  = rpm;               // PID measurement = this fresh sample
+  ESCPID_Fresh[i]     = true;
 }
 
 #if ESCPID_USB_DEBUG
@@ -285,11 +324,16 @@ static void ESCPID_debug_print( void ) {
   ESCCMD_read_cmd( 0, &cmd );
   ESCCMD_read_rpm( 0, &rpm );
   ESCCMD_read_deg( 0, &deg );
-  Serial.printf( "tgt=%ld ref=%ld rpm=%ld cmd=%u wd=%s err=%d deg=%u\n",
+  static uint32_t last_pkts = 0;
+  uint32_t pps = ( ESCPID_PktCount[0] - last_pkts ) * 10;   // 10 Hz line -> packets/s
+  last_pkts = ESCPID_PktCount[0];
+  Serial.printf( "tgt=%ld ref=%ld rpm=%ld cmd=%u wd=%s err=%d deg=%u pkt/s=%lu%s%s\n",
                  (long)( ESCPID_Target[0] * 10 ), (long)( ESCPID_Reference[0] * 10 ),
                  (long)rpm * 10, cmd,
                  ( ESCPID_comm_wd < ESCPID_COMM_WD_LEVEL ) ? "live" : "STALE",
-                 err, deg );
+                 err, deg, (unsigned long)pps,
+                 ESCPID_OpenLoop[0] ? " OPENLOOP" : "",
+                 ESCCMD_is_emulated( ) ? " EMU" : "" );
 }
 #endif
 
@@ -313,17 +357,113 @@ void loop( ) {
     for ( i = 0; i < ESCPID_NB_ESC; i++ ) {
 
       if ( live ) {
+        const uint16_t acq_ticks   = (uint16_t)( ESCPID_ACQ_TIMEOUT_MS  * 1000UL / ESCCMD_TIMER_PERIOD );
+        const uint16_t stale_ticks = (uint16_t)( ESCPID_TLM_STALE_MS    * 1000UL / ESCCMD_TIMER_PERIOD );
+        const uint16_t gap_ticks   = (uint16_t)( ESCPID_HANDBACK_GAP_MS * 1000UL / ESCCMD_TIMER_PERIOD );
+
         // Sequence the start and advance the rate-limited reference
         bool seeded = ESCPID_shape_reference( i );
 
-        // Compute control signal only with a fresh-since-start, valid sample.
-        // In case of invalid telemetry, last control signal is sent.
-        if ( seeded && !ESCCMD_read_tlm_status( i ) ) {
-          ESCPID_Measurement[i] = ESCPID_comm.rpm[i];
+        // ---- S17: telemetry freshness ----
+        // A GOOD packet = arrived since the last tick (the packet counter moved;
+        // ESCCMD's 'valid' flag alone stays set after packets stop), CRC-valid
+        // and plausible. Only good packets refresh anything.
+        uint32_t rx  = ESCCMD_read_tlm_rx_cnt( i );
+        int16_t  rpm = 0;
+        bool good = ( rx != ESCPID_LastRx[i] ) && ESCPID_sample_ok( i, &rpm );
+        bool bad  = ( rx != ESCPID_LastRx[i] ) && !good;   // arrived but unusable
+        ESCPID_LastRx[i] = rx;
+        if ( good ) { ESCPID_GapTicks[i] = 0; ESCPID_PktCount[i]++; }
+        else if ( ESCPID_GapTicks[i] < 0xFFFF ) ESCPID_GapTicks[i]++;
+        if ( bad || ESCPID_GapTicks[i] > gap_ticks ) ESCPID_GoodRun[i] = 0;
+        else if ( good && ESCPID_GoodRun[i] < 0xFFFF ) ESCPID_GoodRun[i]++;
+
+        // Open-loop point for THIS target: the characterized throttle scaled by
+        // target / OL_RPM (<= 1), floored at PID_MIN. Unset -> 0 here.
+        float ol_pt = 0.0f;
+        if ( ESCPID_OL_THROTTLE > ESCPID_PID_MIN ) {
+          float frac = ( ESCPID_Target[i] * 10.0f ) / (float)ESCPID_OL_RPM;
+          if ( frac > 1.0f ) frac = 1.0f;
+          if ( frac < 0.0f ) frac = 0.0f;
+          ol_pt = ESCPID_Min[i] + frac * ( (float)ESCPID_OL_THROTTLE - ESCPID_Min[i] );
+        }
+
+        if ( ESCPID_OpenLoop[i] ) {
+          // Head for the (scaled) OL point, but never below what the closed loop
+          // was averaging when it lost telemetry (fail toward airflow: a heavy
+          // load or a >30k target needed more than the calibration point).
+          ESCPID_OLTarget[i] = ( ol_pt > ESCPID_OLHold[i] ) ? ol_pt : ESCPID_OLHold[i];
+          // Hand back only after a run of consecutive good, plausible packets.
+          if ( good && ESCPID_GoodRun[i] >= ESCPID_HANDBACK_N ) {
+            ESCPID_seed( i, rpm );                       // from the latest good sample
+            AWPID_preset( i, ESCPID_Control[i] );        // bumpless
+            ESCPID_CtrlFilt[i] = ESCPID_Control[i];
+            ESCPID_OpenLoop[i]   = false;
+            ESCPID_AcqTicks[i]   = 0;
+            ESCPID_StaleTicks[i] = 0;
+            seeded = true;
+          }
+        }
+        else if ( !seeded ) {
+          // Acquiring after a (re)start: the first good packet seeds the loop.
+          if ( good ) {
+            ESCPID_seed( i, rpm );
+            ESCPID_AcqTicks[i] = 0;
+            seeded = true;
+          } else {
+            if ( ESCPID_AcqTicks[i] < 0xFFFF ) ESCPID_AcqTicks[i]++;
+            if ( ESCPID_AcqTicks[i] >= acq_ticks ) {
+              ESCPID_OpenLoop[i] = true;
+              ESCPID_OLHold[i]   = ESCPID_Control[i];            // no closed-loop history: PID_MIN
+              ESCPID_OLTarget[i] = ( ol_pt > ESCPID_OLHold[i] ) ? ol_pt : ESCPID_OLHold[i];
+              ESCPID_GoodRun[i]  = 0;
+            }
+          }
+        }
+        else {
+          // Closed loop: trip to open loop after STALE_MS without a good packet.
+          if ( good )                              ESCPID_StaleTicks[i] = 0;
+          else if ( ESCPID_StaleTicks[i] < 0xFFFF ) ESCPID_StaleTicks[i]++;
+          if ( ESCPID_StaleTicks[i] >= stale_ticks ) {
+            ESCPID_OpenLoop[i] = true;
+            // Floor = the ~100 ms AVERAGE throttle, not the last value: a single
+            // in-range garbage packet just before the wire died can't set it.
+            ESCPID_OLHold[i]   = ESCPID_CtrlFilt[i];
+            ESCPID_OLTarget[i] = ( ol_pt > ESCPID_OLHold[i] ) ? ol_pt : ESCPID_OLHold[i];
+            ESCPID_Fresh[i]    = false;
+            ESCPID_GoodRun[i]  = 0;
+            seeded = false;
+          }
+        }
+
+        if ( ESCPID_OpenLoop[i] ) {
+          // Rate-limited ramp toward the open-loop point (PID_MIN -> OL in ~OL_RAMP_S).
+          float span = (float)ESCPID_OL_THROTTLE - ESCPID_Min[i];
+          float step = ( span > 1.0f ? span : 1.0f ) * ( ESCCMD_TIMER_PERIOD * 1e-6f ) / ESCPID_OL_RAMP_S;
+          float d = ESCPID_OLTarget[i] - ESCPID_Control[i];
+          if ( d >  step ) d =  step;
+          if ( d < -step ) d = -step;
+          ESCPID_Control[i] += d;
+          if ( ESCPID_Control[i] < ESCPID_Min[i] ) ESCPID_Control[i] = ESCPID_Min[i];
+          if ( ESCPID_Control[i] > ESCPID_Max[i] ) ESCPID_Control[i] = ESCPID_Max[i];
+        }
+        // Closed loop: run the PID ONLY on a tick with a good new sample, so a
+        // frozen reading is never integrated. Between samples the last control
+        // signal is sent.
+        else if ( seeded && good ) {
+          ESCPID_comm.rpm[i]    = rpm;
+          ESCPID_Measurement[i] = rpm;
           AWPID_control(  i,
                           ESCPID_Reference[i],
                           ESCPID_Measurement[i],
                           &ESCPID_Control[i] );
+        }
+        // ~100 ms average of the closed-loop throttle, sampled only on ticks with
+        // a good packet: a held spike between packets (or after the wire dies)
+        // counts once, not for the whole stale window.
+        if ( !ESCPID_OpenLoop[i] && seeded && good ) {
+          const float a = ( ESCCMD_TIMER_PERIOD * 1e-6f ) / 0.1f;
+          ESCPID_CtrlFilt[i] += a * ( ESCPID_Control[i] - ESCPID_CtrlFilt[i] );
         }
 
         // Send control signal (forward only; ESCPID_PID_MIN..MAX)

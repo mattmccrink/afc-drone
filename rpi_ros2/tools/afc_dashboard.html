@@ -69,6 +69,14 @@
   Consider engaging surfaces / reducing demand / landing.
   <span id="thermDetail"></span>
 </div>
+<div class="banner" id="noTlmBanner">
+  NO ESC TELEMETRY &mdash; compressor commanded OPEN LOOP toward the 30k throttle point.
+  Actual rotor speed UNKNOWN; rpm / temp / current shown are the last good values and the
+  thermal flag is blind. Telemetry wire or ESC fault.
+</div>
+<div class="banner" id="emuBanner">
+  ESC EMULATION BUILD ON THE TEENSY &mdash; telemetry is FAKE. Bench only: reflash before connecting a real ESC.
+</div>
 
 <div class="grid">
   <!-- LEFT: command charts -->
@@ -303,6 +311,8 @@ setInterval(()=>{
   if(lastCompT && now-lastCompT>1500){
     const tp=document.getElementById("thermPill"); tp.textContent="ESC stale"; tp.className="pill warn";
     document.getElementById("thermBanner").classList.remove("on");
+    document.getElementById("noTlmBanner").classList.remove("on");
+    document.getElementById("emuBanner").classList.remove("on");
   }
   if(lastCtrlT && now-lastCtrlT>1500){
     for(const id of ["surfPill","armPill","srcPill"]){
@@ -310,6 +320,7 @@ setInterval(()=>{
     }
   }
 },500);
+let lastNoTlmT=-1e9;
 function onComp(m){
   lastCompT=performance.now();
   document.getElementById("cRpm").textContent = m.rpm;
@@ -319,7 +330,14 @@ function onComp(m){
   t.className = m.temp_c>=CFG.escTempBad?"pill bad":m.temp_c>=CFG.escTempWarn?"pill warn":"";
   document.getElementById("cVA").textContent = m.volt.toFixed(2)+" V / "+m.amp.toFixed(2)+" A";
   document.getElementById("cTlm").innerHTML = pill(m.tlm_ok)+" err="+m.err
-    +(m.err===-8?' <span class="pill bad">ESC >=100C</span>':"");
+    +(m.err===-8?' <span class="pill bad">ESC >=100C</span>':"")
+    +(m.err===-11?' <span class="pill bad">NO TLM: OPEN LOOP</span>':"")
+    +(m.err===-12?' <span class="pill bad">EMULATED ESC</span>':"");
+  // Teensy STATE codes (repeated every reply while true): -11 open-loop fallback, -12 emulation build
+  // -1/-8 outrank -11 for a reply; keep the banner up across that one frame.
+  if(m.err===-11) lastNoTlmT=performance.now();
+  document.getElementById("noTlmBanner").classList.toggle("on", performance.now()-lastNoTlmT<1000);
+  document.getElementById("emuBanner").classList.toggle("on", m.err===-12);
   const th=!!m.thermal_suspect;
   const tp=document.getElementById("thermPill");
   tp.textContent = th ? "ESC THERMAL" : "ESC ok";
