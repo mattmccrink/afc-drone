@@ -269,7 +269,7 @@ void sensors_tick(uint32_t tick) {
   }
 
   // ---- 3) assemble + publish per-valve frame (every tick; holds between updates) ----
-  SensorFrame& out = g_sensor_pub.begin_write();
+  SensorFrame out{};   // built locally; published below in one short copy (types.h)
   float total = 0.0f; uint8_t nvalid = 0;
 
   for (int v = 0; v < VALVE_COUNT; ++v) {
@@ -325,7 +325,7 @@ void sensors_tick(uint32_t tick) {
   out.mdot_total = total;
   out.n_valid    = nvalid;
   for (int s = 0; s < SERVO_COUNT; ++s) out.servo_us[s] = g_servo_us_echo[s];
-  g_sensor_pub.end_write();
+  g_sensor_pub.publish(out);
 
   // ---- 4) if nothing is in flight, kick the next conversion (broadcast) ----
   if (!s_conv_pending) {

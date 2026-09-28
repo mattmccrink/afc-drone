@@ -149,6 +149,22 @@ struct CalBlob {
 };
 
 // -----------------------------------------------------------------------------
+//  age_ms -- age of a millis() stamp, safe against stamps "from the future".
+//
+//  loop() reads `now` once at the top; some producers stamp with their own later
+//  millis() read (framing on_frame, SBUS decode, Teensy reply decode). When the
+//  millisecond ticks between the two reads, the stamp is 1 ms AHEAD of `now` and
+//  the plain unsigned (now - stamp) wraps to ~4.29e9: a fresh input judged
+//  stale for that pass (2026-09-28 bench: TEENSY_LINK blips; SBUS freshness /
+//  receiver-loss watchdog glitching the active source SBUS->SAFE for a frame).
+//  Returns 0 for a stamp at or after `now`. Valid for real ages < ~24.8 days.
+// -----------------------------------------------------------------------------
+static inline uint32_t age_ms(uint32_t now, uint32_t stamp) {
+  int32_t d = (int32_t)(now - stamp);
+  return d > 0 ? (uint32_t)d : 0u;
+}
+
+// -----------------------------------------------------------------------------
 //  SpscPublisher -- single-writer / single-reader lock-free publish.
 //
 //  Realized as a *seqlock* rather than a 2-buffer index flip: a plain double
@@ -159,10 +175,20 @@ struct CalBlob {
 //  monotonic `seq`). Writer bumps seq odd, writes, bumps seq even; reader
 //  retries if it observes an odd or changed seq.
 //
-//  Correct here because writer (core 1, 100 Hz) holds the odd window for only a
-//  few microseconds while the reader (core 0) copies out -- collisions are rare
-//  and bounded; on the (practically never) exhausted-retry case the reader keeps
-//  its last-good copy and flags stale.
+//  The odd window must stay SHORT: the writer builds the frame in a local and
+//  calls publish(), which holds the window only for one struct copy (~1 us).
+//  (2026-09-28: the writers used to compute the whole frame -- six venturis,
+//  density, sqrt, health gating -- inside begin_write()/end_write(). Core 0 polls
+//  every loop pass, so it landed in that window often, exhausted its retries in
+//  well under a microsecond, and every caller treated the miss as "sensors
+//  stale": one-pass VENT_LOST|SENSOR_STALE blips that held the air annunciator
+//  up, zeroed SENSOR_TLM frames to the Pi, and reset the flow-trust debounce.)
+//
+//  Readers use read_latest(): a contended read returns the last good copy
+//  instead of failing, so a collision is invisible. Staleness is judged ONLY by
+//  `seq` not advancing (writer dead / hung), never by one missed read.
+//  read_latest() keeps reader-side state: call it only from the reading core
+//  (core 0 for g_sensor_pub).
 // -----------------------------------------------------------------------------
 template <typename T>
 class SpscPublisher {
@@ -171,15 +197,17 @@ public:
   T data;
 
   // ---- writer side (call from exactly one core) ----
-  T& begin_write() { seq++; __sync_synchronize(); return data; }
-  void end_write() { __sync_synchronize(); seq++; }
+  // publish(): the only writer entry point -- odd window = one struct copy.
+  void publish(const T& v) { seq++; __sync_synchronize(); data = v; __sync_synchronize(); seq++; }
 
   // ---- reader side (call from exactly one core) ----
-  // Returns true and fills `out` with a clean snapshot; false if it could not
-  // obtain one within the retry budget (writer contention -- effectively never).
+  // Returns true and fills `out` with a clean snapshot; false if nothing has been
+  // published yet, or no clean copy within the retry budget (writer contention).
   bool snapshot(T& out) {
-    for (int tries = 0; tries < 8; ++tries) {
+    for (int tries = 0; tries < 64; ++tries) {
       uint32_t s0 = seq; __sync_synchronize();
+      if (s0 == 0) return false;             // never published (after a 2^32 wrap this
+                                             //   hides one frame; read_latest serves the cache)
       if (s0 & 1u) continue;                 // writer mid-update
       out = data; __sync_synchronize();
       uint32_t s1 = seq;
@@ -189,4 +217,19 @@ public:
   }
 
   uint32_t sequence() const { return seq; }  // for non-advancing == stale checks
+
+  // read_latest(): the newest clean snapshot, or -- if this read collided with
+  // the writer -- the last good one. Returns false only before the first frame.
+  // *fresh (optional) = this call got a new clean snapshot (for contention stats).
+  bool read_latest(T& out, bool* fresh = nullptr) {
+    bool ok = snapshot(out);
+    if (ok) { last_ = out; have_ = true; }
+    else if (have_) out = last_;
+    if (fresh) *fresh = ok;
+    return have_;
+  }
+
+private:
+  T    last_{};            // reader-side cache (core 0 only)
+  bool have_ = false;
 };

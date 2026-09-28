@@ -101,12 +101,13 @@ void compressor_update(uint32_t now) {
   if (dt <= 0.0f || dt > 0.2f) dt = 0.01f;   // guard first call / stalls
 
   // ---- read the latest sensor frame ----
+  // A read that collides with core 1's publish returns the last good frame
+  // (read_latest); "stale" means ONLY that core 1 stopped publishing.
   SensorFrame fr;
-  bool got = g_sensor_pub.snapshot(fr);
+  bool got = g_sensor_pub.read_latest(fr);             // false only before the first frame
   uint32_t seq = g_sensor_pub.sequence();
   if (seq != comp_last_seq) { comp_last_seq = seq; comp_last_seq_ms = now; }
-  bool sensor_stale = (now - comp_last_seq_ms) > 50;   // >5 missed ticks
-  if (!got) sensor_stale = true;
+  bool sensor_stale = !got || (now - comp_last_seq_ms) > 50;   // >5 missed ticks
 
   float mdot_total = got ? fr.mdot_total : 0.0f;
   uint8_t n_valid  = got ? fr.n_valid   : 0;

@@ -191,7 +191,7 @@ void servos_service(uint32_t tick) {
   if (g_valve_pub.snapshot(cmd)) { s_last = cmd; s_have = true; }  // refresh only on a clean read
   // else: transient miss -> keep s_last (its stamp still measures core-0 liveness)
 
-  bool stale = !s_have || (millis() - s_last.stamp_ms) > CMD_TIMEOUT_MS;
+  bool stale = !s_have || age_ms(millis(), s_last.stamp_ms) > CMD_TIMEOUT_MS;
 
   if (stale) {
     // Boot or core-0 stall: defined-safe valve pose (through the curve fit),

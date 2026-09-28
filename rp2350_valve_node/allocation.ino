@@ -185,7 +185,5 @@ void allocation_update(uint32_t now) {
 
   // Publish in one short odd-seq window (single struct copy), so core 1's
   // snapshot() almost never catches the buffer mid-write -> no servo neutral-bounce.
-  ValveCmd& dst = g_valve_pub.begin_write();
-  dst = out;
-  g_valve_pub.end_write();
+  g_valve_pub.publish(out);
 }

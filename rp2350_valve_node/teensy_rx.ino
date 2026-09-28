@@ -67,7 +67,7 @@ void teensy_rx_service(uint32_t now) {
     }
   }
 
-  if (g_comp.ok && (now - g_comp.tlm_ms) > TEENSY_TLM_STALE_MS)
+  if (g_comp.ok && age_ms(now, g_comp.tlm_ms) > TEENSY_TLM_STALE_MS)   // tlm_ms can be > now
     g_comp.ok = false;               // link/telemetry dropped
 }
 

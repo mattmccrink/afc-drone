@@ -128,8 +128,9 @@ void tlm_service(uint32_t now) {
   if ((now - last) < (uint32_t)(1000 / (PI_TLM_EACH_HZ * 2))) return;   // ~20 ms -> 50/s total
   last = now;
 
-  SensorFrame fr; bool got = g_sensor_pub.snapshot(fr);
-  if (!got) g_tlm_dropped++;              // contended cross-core SensorFrame read
+  SensorFrame fr; bool fresh = false;
+  bool got = g_sensor_pub.read_latest(fr, &fresh);   // collision -> last good frame, not zeros
+  if (!fresh) g_tlm_dropped++;            // contended cross-core read (served from the cache)
 
   uint8_t pl[128]; int i;
   if (which == 0) {

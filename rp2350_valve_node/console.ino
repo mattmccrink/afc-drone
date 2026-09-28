@@ -288,7 +288,7 @@ static void dispatch(char* line) {
   else if (eq(tok[0], "mdot") && n >= 2) { g_status.mdot_target = atof(tok[1]); Serial.printf("[mdot] target=%.1f\n",(double)g_status.mdot_target); }
   else if (eq(tok[0], "sens")) {
     SensorFrame fr;
-    if (!g_sensor_pub.snapshot(fr)) { Serial.println(F("[sens] no frame")); return; }
+    if (!g_sensor_pub.read_latest(fr)) { Serial.println(F("[sens] no frame")); return; }
     for (int v = 0; v < VALVE_COUNT; ++v) {
       //if (fr.p_up[v] <= 0.0f && fr.p_lo[v] <= 0.0f) continue;   // skip unpopulated valves
       float dpraw  = fr.p_up[v] - fr.p_lo[v];
@@ -315,7 +315,7 @@ static void dispatch(char* line) {
       return;
     }
     SensorFrame fr;
-    if (!g_sensor_pub.snapshot(fr)) { Serial.println(F("[zero] no sensor frame")); return; }
+    if (!g_sensor_pub.read_latest(fr)) { Serial.println(F("[zero] no sensor frame")); return; }
     int n = 0;
     for (int v = 0; v < VALVE_COUNT; ++v) {
       // Only from a venturi whose sensors are healthy: an offset captured from a
@@ -387,7 +387,7 @@ void console_service(uint32_t now) {
     if ((now - last_ps) >= 500) {
       last_ps = now;
       SensorFrame fr;
-      if (g_sensor_pub.snapshot(fr)) {
+      if (g_sensor_pub.read_latest(fr)) {
         Serial.print("!A");
         for (int v = 0; v < VALVE_COUNT; ++v)
           Serial.printf(",%.3f,%.3f", (double)fr.p_up[v], (double)fr.p_lo[v]);

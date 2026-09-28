@@ -91,7 +91,7 @@ void sensors_tick(uint32_t tick) {
   }
 
   // ---- 2) compute mass flow + validity, build the frame ----
-  SensorFrame& out = g_sensor_pub.begin_write();
+  SensorFrame out{};   // built locally; published below in one short copy (types.h)
   float total = 0.0f;
   uint8_t nvalid = 0;
 
@@ -132,7 +132,7 @@ void sensors_tick(uint32_t tick) {
   out.mdot_total = total;      // summed over VALID valves only
   out.n_valid    = nvalid;
   for (int s = 0; s < SERVO_COUNT; ++s) out.servo_us[s] = g_servo_us_echo[s]; // telemetry echo
-  g_sensor_pub.end_write();
+  g_sensor_pub.publish(out);
 
   // ---- 3) kick the NEXT conversion (D1 every tick, D2 every ~16 ticks) ----
   int type = ((tick % D2_CADENCE_TICKS) == 0) ? KICK_D2 : KICK_D1;

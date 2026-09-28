@@ -28,6 +28,8 @@ static bool     arb_forced        = false;    // console 'src' override active?
 static Source   arb_forced_src    = SRC_SAFE;
 static uint32_t arb_primary_fresh_since = 0;
 static uint32_t arb_primary_stale_since = 0;
+static uint32_t arb_sbus_ok_ms          = 0;      // last pass SBUS was clean + fresh
+static bool     arb_sbus_seen_ok        = false;
 
 // ---- arm enforcement state ----
 static uint32_t arb_last_arm_counter = 0;
@@ -77,10 +79,21 @@ void arbitration_update(uint32_t now) {
   // termination while the command link is alive ("follow the intent of the
   // available links"): with no SBUS, PRIMARY holds its state.
   bool primary_fresh = g_primary_in.valid &&
-                       (now - g_primary_in.stamp_ms) < USB_CMD_TIMEOUT_MS;
+                       age_ms(now, g_primary_in.stamp_ms) < USB_CMD_TIMEOUT_MS;   // stamps can be > now
   bool token_ok      = !arb_token_seen || token_live;
   bool sbus_ok = g_sbus_in.valid && !g_sbus_failsafe && !g_sbus_framelost &&
-                 (now - g_sbus_in.stamp_ms) < USB_CMD_TIMEOUT_MS;
+                 age_ms(now, g_sbus_in.stamp_ms) < USB_CMD_TIMEOUT_MS;
+  // SBUS "usable" = clean now, or clean within SBUS_LOSS_HOLD_MS. The receiver
+  // sets frame-lost on individual missed RF packets; without this hold one lost
+  // packet dropped the active source SBUS -> SAFE for a frame (safe valve pose,
+  // surfaces off; 2026-09-28 bench). Allocation keeps flying the last CLEAN
+  // sticks through the hold (g_sbus_in is only refreshed on clean frames). The
+  // receiver's own FAILSAFE is already a sustained-loss verdict: no extra hold.
+  // Entering SBUS (from SAFE, or the dead-token handoff) still needs sbus_ok.
+  if (sbus_ok) { arb_sbus_ok_ms = now; arb_sbus_seen_ok = true; }
+  bool sbus_usable = sbus_ok ||
+                     (arb_sbus_seen_ok && !g_sbus_failsafe &&
+                      age_ms(now, arb_sbus_ok_ms) < SBUS_LOSS_HOLD_MS);
 
   // Track how long PRIMARY has been continuously fresh / stale (for hysteresis).
   if (primary_fresh) {
@@ -103,7 +116,7 @@ void arbitration_update(uint32_t now) {
         // Leave PRIMARY only after it has been stale long enough (debounce).
         if (!primary_fresh &&
             arb_primary_stale_since && (now - arb_primary_stale_since) >= PRIMARY_TO_SBUS_HOLD_MS) {
-          next = sbus_ok ? SRC_SBUS : SRC_SAFE;
+          next = sbus_usable ? SRC_SBUS : SRC_SAFE;
         } else if (!token_ok && sbus_ok) {
           next = SRC_SBUS;          // FC token dead, pilot available: pilot governs
         }
@@ -115,7 +128,7 @@ void arbitration_update(uint32_t now) {
         if (primary_fresh && token_ok &&
             arb_primary_fresh_since && (now - arb_primary_fresh_since) >= SBUS_TO_PRIMARY_HOLD_MS) {
           next = SRC_PRIMARY;
-        } else if (!sbus_ok) {
+        } else if (!sbus_usable) {                         // debounced (SBUS_LOSS_HOLD_MS)
           next = primary_fresh ? SRC_PRIMARY : SRC_SAFE;   // CMD still alive: hold on PRIMARY
         }
         break;

@@ -215,7 +215,7 @@ void sbus_real_update(uint32_t now) {
 
     // Receiver-loss watchdog: no clean frame recently -> declare frame-lost so
     // arbitration reverts away from SBUS (fail toward the safe source).
-    if ((now - s_last_good_ms) > SBUS_LOST_TIMEOUT_MS) {
+    if (age_ms(now, s_last_good_ms) > SBUS_LOST_TIMEOUT_MS) {   // stamp can be > now
         g_sbus_framelost = true;
         g_sbus_in.valid  = false;
     }

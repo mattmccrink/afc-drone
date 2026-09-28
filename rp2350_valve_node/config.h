@@ -211,6 +211,10 @@
 #define USB_CMD_TIMEOUT_MS       80   // PRIMARY considered fresh below this age
 #define PRIMARY_TO_SBUS_HOLD_MS 150   // hysteresis: USB must be stale this long
 #define SBUS_TO_PRIMARY_HOLD_MS 200   // ...and fresh this long before switching back
+#define SBUS_LOSS_HOLD_MS       100   // SBUS must be unusable this long before arbitration
+                                      //   treats it as gone (receiver per-frame frame-lost bit /
+                                      //   single missed packets hold the last clean sticks).
+                                      //   Receiver FAILSAFE bypasses the hold (sustained loss).
 
 #define ARM_HEARTBEAT_MS       1000   // expected arm-token cadence (1 Hz)
 #define ARM_LOSS_TIMEOUT_MS   10000   // FC-token liveness window (reversion, not disarm)
