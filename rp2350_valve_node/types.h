@@ -107,7 +107,9 @@ struct NodeStatus {
   bool     surf_active     = false;      // surfaces actually allocated (switch && live source && !term)
   bool     comp_thermal    = false;      // ESC thermal-derate suspected (advisory)
   uint8_t  air_sev         = 0;          // air-delivery severity (AirSev, air_state.h), debounced
-  uint8_t  air_causes      = 0;          // AIR_C_* bits behind it (instantaneous)
+  uint8_t  air_causes      = 0;          // AIR_C_* bits behind the level on display (held; CTRL_TLM byte 55)
+  uint8_t  air_causes_now  = 0;          // AIR_C_* bits this instant (console 'air' only)
+  uint32_t air_held_ms     = 0;          // millis() of the last evaluation supporting air_sev
 };
 
 // Measured compressor telemetry, latched from the Motor Teensy's ESCPID_comm.

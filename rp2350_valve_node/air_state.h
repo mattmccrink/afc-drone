@@ -30,7 +30,7 @@
 
 enum AirSev : uint8_t { AIR_OK = 0, AIR_ADVISORY = 1, AIR_CAUTION = 2, AIR_WARNING = 3 };
 
-// Cause bits (CTRL_TLM byte 55, /afc/ctrl_tlm.air_causes)
+// Cause bits (CTRL_TLM byte 55, /afc/ctrl_tlm.air_causes -- the HELD causes, see air_debounce)
 #define AIR_C_TLM_LOST      0x01   // Teensy reports no ESC telemetry (err -11, open loop)
 #define AIR_C_TLM_EMU       0x02   // Teensy is an ESC-emulation build (err -12): rpm is fake
 #define AIR_C_VENT_PARTIAL  0x04   // some venturis invalid
@@ -90,13 +90,28 @@ inline uint8_t air_eval(const AirInputs& in, uint8_t* causes_out) {
 }
 
 // Debounce: a new level must persist AIR_RAISE_MS to raise, AIR_FALL_MS to lower.
-struct AirDebounce { uint8_t out = AIR_OK, cand = AIR_OK; uint32_t since = 0; };
+//
+// `held` = the causes of the most recent evaluation that supported the level on
+// display (cand >= out); cleared when the display returns to OK. The fall delay
+// means a level stays lit while its fault recurs at least once per AIR_FALL_MS,
+// even if the fault is absent at any given instant (an intermittent blip re-arms
+// the timer). Reporting `held` rather than the instantaneous causes means a lit
+// annunciator / QGC alert always carries the reason it is lit. held_ms = when
+// that supporting evaluation happened (for 'last seen N ms ago').
+struct AirDebounce {
+  uint8_t  out = AIR_OK, cand = AIR_OK; uint32_t since = 0;
+  uint8_t  held = 0;                    uint32_t held_ms = 0;
+};
 
-inline uint8_t air_debounce(AirDebounce& d, uint8_t cand, uint32_t now) {
-  if (cand == d.out) { d.cand = cand; d.since = now; return d.out; }
-  if (cand != d.cand) { d.cand = cand; d.since = now; return d.out; }
-  uint32_t need = (cand > d.out) ? AIR_RAISE_MS : AIR_FALL_MS;
-  if ((uint32_t)(now - d.since) >= need) d.out = cand;
+inline uint8_t air_debounce(AirDebounce& d, uint8_t cand, uint8_t causes, uint32_t now) {
+  if (cand == d.out)       { d.cand = cand; d.since = now; }
+  else if (cand != d.cand) { d.cand = cand; d.since = now; }
+  else {
+    uint32_t need = (cand > d.out) ? AIR_RAISE_MS : AIR_FALL_MS;
+    if ((uint32_t)(now - d.since) >= need) d.out = cand;
+  }
+  if (d.out == AIR_OK)     { d.held = 0; }
+  else if (cand >= d.out)  { d.held = causes; d.held_ms = now; }
   return d.out;
 }
 

@@ -129,12 +129,22 @@ static void dispatch(char* line) {
   }
   else if (eq(tok[0], "vhealth")) { sensors_vhealth_print(); }
   else if (eq(tok[0], "air")) {
-    uint8_t c = g_status.air_causes;
-    Serial.printf("[air] severity=%s  causes=0x%02X%s%s%s%s%s%s%s\n", air_name(g_status.air_sev), c,
-      (c & AIR_C_TLM_LOST)     ? " TLM_LOST"     : "", (c & AIR_C_TLM_EMU)     ? " TLM_EMU"     : "",
-      (c & AIR_C_VENT_PARTIAL) ? " VENT_PARTIAL" : "", (c & AIR_C_VENT_LOST)   ? " VENT_LOST"   : "",
-      (c & AIR_C_FLOW_LOW)     ? " FLOW_LOW"     : "", (c & AIR_C_SENSOR_STALE)? " SENSOR_STALE": "",
-      (c & AIR_C_TEENSY_LINK)  ? " TEENSY_LINK"  : "");
+    // held = why the displayed level is lit (what the dashboard/QGC show);
+    // now = this instant. They differ while an intermittent fault holds the level up.
+    for (int k = 0; k < 2; ++k) {
+      uint8_t c = k ? g_status.air_causes_now : g_status.air_causes;
+      if (k == 0)
+        Serial.printf("[air] severity=%s  held=0x%02X", air_name(g_status.air_sev), c);
+      else
+        Serial.printf("[air] now=0x%02X", c);
+      Serial.printf("%s%s%s%s%s%s%s", (c & AIR_C_TLM_LOST) ? " TLM_LOST" : "", (c & AIR_C_TLM_EMU) ? " TLM_EMU" : "",
+        (c & AIR_C_VENT_PARTIAL) ? " VENT_PARTIAL" : "", (c & AIR_C_VENT_LOST) ? " VENT_LOST" : "",
+        (c & AIR_C_FLOW_LOW) ? " FLOW_LOW" : "", (c & AIR_C_SENSOR_STALE) ? " SENSOR_STALE" : "",
+        (c & AIR_C_TEENSY_LINK) ? " TEENSY_LINK" : "");
+      if (k == 0 && g_status.air_sev != AIR_OK)
+        Serial.printf("  (last seen %lu ms ago)", (unsigned long)(millis() - g_status.air_held_ms));
+      Serial.println();
+    }
     Serial.printf("[air] inputs: armed=%d term=%d teensy_ok=%d err=%d nvalid=%u stale=%d mdot=%.1f g/s (min %.1f)\n",
       g_status.armed?1:0, g_status.terminated?1:0, g_comp.ok?1:0, (int)g_comp.err,
       g_status.n_valid, g_status.sensor_stale?1:0, (double)g_status.mdot_total, (double)AIR_MDOT_MIN_GPS);

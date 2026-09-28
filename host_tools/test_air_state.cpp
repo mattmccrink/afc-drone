@@ -70,20 +70,51 @@ int main() {
   check("terminated -> OK (air off by design; mode shows TERMINATED)", sev(a) == AIR_OK);
 
   printf("debounce\n");
+  const uint8_t W = AIR_C_TLM_LOST | AIR_C_VENT_LOST;
   AirDebounce d;
-  check("starts OK", air_debounce(d, AIR_OK, 0) == AIR_OK);
-  air_debounce(d, AIR_WARNING, 1000);
-  check("raise not before AIR_RAISE_MS", air_debounce(d, AIR_WARNING, 1000 + AIR_RAISE_MS - 1) == AIR_OK);
-  check("raise at AIR_RAISE_MS", air_debounce(d, AIR_WARNING, 1000 + AIR_RAISE_MS) == AIR_WARNING);
-  air_debounce(d, AIR_OK, 5000);
-  check("fall not before AIR_FALL_MS", air_debounce(d, AIR_OK, 5000 + AIR_FALL_MS - 1) == AIR_WARNING);
-  check("fall at AIR_FALL_MS", air_debounce(d, AIR_OK, 5000 + AIR_FALL_MS) == AIR_OK);
+  check("starts OK", air_debounce(d, AIR_OK, 0, 0) == AIR_OK);
+  air_debounce(d, AIR_WARNING, W, 1000);
+  check("raise not before AIR_RAISE_MS", air_debounce(d, AIR_WARNING, W, 1000 + AIR_RAISE_MS - 1) == AIR_OK);
+  check("raise at AIR_RAISE_MS", air_debounce(d, AIR_WARNING, W, 1000 + AIR_RAISE_MS) == AIR_WARNING);
+  check("held = causes of the raising evaluation", d.held == W);
+  air_debounce(d, AIR_OK, 0, 5000);
+  check("fall not before AIR_FALL_MS", air_debounce(d, AIR_OK, 0, 5000 + AIR_FALL_MS - 1) == AIR_WARNING);
+  check("still lit while falling: held keeps the reason", d.held == W);
+  check("fall at AIR_FALL_MS", air_debounce(d, AIR_OK, 0, 5000 + AIR_FALL_MS) == AIR_OK);
+  check("held cleared at OK", d.held == 0);
   AirDebounce f; uint8_t shown_max = 0;
   for (uint32_t t = 0; t < 5000; t += 10) {               // 100 ms blips of CAUTION
     uint8_t cand = ((t / 100) % 3 == 0) ? AIR_CAUTION : AIR_OK;
-    uint8_t o = air_debounce(f, cand, t); if (o > shown_max) shown_max = o;
+    uint8_t o = air_debounce(f, cand, cand ? AIR_C_VENT_LOST : 0, t); if (o > shown_max) shown_max = o;
   }
-  check("100 ms blips never reach the display", shown_max == AIR_OK);
+  check("100 ms blips never reach the display", shown_max == AIR_OK && f.held == 0);
+
+  printf("held causes: intermittent fault holding a level (bench 2026-09-28)\n");
+  // ADVISORY raised by lost telemetry; telemetry then recovers except a one-tick
+  // blip every 500 ms. The fall timer never completes -> level stays lit, and the
+  // instantaneous causes are 0 almost all the time. held must still name it.
+  AirDebounce b; uint32_t t = 0;
+  for (; t <= 1000; t += 10) air_debounce(b, AIR_ADVISORY, AIR_C_TLM_LOST, t);
+  bool lit = true, named = true, inst_zero_seen = false;
+  for (; t <= 6000; t += 10) {
+    bool blip = (t % 500 == 0);
+    uint8_t o = air_debounce(b, blip ? AIR_ADVISORY : AIR_OK, blip ? AIR_C_TLM_LOST : 0, t);
+    lit &= (o == AIR_ADVISORY); named &= (b.held == AIR_C_TLM_LOST);
+    if (!blip) inst_zero_seen = true;
+  }
+  check("blips every 500 ms keep ADVISORY lit (anti-flap as designed)", lit);
+  check("...and held names TLM_LOST although 'now' is 0 between blips", named && inst_zero_seen);
+  uint32_t last_blip = 6000;
+  for (t += 10; t <= 6000 + AIR_FALL_MS + 20; t += 10) air_debounce(b, AIR_OK, 0, t);
+  check("blips stop -> falls to OK one AIR_FALL_MS after the last blip, held cleared",
+        b.out == AIR_OK && b.held == 0 && b.held_ms == last_blip);
+  // a higher-level blip holding a lower display names the higher cause
+  AirDebounce h;
+  for (t = 0; t <= 1000; t += 10) air_debounce(h, AIR_ADVISORY, AIR_C_VENT_PARTIAL, t);
+  air_debounce(h, AIR_CAUTION, AIR_C_VENT_LOST, t);                 // one-tick CAUTION blip
+  air_debounce(h, AIR_OK, 0, t + 10);
+  check("CAUTION blip under ADVISORY: display stays ADVISORY, held = VENT_LOST",
+        h.out == AIR_ADVISORY && h.held == AIR_C_VENT_LOST);
 
   printf("\n%s\n", fails ? "SOME CHECKS FAILED" : "all checks passed");
   return fails ? 1 : 0;

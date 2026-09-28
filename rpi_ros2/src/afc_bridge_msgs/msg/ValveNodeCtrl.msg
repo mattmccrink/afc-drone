@@ -46,7 +46,7 @@ uint8 AIR_C_VENT_LOST    = 8    # no valid venturis
 uint8 AIR_C_FLOW_LOW     = 16   # venturis healthy but flow implausibly low while running
 uint8 AIR_C_SENSOR_STALE = 32   # sensor frame not updating
 uint8 AIR_C_TEENSY_LINK  = 64   # no Teensy replies while armed
-uint8 air_causes            # bitmask of AIR_C_* (instantaneous)
+uint8 air_causes            # bitmask of AIR_C_* behind the level on display (held while air_sev is lit, 0 at OK)
 
 # ---- RC link + build configuration (CTRL_TLM flags2, 2026-09-27) ----
 bool flags2_valid           # false on older firmware (fields below then meaningless)

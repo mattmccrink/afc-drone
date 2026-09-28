@@ -208,8 +208,10 @@ void compressor_update(uint32_t now) {
     ai.mdot_total      = mdot_total;
     uint8_t causes = 0;
     uint8_t cand   = air_eval(ai, &causes);
-    g_status.air_sev    = air_debounce(air_db, cand, now);
-    g_status.air_causes = causes;
+    g_status.air_sev        = air_debounce(air_db, cand, causes, now);
+    g_status.air_causes     = air_db.held;       // why the displayed level is lit
+    g_status.air_causes_now = causes;
+    g_status.air_held_ms    = air_db.held_ms;
   }
 
   // ---- stream to Teensy at 50 Hz while running; SILENCE when stopped (= stop) ----
