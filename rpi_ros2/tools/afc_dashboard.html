@@ -2,15 +2,22 @@
 <html lang="en">
 <head>
 <meta charset="utf-8"/>
-<title>AFC Drone Dashboard</title>
+<title>Phoenix Control Panel</title>
 <!-- roslibjs (rosbridge client) + uPlot (fast streaming charts), from CDN -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/roslibjs/1.4.1/roslib.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.min.css"/>
 <script src="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.iife.min.js"></script>
 <style>
   :root{
-    --bg:#0d1117; --panel:#161b22; --edge:#30363d; --ink:#e6edf3; --dim:#8b949e;
-    --ok:#3fb950; --warn:#d29922; --bad:#f85149; --accent:#58a6ff; --port:#58a6ff; --stbd:#f0883e;
+    /* Ohio State grays; Scarlet (#BA0C2F) only as a brand highlight, never for status.
+       Alert colors (ok/warn/bad/adv) follow AC 25.1322 and are not brand colors. */
+    --bg:#1a1c1e; --panel:#232628; --well:#1a1c1e; --edge:#3f4443; --grid:#33373a;
+    --ink:#e9ebec; --dim:#a7b1b7; --mute:#6f777c; --scarlet:#ba0c2f;
+    --ok:#3fb950; --warn:#d29922; --bad:#f85149;
+    /* diverging valve/surface ramp: negative pole, neutral midpoint, positive pole */
+    --neg:#3987e5; --mid:#4a4f52; --pos:#d95926;
+    /* chart series (validated on --panel: CVD dE >= 9) */
+    --s1:#199e70; --s2:#9085e9; --s3:#d55181;
   }
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--ink);
@@ -18,17 +25,22 @@
   header{display:flex;gap:12px;align-items:center;padding:8px 12px;background:var(--panel);
          border-bottom:1px solid var(--edge);flex-wrap:wrap}
   header h1{font-size:14px;margin:0 8px 0 0;letter-spacing:.5px}
-  input{background:#0d1117;border:1px solid var(--edge);color:var(--ink);padding:4px 8px;
+  input{background:var(--well);border:1px solid var(--edge);color:var(--ink);padding:4px 8px;
         border-radius:6px;font:inherit;width:230px}
-  button{background:#21262d;border:1px solid var(--edge);color:var(--ink);padding:5px 12px;
+  button{background:#2e3235;border:1px solid var(--edge);color:var(--ink);padding:5px 12px;
          border-radius:6px;font:inherit;cursor:pointer}
-  button:hover{border-color:var(--accent)}
+  button:hover,input:focus{border-color:var(--scarlet);outline:none}
+  .brand{display:flex;align-items:center;gap:8px;margin-right:8px}
+  .brand .blk{background:var(--scarlet);color:#fff;font-weight:700;letter-spacing:1px;
+              padding:2px 7px;border-radius:4px}
+  .brand .nm{font-weight:700;letter-spacing:1.5px;color:var(--ink)}
   .dot{width:10px;height:10px;border-radius:50%;display:inline-block;background:var(--bad)}
   .dot.on{background:var(--ok)}
   .grid{display:grid;grid-template-columns:1fr 1.1fr 1fr;gap:10px;padding:10px}
   .panel{background:var(--panel);border:1px solid var(--edge);border-radius:8px;padding:10px}
   .panel h2{font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--dim);
-            margin:0 0 8px}
+            margin:0 0 8px;font-weight:700}
+  .panel h2.sec{margin-top:16px}
   .kv{display:flex;justify-content:space-between;padding:2px 0}
   .kv b{font-weight:600}
   .pill{padding:1px 8px;border-radius:10px;font-size:11px;font-weight:700}
@@ -38,18 +50,35 @@
   .chart{margin-bottom:8px}
   .bars{display:flex;flex-direction:column;gap:6px}
   .bar{display:grid;grid-template-columns:60px 1fr 62px;align-items:center;gap:6px}
-  .bar .track{height:14px;background:#0d1117;border:1px solid var(--edge);border-radius:4px;overflow:hidden}
-  .bar .fill{height:100%;background:var(--accent);width:0}
+  .bar .track{height:14px;background:var(--well);border:1px solid var(--edge);border-radius:4px;overflow:hidden}
+  .bar .fill{height:100%;background:var(--s1);width:0}
+  /* bipolar bar: fill grows from the centre line */
+  .bar .track.bi{position:relative}
+  .bar .track.bi .fill{position:absolute;top:0;left:50%;width:0}
+  .bar .track.bi::after{content:"";position:absolute;left:50%;top:-1px;bottom:-1px;width:1px;background:var(--mute)}
+  .num{font-variant-numeric:tabular-nums}
+  .ramp{display:grid;grid-template-columns:auto 1fr auto;gap:6px;align-items:center;
+        font-size:10px;color:var(--dim);margin:2px 0 0}
+  .ramp i{height:6px;border-radius:3px;background:linear-gradient(90deg,var(--neg),var(--mid) 45%,var(--mid) 55%,var(--pos))}
+  .health{display:grid;grid-template-columns:1fr 1fr;column-gap:18px}
+  .health .wide{grid-column:1/-1}
+  .sub{font-size:10px;color:var(--dim);margin:0 0 6px}
+  .blk{position:relative}
+  .blk.stale > *{opacity:.28}
+  .blk.stale::after{content:"NO DATA";position:absolute;inset:0;display:flex;align-items:center;
+    justify-content:center;font-weight:700;letter-spacing:2px;font-size:12px;color:var(--dim);pointer-events:none}
+  details.raw{margin-top:8px;color:var(--dim);font-size:11px}
+  details.raw summary{cursor:pointer}
   .bar.invalid{opacity:.35}
   .num{text-align:right}
-  svg text{fill:var(--ink);font:11px ui-monospace,monospace}
+  svg text{fill:var(--ink);font:11px ui-monospace,monospace;font-variant-numeric:tabular-nums}
   .stale{color:var(--warn)}
   /* ---- annunciator / crew-alerting panel (14 CFR 25.1322 / AC 25.1322-1 conventions) ----
      warning = red, caution = amber, advisory = cyan (not red/green), status = white. */
   :root{--adv:#39c5cf}
   .annun{display:grid;grid-template-columns:150px 1fr 1fr;gap:10px;margin:10px 10px 0}
   .masters{display:flex;flex-direction:column;gap:8px}
-  .master{border:2px solid var(--edge);border-radius:6px;background:#0d1117;color:#484f58;
+  .master{border:2px solid var(--edge);border-radius:6px;background:var(--well);color:var(--mute);
           font:700 13px ui-monospace,monospace;padding:10px 4px;text-align:center;cursor:pointer;letter-spacing:1px}
   .master.W.lit{background:rgba(248,81,73,.85);border-color:var(--bad);color:#fff}
   .master.C.lit{background:rgba(210,153,34,.85);border-color:var(--warn);color:#111}
@@ -61,14 +90,14 @@
   .grp h3{font-size:10px;letter-spacing:1px;color:var(--dim);margin:0 0 4px;text-transform:uppercase}
   .tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(96px,1fr));gap:5px}
   .tile{border:1px solid var(--edge);border-radius:4px;padding:3px 5px;text-align:center;
-        font-weight:700;font-size:11px;color:#484f58;background:#0d1117;min-height:34px;line-height:1.25}
+        font-weight:700;font-size:11px;color:var(--mute);background:var(--well);min-height:34px;line-height:1.25}
   .tile .v{display:block;font-weight:400;font-size:10px}
-  .tile.S{color:var(--ink);border-color:#484f58}
+  .tile.S{color:var(--ink);border-color:var(--mute)}
   .tile.A{background:rgba(57,197,207,.16);border-color:var(--adv);color:var(--adv)}
   .tile.C{background:rgba(210,153,34,.22);border-color:var(--warn);color:var(--warn)}
   .tile.W{background:rgba(248,81,73,.28);border-color:var(--bad);color:#ff7b72}
   .tile.stale{opacity:.4}
-  .cas{background:#0d1117;border:1px solid var(--edge);border-radius:6px;padding:6px 8px;min-height:120px;
+  .cas{background:var(--well);border:1px solid var(--edge);border-radius:6px;padding:6px 8px;min-height:120px;
        max-height:260px;overflow:auto}
   .cas h3{font-size:10px;letter-spacing:1px;color:var(--dim);margin:0 0 4px;text-transform:uppercase}
   .msg{display:grid;grid-template-columns:62px 1fr;gap:6px;padding:1px 0}
@@ -82,19 +111,18 @@
   details.hist .msg{color:var(--dim)}
   @media (max-width:1000px){.annun{grid-template-columns:1fr}.masters{flex-direction:row}}
   .big{font-size:22px;font-weight:700}
+  /* uPlot on the dark theme */
+  .uplot, .u-legend{color:var(--dim)}
+  .u-legend{font-size:11px;margin-top:-2px} .u-legend th{font-weight:400}
+  .u-legend .u-marker{width:14px;height:0;border-width:3px 0 0 0 !important;border-radius:0;background:none !important;vertical-align:middle}
 </style>
 </head>
 <body>
 <header>
-  <h1>AFC&nbsp;DRONE</h1>
+  <h1 class="brand"><span class="blk">PHOENIX</span><span class="nm">CONTROL PANEL</span></h1>
   <span class="dot" id="link"></span><span id="linkTxt">disconnected</span>
-  <input id="url" value="ws://192.168.1.50:9090"/>
+  <input id="url" value="ws://192.168.137.10:9090"/>
   <button id="connect">Connect</button>
-  <span style="margin-left:auto"></span>
-  <span class="pill" id="modePill">MODE ?</span>
-  <span class="pill" id="armPill">ARM ?</span>
-  <span class="pill" id="srcPill">SRC ?</span>
-  <span class="pill" id="surfPill">SURF ?</span>
 </header>
 <!-- ANNUNCIATOR: master alerts | system tiles | crew-alert message list.
      Rules (what lights, at which level) live in the RULES table in the script. -->
@@ -113,41 +141,53 @@
 </div>
 
 <div class="grid">
-  <!-- LEFT: command charts -->
+  <!-- LEFT: what is being commanded -->
   <div class="panel">
     <h2>Torque command (roll / pitch / yaw)</h2>
-    <div class="chart" id="torqueChart"></div>
+    <div class="blk" data-src="torque"><div class="chart" id="torqueChart"></div></div>
     <h2>Thrust command</h2>
-    <div class="chart" id="thrustChart"></div>
-    <h2 style="margin-top:12px">Compressor (measured, via Teensy)</h2>
-    <div class="kv"><span>rpm (meas / target)</span><span><span id="cRpm" class="big">--</span> / <span id="cTgt">--</span></span></div>
-    <div class="chart" id="rpmChart"></div>
-    <div class="kv"><span>ESC temp</span><span id="cTemp">--</span></div>
-    <div class="kv"><span>volt / amp</span><span id="cVA">-- / --</span></div>
-    <div class="kv"><span>ESC telemetry / err</span><span id="cTlm">--</span></div>
+    <div class="blk" data-src="thrust"><div class="chart" id="thrustChart"></div></div>
+    <h2 class="sec">Valve position (command, &plusmn;1000)</h2>
+    <div class="blk" data-src="ctrl"><div class="bars" id="valveBars"></div></div>
+    <details class="raw"><summary>servo pulse widths (&micro;s)</summary><div id="servoRow" class="num">--</div></details>
   </div>
 
-  <!-- CENTER: valve schematic (canard, top-down, nose up) -->
+  <!-- CENTER: valve schematic (canard, top-down, nose up) + link health -->
   <div class="panel">
     <h2>Valves + surfaces &mdash; top-down (nose up)</h2>
-    <svg id="ac" viewBox="0 0 320 300" width="100%" height="300"></svg>
-    <div id="servoRow" style="margin-top:6px"></div>
+    <div class="blk" data-src="ctrl">
+      <svg id="ac" viewBox="0 0 320 300" width="100%" height="300"></svg>
+      <div class="ramp"><span>&minus;1000</span><i></i><span>+1000</span></div>
+    </div>
+    <h2 class="sec">Link / health</h2>
+    <div class="health blk" data-src="health">
+      <div class="kv"><span>serial</span><span id="hSer">--</span></div>
+      <div class="kv"><span>crc errors</span><span id="hCrc" class="num">--</span></div>
+      <div class="kv wide"><span>rates ctrl / sensor / comp (Hz)</span><span id="hHz" class="num">--</span></div>
+      <div class="kv"><span>cmd / arm fresh</span><span id="hFresh">-- / --</span></div>
+      <div class="kv"><span>arm counter</span><span id="hCtr" class="num">--</span></div>
+      <div class="kv"><span>node offset (ms)</span><span id="hOff" class="num">--</span></div>
+    </div>
   </div>
 
-  <!-- RIGHT: pressures / mdot + health -->
+  <!-- RIGHT: the air supply -- compressor, upstream pressure, mass flow -->
   <div class="panel">
-    <h2>Mass flow (g/s)</h2>
-    <div class="bars" id="mdotBars"></div>
-    <div class="kv" style="margin-top:6px"><b>total</b><span id="mdotTotal" class="num">--</span></div>
-    <h2 style="margin-top:12px">Upstream pressure (mbar)</h2>
-    <div class="bars" id="pupBars"></div>
-    <h2 style="margin-top:12px">Link / health</h2>
-    <div class="kv"><span>serial</span><span id="hSer">--</span></div>
-    <div class="kv"><span>ctrl / sensor / comp Hz</span><span id="hHz">-- / -- / --</span></div>
-    <div class="kv"><span>crc errors</span><span id="hCrc">--</span></div>
-    <div class="kv"><span>cmd fresh / arm fresh</span><span id="hFresh">-- / --</span></div>
-    <div class="kv"><span>arm counter</span><span id="hCtr">--</span></div>
-    <div class="kv"><span>node offset (ms)</span><span id="hOff">--</span></div>
+    <h2>Compressor</h2>
+    <div class="blk" data-src="comp">
+    <div class="kv"><span>rpm (meas / target)</span><span class="num"><span id="cRpm" class="big">--</span> / <span id="cTgt">--</span></span></div>
+    <div class="chart" id="rpmChart"></div>
+    <div class="kv"><span>ESC temp</span><span id="cTemp" class="num">--</span></div>
+    <div class="kv"><span>volt / amp</span><span id="cVA" class="num">-- / --</span></div>
+    <div class="kv"><span>ESC telemetry / err</span><span id="cTlm">--</span></div>
+    </div>
+    <h2 class="sec">Mass flow (g/s)</h2>
+    <div class="blk" data-src="sensor">
+      <div class="bars" id="mdotBars"></div>
+      <div class="kv" style="margin-top:6px"><b>total</b><span id="mdotTotal" class="num">--</span></div>
+    </div>
+    <h2 class="sec">Upstream pressure above ambient (mbar)</h2>
+    <div class="sub" id="pRefNote">ambient not captured yet</div>
+    <div class="blk" data-src="sensor"><div class="bars" id="pupBars"></div></div>
   </div>
 </div>
 
@@ -173,6 +213,13 @@ const CFG = {
     {x:258, y:85,  label:"RC"},
   ],
   valveAbsMax: 1000,     // |valve[]| full-scale for fill (int16 aero-intent units)
+  deadband: 0.03,
+  // Upstream pressure is shown above ambient. The Tiny has no ambient sensor, so the
+  // reference is each venturi's own p_up while the compressor is at rest (disarmed,
+  // rpm below restRpm for restHoldMs); it also absorbs per-sensor offset. Frozen
+  // while running; kept in this browser for refHoldH so a mid-flight reconnect keeps it.
+  pGaugeFS: 150,         // mbar full-scale for the gauge bars (tweak once real data exists)
+  restRpm: 500, restHoldMs: 2000, refHoldH: 2,        // |value|/full-scale below this shows as neutral (no side colour)
   window: 300,           // samples kept in the strip charts (~15s @20Hz)
   // Valve layout: index 0-5 = valves 1-6. Canard aircraft, top-down, nose UP.
   //   1(idx0) port-outboard, 2(idx1) left-inboard, 3(idx2) right-inboard,
@@ -194,44 +241,53 @@ const ac = document.getElementById("ac");
 function svg(tag,attrs){const e=document.createElementNS("http://www.w3.org/2000/svg",tag);
   for(const k in attrs)e.setAttribute(k,attrs[k]);return e;}
 // planform hints
-ac.appendChild(svg("line",{x1:160,y1:40,x2:160,y2:270,stroke:"#30363d","stroke-width":8,"stroke-linecap":"round"})); // fuselage
-ac.appendChild(svg("line",{x1:30,y1:225,x2:290,y2:225,stroke:"#30363d","stroke-width":6,"stroke-linecap":"round"})); // main wing
-ac.appendChild(svg("line",{x1:110,y1:85,x2:210,y2:85,stroke:"#30363d","stroke-width":5,"stroke-linecap":"round"}));  // canard
-ac.appendChild(svg("circle",{cx:160,cy:36,r:6,fill:"#30363d"})); // nose
-ac.appendChild(svg("text",{x:6,y:232,fill:"#8b949e"},)).textContent="PORT";
-const stbdT=svg("text",{x:296,y:232,fill:"#8b949e","text-anchor":"end"});stbdT.textContent="STBD";ac.appendChild(stbdT);
+const FRAME="#3f4443", WELL="#1a1c1e", DIM="#a7b1b7";
+ac.appendChild(svg("line",{x1:160,y1:40,x2:160,y2:270,stroke:FRAME,"stroke-width":8,"stroke-linecap":"round"})); // fuselage
+ac.appendChild(svg("line",{x1:30,y1:225,x2:290,y2:225,stroke:FRAME,"stroke-width":6,"stroke-linecap":"round"})); // main wing
+ac.appendChild(svg("line",{x1:110,y1:85,x2:210,y2:85,stroke:FRAME,"stroke-width":5,"stroke-linecap":"round"}));  // canard
+ac.appendChild(svg("circle",{cx:160,cy:36,r:6,fill:FRAME})); // nose
+// side labels at mid-height, clear of the outboard valves (1, 4)
+const portT=svg("text",{x:4,y:152,fill:DIM,"font-size":10,"letter-spacing":1});portT.textContent="PORT";ac.appendChild(portT);
+const stbdT=svg("text",{x:316,y:152,fill:DIM,"text-anchor":"end","font-size":10,"letter-spacing":1});stbdT.textContent="STBD";ac.appendChild(stbdT);
 const valveEls=[];
 CFG.valvePos.forEach((v,i)=>{
-  const c=svg("circle",{cx:v.x,cy:v.y,r:16,fill:"#0d1117",stroke:"#30363d","stroke-width":2});
+  const c=svg("circle",{cx:v.x,cy:v.y,r:16,fill:WELL,stroke:FRAME,"stroke-width":2});
   const t=svg("text",{x:v.x,y:v.y+4,"text-anchor":"middle","font-weight":"700"});t.textContent=v.label;
-  const val=svg("text",{x:v.x,y:v.y+30,"text-anchor":"middle",fill:"#8b949e"});val.textContent="--";
+  const val=svg("text",{x:v.x,y:v.y+30,"text-anchor":"middle",fill:DIM});val.textContent="--";
   ac.appendChild(c);ac.appendChild(t);ac.appendChild(val);
   valveEls.push({c,val});
 });
 const surfEls=[];
 CFG.surfPos.forEach((p)=>{
-  const r=svg("rect",{x:p.x-18,y:p.y-5,width:36,height:10,rx:2,fill:"#0d1117",stroke:"#30363d","stroke-width":1.5});
-  const t=svg("text",{x:p.x,y:p.y+19,"text-anchor":"middle",fill:"#8b949e"});t.textContent=p.label;
+  const r=svg("rect",{x:p.x-18,y:p.y-5,width:36,height:10,rx:2,fill:WELL,stroke:FRAME,"stroke-width":1.5});
+  const t=svg("text",{x:p.x,y:p.y+19,"text-anchor":"middle",fill:DIM});t.textContent=p.label;
   ac.appendChild(r);ac.appendChild(t);
   surfEls.push({r,t,label:p.label});
 });
+// Diverging colour ramp: neutral grey inside the deadband, then a continuous blend
+// toward the negative (blue) or positive (orange) pole. No hard jump at zero.
+const hex2rgb=h=>{h=h.replace("#","");return[0,2,4].map(k=>parseInt(h.substr(k,2),16));};
+const rgb2hex=a=>"#"+a.map(v=>Math.round(v).toString(16).padStart(2,"0")).join("");
+function rampColor(value){
+  const f=Math.max(-1,Math.min(1,value/CFG.valveAbsMax)), a=Math.abs(f), db=CFG.deadband;
+  const mid=hex2rgb(getCSS("--mid"));
+  if(a<=db) return {col:rgb2hex(mid), f, a:0};
+  const m=(a-db)/(1-db), pole=hex2rgb(getCSS(f<0?"--neg":"--pos"));
+  return {col:rgb2hex(mid.map((c,k)=>c+(pole[k]-c)*m)), f, a:m};
+}
 function setSurf(i,value,engaged){
   const el=surfEls[i]; if(!el)return;
-  const f=Math.max(-1,Math.min(1,value/CFG.valveAbsMax));
-  const col=f<0?getCSS("--port"):getCSS("--stbd");
-  el.r.setAttribute("fill", engaged ? col : "#0d1117");
-  el.r.setAttribute("fill-opacity", engaged ? (0.25+0.65*Math.abs(f)).toFixed(2) : "1");
-  el.r.setAttribute("stroke", engaged ? col : "#30363d");
+  const {col}=rampColor(value);
+  el.r.setAttribute("fill", engaged ? col : WELL);
+  el.r.setAttribute("stroke", engaged ? col : FRAME);
   el.t.textContent = el.label+(engaged?" "+Math.round(value):"");
 }
 function setValve(i,value,valid){
   const el=valveEls[i]; if(!el)return;
-  const f=Math.max(-1,Math.min(1,value/CFG.valveAbsMax));
-  // bipolar color: port-blue negative, stbd-orange positive; radius grows with |f|
-  const col = !valid ? "#30363d" : (f<0 ? getCSS("--port") : getCSS("--stbd"));
-  el.c.setAttribute("fill", col);
-  el.c.setAttribute("fill-opacity", valid ? (0.25+0.65*Math.abs(f)).toFixed(2) : "0.15");
-  el.c.setAttribute("stroke", valid ? col : "#30363d");
+  const {col}=rampColor(value);
+  el.c.setAttribute("fill", valid ? col : WELL);
+  el.c.setAttribute("stroke", valid ? col : FRAME);
+  el.c.setAttribute("stroke-dasharray", valid ? "" : "3 3");
   el.val.textContent = valid ? Math.round(value) : "x";
 }
 function getCSS(v){return getComputedStyle(document.documentElement).getPropertyValue(v).trim();}
@@ -241,19 +297,21 @@ function getCSS(v){return getComputedStyle(document.documentElement).getProperty
 // ---------------------------------------------------------------------------
 function makeChart(el,labels,colors,ySize){
   const data=[[]]; labels.forEach(()=>data.push([]));
-  const series=[{}].concat(labels.map((l,i)=>({label:l,stroke:colors[i],width:1.5})));
+  const series=[{}].concat(labels.map((l,i)=>(Object.assign({label:l,width:1.5},
+    typeof colors[i]==="string"?{stroke:colors[i]}:colors[i]))));
   const opts={width:el.clientWidth||360,height:130,series,
-    axes:[{stroke:"#8b949e"},{stroke:"#8b949e",size:ySize||50}],
-    scales:{x:{time:false}},legend:{show:true},cursor:{show:false}};
+    axes:[{stroke:DIM,grid:{stroke:"#33373a",width:1},ticks:{stroke:FRAME,width:1}},
+          {stroke:DIM,size:ySize||50,grid:{stroke:"#33373a",width:1},ticks:{stroke:FRAME,width:1}}],
+    scales:{x:{time:false}},legend:{show:true,live:false},cursor:{show:false}};
   const u=new uPlot(opts,data,el);
   return {u,data};
 }
 const torque=makeChart(document.getElementById("torqueChart"),
-  ["roll","pitch","yaw"],["#f85149","#3fb950","#58a6ff"]);
+  ["roll","pitch","yaw"],[getCSS("--s1"),getCSS("--s2"),getCSS("--s3")]);
 const thrust=makeChart(document.getElementById("thrustChart"),
-  ["thrust"],["#d29922"]);
+  ["thrust"],["#c0c7cb"]);
 const rpmCh=makeChart(document.getElementById("rpmChart"),
-  ["rpm meas","rpm target"],["#58a6ff","#8b949e"],64);
+  ["rpm meas","rpm target"],[getCSS("--s1"),{stroke:DIM,dash:[4,4]}],64);
 let lastRpmTarget=0;
 let t0=performance.now()/1000;
 function push(ch,vals){
@@ -266,18 +324,28 @@ function push(ch,vals){
 // ---------------------------------------------------------------------------
 // Bar rows (mdot, pressure) built once, updated per message.
 // ---------------------------------------------------------------------------
-function buildBars(container,n,color){
+function buildBars(container,n,color,bipolar){
   const rows=[];
   for(let i=0;i<n;i++){
     const row=document.createElement("div");row.className="bar";
-    row.innerHTML=`<span>valve ${i+1}</span><div class="track"><div class="fill" style="background:${color}"></div></div><span class="num">--</span>`;
+    row.innerHTML=`<span>valve ${i+1}</span><div class="track${bipolar?" bi":""}"><div class="fill" style="background:${color}"></div></div><span class="num">--</span>`;
     container.appendChild(row);
     rows.push({row,fill:row.querySelector(".fill"),num:row.querySelector(".num")});
   }
   return rows;
 }
-const mdotRows=buildBars(document.getElementById("mdotBars"),6,"#3fb950");
-const pupRows =buildBars(document.getElementById("pupBars"),6,"#58a6ff");
+const mdotRows =buildBars(document.getElementById("mdotBars"),6,getCSS("--s1"));
+const pupRows  =buildBars(document.getElementById("pupBars"),6,"#8f99a0");
+const valveRows=buildBars(document.getElementById("valveBars"),6,"",true);
+function setBiBar(i,value,valid){
+  const r=valveRows[i]; if(!r)return;
+  const {col,f}=rampColor(value), w=50*Math.abs(f);
+  r.row.classList.toggle("invalid",!valid);
+  r.fill.style.background=col;
+  r.fill.style.width=w+"%";
+  r.fill.style.left=(f<0?50-w:50)+"%";
+  r.num.textContent=valid?Math.round(value):"x";
+}
 function setBar(rows,i,value,max,valid,why){
   const r=rows[i]; if(!r)return;
   r.row.classList.toggle("invalid",!valid);
@@ -301,8 +369,8 @@ function connect(){
 function sub(t){return new ROSLIB.Topic({ros,name:t.name,messageType:t.type,
   throttle_rate:t.throttle,queue_length:1,queue_size:1});}
 function subscribe(){
-  sub(CFG.topics.torque).subscribe(m=>push(torque,[m.xyz[0],m.xyz[1],m.xyz[2]]));
-  sub(CFG.topics.thrust).subscribe(m=>push(thrust,[m.xyz[2]]));   // z-axis thrust
+  sub(CFG.topics.torque).subscribe(m=>{TSRC.torque=performance.now();push(torque,[m.xyz[0],m.xyz[1],m.xyz[2]]);});
+  sub(CFG.topics.thrust).subscribe(m=>{TSRC.thrust=performance.now();push(thrust,[m.xyz[2]]);});   // z-axis thrust
   sub(CFG.topics.ctrl).subscribe(onCtrl);
   sub(CFG.topics.sensor).subscribe(onSensor);
   sub(CFG.topics.health).subscribe(onHealth);
@@ -310,15 +378,37 @@ function subscribe(){
 }
 
 let lastValid=[true,true,true,true,true,true];
+// ---- ambient reference for the pressure bars (see CFG.pGaugeFS) ----
+const PREF = {ref:[null,null,null,null,null,null], t:null, restSince:null};
+try{ const j=JSON.parse(localStorage.getItem("afc_pref")||"null");
+     if(j && Date.now()-j.t < CFG.refHoldH*3600e3){ PREF.ref=j.ref; PREF.t=j.t; } }catch(e){}
+function updateAmbient(m){
+  const t=performance.now();
+  const rest = S.ros_up && !S.armed && (S.rpm===null || S.rpm < CFG.restRpm) && t-TSRC.comp < 1500;
+  PREF.restSince = rest ? (PREF.restSince ?? t) : null;
+  if(rest && t-PREF.restSince >= CFG.restHoldMs){
+    for(let i=0;i<6;i++) if(m.valid[i] && m.p_up[i]>0)
+      PREF.ref[i] = PREF.ref[i]===null ? m.p_up[i] : PREF.ref[i]+0.05*(m.p_up[i]-PREF.ref[i]);
+    PREF.t=Date.now();
+    try{ localStorage.setItem("afc_pref", JSON.stringify({ref:PREF.ref,t:PREF.t})); }catch(e){}
+  }
+  const n=document.getElementById("pRefNote");
+  n.textContent = PREF.t===null ? "ambient not captured yet: needs the compressor stopped and disarmed for 2 s"
+    : rest ? "ambient: tracking the compressor-off reading"
+    : "ambient: compressor-off reading from "+fmtT(PREF.t)+(Date.now()-PREF.t>15*60e3?" (old: drifts with weather and altitude)":"");
+}
 function onSensor(m){
   lastValid = m.valid;
-  S.t_sensor = performance.now();
+  S.t_sensor = TSRC.sensor = performance.now();
   S.why = m.why ? Array.from(m.why) : null;
   for(let i=0;i<6;i++){
     const why = S.why ? vhName(S.why[i]) : "x";
     setBar(mdotRows,i,m.mdot[i],50,m.valid[i],why);      // 50 g/s full-scale (tweak)
-    setBar(pupRows,i,m.p_up[i],1200,m.valid[i],why);     // ~1200 mbar full-scale
+    const g = PREF.ref[i]===null ? null : m.p_up[i]-PREF.ref[i];
+    setBar(pupRows,i,g===null?0:g,CFG.pGaugeFS,m.valid[i]&&g!==null,m.valid[i]?"no ref":why);
+    if(g!==null && m.valid[i]) pupRows[i].num.textContent=(g>=0?"+":"")+g.toFixed(1);
   }
+  updateAmbient(m);
   document.getElementById("mdotTotal").textContent=m.mdot_total.toFixed(1);
 }
 // ===========================================================================
@@ -343,7 +433,7 @@ const S = {                   // latest state, filled by the topic handlers belo
   cmd_fresh:null, arm_fresh:null, elig_fc:null, elig_sbus:null,
   esc_err:0, esc_tlm_ok:null, thermal:false, esc_temp:null, err11_t:-1e9, err12_t:-1e9,
   t_ctrl:0, t_health:0, t_comp:0, t_sensor:0, ros_up:false,
-  why:null, f2:false, sbus_lost:false, sbus_ok:false, bench:false, cal_flash:true,
+  why:null, rpm:null, f2:false, sbus_lost:false, sbus_ok:false, bench:false, cal_flash:true,
   sim_sensors:false, sim_sbus:false, sim_primary:false,
 };
 const VH = ["OK","UNMAPPED","NOPROM","NODATA","STALE","FROZEN","LOSSY","RANGE","DPNEG","RECOVER","INJECTED"];
@@ -520,42 +610,37 @@ buildAnnunciator();
 setInterval(evaluate, 200);
 
 function onCtrl(m){
-  lastCtrlT=performance.now();
+  lastCtrlT=performance.now(); TSRC.ctrl=lastCtrlT;
   Object.assign(S, {t_ctrl:lastCtrlT, armed:!!m.armed, source:m.source, n_valid:m.n_valid,
     surf:!!m.surf_engaged, surf_sw:!!m.surf_switch,
     air_sev:(m.air_sev!==undefined?m.air_sev:0), air_causes:(m.air_causes||0),
     f2:!!m.flags2_valid, sbus_lost:!!m.sbus_lost, sbus_ok:!!m.sbus_ok, bench:!!m.bench_build,
     cal_flash:(m.flags2_valid?!!m.cal_flash:true), sim_sensors:!!m.sim_sensors,
     sim_sbus:!!m.sim_sbus, sim_primary:!!m.sim_primary});
-  for(let i=0;i<6;i++) setValve(i, m.valve[i], lastValid[i]);
-  document.getElementById("servoRow").textContent =
-    "servo us: "+Array.from(m.servo_us).join(" ");
-  const arm=document.getElementById("armPill");
-  arm.textContent = m.armed?"ARMED":"DISARMED";
-  arm.className = "pill "+(m.armed?"bad":"ok");   // armed = red (hot), disarmed = green
-  const srcMap=["PRIMARY","SBUS","SAFE"];
-  const src=document.getElementById("srcPill");
-  src.textContent = "SRC "+(srcMap[m.source]||m.source);
-  src.className = "pill "+(m.source===0?"ok":m.source===1?"warn":"bad");
+  for(let i=0;i<6;i++){ setValve(i, m.valve[i], lastValid[i]); setBiBar(i, m.valve[i], lastValid[i]); }
+  document.getElementById("servoRow").textContent = Array.from(m.servo_us).join("  ");
   lastRpmTarget = m.armed ? m.rpm_target : 0;
   document.getElementById("cTgt").textContent = lastRpmTarget;
   const eng = !!m.surf_engaged, surf = m.surf || [0,0,0,0];
   for(let i=0;i<4;i++) setSurf(i, surf[i], eng);
-  const sp=document.getElementById("surfPill");
-  sp.textContent = eng ? "SURFACES ON" : (m.surf_switch ? "SURF sw on (idle)" : "SURFACES off");
-  sp.className = "pill "+(eng?"warn":"ok");
 }
 let lastCompT=0, lastCtrlT=0;
-// Staleness: a pill that stops updating must not keep saying "ok".
+// ---------------------------------------------------------------------------
+// Staleness: every data block is tagged data-src; a block whose source has not
+// updated recently (or with rosbridge down) is dimmed and labelled NO DATA, so a
+// frozen chart can never pass for a steady signal.
+// ---------------------------------------------------------------------------
+const TSRC = {torque:0, thrust:0, ctrl:0, sensor:0, comp:0, health:0};
+const STALE_MS = {health:3000};            // 1 Hz topic; the rest stream at 10-25 Hz
 setInterval(()=>{
-  if(lastCtrlT && performance.now()-lastCtrlT>1500){
-    for(const id of ["surfPill","armPill","srcPill","modePill"]){
-      const e=document.getElementById(id); e.textContent=e.textContent.replace(/ \(stale\)$/,"")+" (stale)"; e.className="pill warn";
-    }
-  }
-},500);
+  const t=performance.now();
+  document.querySelectorAll(".blk[data-src]").forEach(el=>{
+    const k=el.dataset.src;
+    el.classList.toggle("stale", !S.ros_up || t-TSRC[k] > (STALE_MS[k]||1500));
+  });
+},250);
 function onComp(m){
-  lastCompT=performance.now();
+  lastCompT=performance.now(); TSRC.comp=lastCompT; S.rpm=m.rpm;
   Object.assign(S, {t_comp:lastCompT, esc_err:m.err, esc_tlm_ok:!!m.tlm_ok,
     thermal:!!m.thermal_suspect, esc_temp:m.temp_c});
   if(m.err===-11) S.err11_t=lastCompT;     // -1/-8 outrank -11/-12 for a reply: hold ~1 s
@@ -573,7 +658,8 @@ function onComp(m){
 }
 function onHealth(m){
   if(S.crc!==null && m.crc_errors>S.crc) S.crc_rise_t=performance.now();   // rising, not the backlog
-  Object.assign(S, {t_health:performance.now(), mode:m.mode, terminated:!!m.terminated,
+  TSRC.health=performance.now();
+  Object.assign(S, {t_health:TSRC.health, mode:m.mode, terminated:!!m.terminated,
     serial:!!m.serial_connected, ctrl_hz:m.ctrl_hz, sensor_hz:m.sensor_hz, comp_hz:m.comp_hz,
     crc:m.crc_errors, cmd_fresh:!!m.cmd_fresh, arm_fresh:!!m.arm_fresh,
     elig_fc:!!m.elig_fc, elig_sbus:!!m.elig_sbus, desat_rp:m.desat_rp, desat_yaw:m.desat_yaw});
@@ -581,9 +667,6 @@ function onHealth(m){
     ? '<span class="pill ok">up</span>' : '<span class="pill bad">DOWN</span>';
   document.getElementById("hHz").textContent = m.ctrl_hz.toFixed(1)+" / "+m.sensor_hz.toFixed(1)
     +" / "+(m.comp_hz!==undefined?m.comp_hz.toFixed(1):"--");
-  const mp=document.getElementById("modePill");
-  mp.textContent = m.mode_str || "MODE ?";
-  mp.className = "pill "+({1:"ok",2:"warn",3:"bad",4:"bad"}[m.mode]||"");
   const crc=document.getElementById("hCrc");
   crc.textContent=m.crc_errors; crc.className = m.crc_errors>0 ? "stale":"";
   document.getElementById("hFresh").innerHTML =
