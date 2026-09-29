@@ -6,7 +6,9 @@
 #
 #   sudo systemctl status afc-bridge        # is it up?
 #   journalctl -u afc-bridge -f             # live log (the 1 Hz [health] line lands here)
-#   sudo systemctl restart afc-bridge       # safe (T-C2); NEVER restart the agent
+#   sudo systemctl restart afc-bridge       # safe (T-C2). Restarting the agent is also
+#                                           #   safe on firmware built with patch_px4.py
+#                                           #   steps 4-6 (FC reconnects in seconds, D1/D2)
 #   sudo systemctl stop afc-bridge          # before running the bridge by hand
 #                                           #   (it holds /dev/ttyAMA1 exclusively)
 

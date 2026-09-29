@@ -94,7 +94,7 @@ message, and QGC shows/speaks it):
   - topic: /fmu/in/mavlink_log
     type: px4_msgs::msg::MavlinkLog
 ```
-Fold this into the S14 rebuild (release/1.17 + #25873 keep-alive + #26848 reconnect),
+Applied by `patch_px4.py` step 3 (see "Firmware prereqs" in Appendix B),
 together with any low-rate state topics wanted in bags (use `rate_limit:` on each,
 and keep TELEM2 load well below the torque/thrust stream -- that link is the CMD path).
 The bridge stamps each MavlinkLog with an FC-clock estimate taken from
@@ -324,20 +324,31 @@ so the Pi↔FC link carries only DDS telemetry — one link, one middleware.
 - ARM = `vehicle_status.arming_state == ARMING_STATE_ARMED` (strict; the tiny does
   no failsafe reasoning — the FC flips arming_state and it propagates).
 
-**Transport:** serial, **TELEM2** (= `/dev/ttyS2` on Pixhawk 6C) direct-wired to the
+**Transport:** serial, **TELEM2** (= `/dev/ttyS2` on this FC: fmu-v5 / Pixhawk 4 class,
+`ver all` -> `PX4_FMU_V5`, STM32F765) direct-wired to the
 Pi PL011 (`serial0` → `ttyAMA0`, GPIO14/15) @921600. *(Historically an FTDI; the
 FTDI notes below are kept for reference only — it has been removed.)*
 Not the FMU-USB (that defaults to MAVLink; MAVLink and DDS can't share a CDC).
 
-**Firmware prereqs (one rebuild):**
+**Firmware prereqs (one rebuild):** PX4 **v1.17.0** tag, pristine submodule in the
+flow-angle workspace, patched by `px4_flow_angle/tools/patch_px4.py` (content-matched,
+idempotent -- re-run after any `git checkout`), built as
+`make px4_fmu-v5_default EXTERNAL_MODULES_LOCATION=$PWD/../px4_flow_angle`.
 1. `uxrce_dds_client` module enabled (`make <target> boardconfig` → modules) — was
    off for flash on the alpha/beta build.
-2. `/fmu/out/vehicle_torque_setpoint` + `/fmu/out/vehicle_thrust_setpoint` added to
-   `dds_topics.yaml` publications (they ship `/fmu/in/` only). `vehicle_status`
-   publishes by default.
+2. Script step 3: `/fmu/out/vehicle_torque_setpoint` + `/fmu/out/vehicle_thrust_setpoint`
+   publications (they ship `/fmu/in/` only) and the `/fmu/in/mavlink_log` subscription.
+   `vehicle_status` publishes by default.
 3. Keep `/fmu/in/offboard_control_mode` in subscriptions (needed by the keep-alive).
-4. Recommended: the 2-line **#25873** patch to `uxrce_dds_client.cpp` (gate
-   connectivity on TX alone) so the keep-alive becomes optional.
+4. Script step 4: upstream **#26848** reconnect fix (on PX4 main, not in v1.17.0).
+5. Script step 5 (ours, not upstream): drain TELEM2 TX before the client closes the
+   port on reconnect. Without it an agent outage / cable pull wedged TELEM2 TX
+   (USART3 TX DMA shut down mid-transfer) until an FC reboot -- see troubleshooting.
+6. Script step 6: pre-session ping loop capped at 15 pings, then a clean transport
+   re-open (the configuration validated in D1/D2).
+
+There is no firmware fix for **#25873** to apply: it is an issue closed "not planned",
+so the Pi keep-alive below is the permanent workaround.
 
 **Agent (Pi) — version MUST match the client:** PX4 1.17 client is Micro-XRCE
 **v2.x** → build agent **v2.4.3**:
@@ -374,7 +385,7 @@ ros2 topic echo /afc/health         # cmd_fresh, src=PRIMARY (armed), arm_counte
   second. `UXRCE_DDS_RX_TO=-1` does NOT stop it.
 - Fix: publish any inert `/fmu/in/` topic → rx != 0 → ping suppressed. Bridge
   publishes `offboard_control_mode` @5 Hz (in-node). Confirmed: 13 Hz/1.0 s →
-  25 Hz/0.07 s. Permanent fix = the 2-line firmware patch above.
+  25 Hz/0.07 s. This is the permanent fix: #25873 was closed "not planned" upstream.
 
 **DDS troubleshooting (symptom → cause → fix):**
 
@@ -387,4 +398,6 @@ ros2 topic echo /afc/health         # cmd_fresh, src=PRIMARY (armed), arm_counte
 | topics listed but `echo` empty | px4_msgs≠firmware, or reliable QoS | match px4_msgs; subscribe best-effort (SENSOR_DATA) |
 | `vehicle_status` present, setpoints absent | `/fmu/out/` torque/thrust not in `dds_topics.yaml` | add them + rebuild firmware |
 | setpoints all zeros | disarmed / not in a rate mode | arm in rate mode; zeros disarmed are normal |
-| wrong TELEM2 port | 6C TELEM2 = ttyS2 (not ttyS1) | `mavlink start -d /dev/ttyS2`; `mavlink status` prints the device |
+| wrong TELEM2 port | fmu-v5 TELEM2 = ttyS2 (TELEM1 = ttyS1) | `mavlink status` / `uxrce_dds_client status` print the device |
+| after an agent outage or TELEM2 unplug: client loops `got no ping from agent` / `init serial`, Pi sees **no bytes** (sniff), only an FC reboot recovers | client closed the O_NONBLOCK port mid-TX-DMA -> TELEM2 TX wedged (NuttX, fmu-v5 USART3) | firmware without `patch_px4.py` step 5 -- rebuild; `uxrce_dds_client stop/start` recovers on the bench |
+| `serial TX did not drain (N B), flushing` in dmesg | TX was already stuck before a reconnect close | should never appear; report it with the preceding dmesg |

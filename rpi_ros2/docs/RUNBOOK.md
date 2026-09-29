@@ -48,8 +48,10 @@ ros2 launch afc_bridge afc_system.launch.py      # defaults: agent_dev=/dev/seri
 ```
 Watch for `create_client` / `create_participant` from the agent and
 `opened /dev/ttyAMA1 (exclusive)` from the bridge (which also starts the #25873
-keep-alive). Do NOT cycle the DDS link with Ctrl-C mid-session: an agent restart
-wedges the FC client until an FC reboot (S14).
+keep-alive). Restarting the agent mid-session is recoverable on firmware built with
+`patch_px4.py` steps 4-6: the FC reconnects a few seconds after the agent is back
+(D1/D2, 2026-09-28). While DDS is down the arm token stalls; past 10 s the Tiny
+reverts to SBUS. On older firmware an agent restart wedged the FC until a reboot.
 
 Running pieces by hand instead:
 ```bash
