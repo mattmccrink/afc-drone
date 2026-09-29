@@ -10,7 +10,8 @@
 //  mode switch any more (the old 'tlm on' handshake / g_binary_tlm are gone).
 //
 //  Telemetry payloads (all APPENDED fields keep earlier offsets unchanged):
-//    CTRL_TLM   0x81  55 B = 43 base + 4 fault-tree ext + 8 surfaces (4x i16)
+//    CTRL_TLM   0x81  61 B = 43 base + 4 fault-tree ext + 8 surfaces (4x i16)
+//                     + 1 air_causes + 1 flags2 + 4 node_stamp_ms (u32 millis)
 //                     flags: bit0 terminated, bit1 FC arm eligible (token live),
 //                            bit2 SBUS arm eligible, bit3 SBUS arm sw,
 //                            bit4 surfaces active (allocated), bit5 surface switch on
@@ -175,7 +176,9 @@ void tlm_service(uint32_t now) {
                    | (USE_REAL_SBUS    ? 0 : 0x20)                        // bit5 SIMULATED SBUS
                    | (USE_REAL_PRIMARY ? 0 : 0x40);                       // bit6 SIMULATED primary (Pi) input
     fput_u8(pl, i, flags2);
-    send_frame(FT_CTRL_TLM, pl, (uint8_t)i);   // i == 57
+    // ---- node clock (APPENDED 2026-09-29): same millis() as SENSOR_TLM / COMP_TLM ----
+    fput_u32(pl, i, now);
+    send_frame(FT_CTRL_TLM, pl, (uint8_t)i);   // i == 61
   } else {
     i = 0;
     for (int v = 0; v < VALVE_COUNT; ++v) fput_i16(pl, i, (int16_t)lroundf((got?fr.p_up[v]:0)  * 10.0f));

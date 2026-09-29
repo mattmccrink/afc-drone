@@ -79,7 +79,7 @@ is always framed and its USB is a console only.
 cd src/afc_bridge && PYTHONPATH=. python3 tools/wire_check.py
 ```
 
-Covers CMD/ARM out, CTRL_TLM (43/47/55 B), SENSOR_TLM, COMP_TLM (13/14 B) in,
+Covers CMD/ARM out, CTRL_TLM (43/47/55/56/57/61 B), SENSOR_TLM, COMP_TLM (13/14 B) in,
 magic resync, CRC-drop recovery, and the arm-token fresh / on-change / stale
 behavior.
 

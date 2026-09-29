@@ -1,7 +1,8 @@
 # Control telemetry from the RP2350 valve node (CTRL_TLM, frame type 0x81).
-# header.stamp is the Pi's ROS receipt time. This frame carries NO node clock
-# (only ValveNodeSensor does), so cross-stream correlation uses the sensor
-# frame's node_stamp_ms plus the offset it establishes.
+# header.stamp is the Pi's ROS receipt time; node_stamp_ms (end of message) is the
+# tiny's own millis() at frame build, the same clock as ValveNodeSensor and
+# ValveNodeComp, so control, sensor and compressor frames align in bags without
+# USB/scheduling jitter.
 std_msgs/Header header
 
 # active command source
@@ -57,3 +58,6 @@ bool cal_flash              # calibration loaded from flash (false = compiled de
 bool sim_sensors            # tiny built with SIMULATED sensors/servos (USE_REAL_I2C=0)
 bool sim_sbus               # tiny built with SIMULATED SBUS (USE_REAL_SBUS=0)
 bool sim_primary            # tiny built with SIMULATED primary input (USE_REAL_PRIMARY=0)
+
+# ---- node clock (CTRL_TLM ext5, 2026-09-29) ----
+uint32 node_stamp_ms        # RP2350 millis() when the frame was built; 0 = older firmware

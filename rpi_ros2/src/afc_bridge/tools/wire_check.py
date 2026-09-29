@@ -10,6 +10,7 @@ import sys
 
 from afc_bridge import framing as F
 from afc_bridge.arm_token import ArmTokenTx
+from afc_bridge.cmd_gate import setpoints_fresh
 from afc_bridge.qgc_alert import AirAlerter, alert_text, encode_text
 
 # Tiny arm-token semantics (Q5, 2026-09-22; config.h):
@@ -311,6 +312,38 @@ def test_flags2_and_venturi_reason():
           ds56["why"] == [0 if v else 255 for v in valid])
 
 
+def test_ctrl_node_stamp():
+    print("CTRL_TLM node clock (61 B)")
+    valve = [0] * 6; servo = [1500] * 12; surf = [0, 0, 0, 0]
+    pl = struct.pack("<BBBBHB", 0, 1, 3, 1, 30000, 5)
+    pl += struct.pack("<6h", *valve) + struct.pack("<12H", *servo)
+    pl += struct.pack("<BBBB", 1, 0x02, 100, 100) + struct.pack("<4h", *surf)
+    pl += bytes([0x00, 0x02])                             # air_causes, flags2 (sbus_ok)
+    stamp = 0xFEDCBA98                                    # > 2^31: catches a signed unpack
+    pl += struct.pack("<I", stamp)
+    got = list(F.FrameReader().feed(F.build_frame(F.FT_CTRL_TLM, pl)))
+    check("one 61-byte CTRL frame", len(got) == 1 and len(got[0].payload) == F.CTRL_TLM_LEN_EXT5)
+    d = F.decode_ctrl_tlm(got[0].payload)
+    check("node_stamp_ms round-trip (unsigned)", d["node_stamp_ms"] == stamp)
+    check("earlier fields unaffected", d["flags2_valid"] and d["sbus_ok"] and d["mode"] == 1)
+    d57 = F.decode_ctrl_tlm(got[0].payload[:57])
+    check("57-byte (older) frame: node_stamp_ms = 0, flags2 still decoded",
+          d57["node_stamp_ms"] == 0 and d57["flags2_valid"])
+
+
+def test_setpoint_gate():
+    print("CMD gate: both torque and thrust must be fresh")
+    w = 0.1
+    check("nothing received -> not fresh", not setpoints_fresh(1.0, None, None, w))
+    check("torque only -> not fresh", not setpoints_fresh(1.0, 0.99, None, w))
+    check("both recent -> fresh", setpoints_fresh(1.0, 0.95, 0.97, w))
+    check("thrust stalled, torque live -> NOT fresh (old behaviour forwarded)",
+          not setpoints_fresh(1.0, 0.999, 0.85, w))
+    check("torque stalled, thrust live -> NOT fresh", not setpoints_fresh(1.0, 0.85, 0.999, w))
+    check("older exactly at the window -> not fresh",       # binary-exact values
+          not setpoints_fresh(2.0, 1.875, 1.95, 0.125))
+
+
 def test_qgc_alerter():
     print("QGC alert policy (air severity -> mavlink_log -> STATUSTEXT)")
     a = AirAlerter(min_gap_s=2.0)
@@ -335,7 +368,8 @@ def test_qgc_alerter():
 
 def main():
     for fn in [test_cmd_and_resync, test_ctrl_tlm, test_ctrl_tlm_ext, test_ctrl_tlm_air,
-               test_flags2_and_venturi_reason, test_qgc_alerter, test_comp_tlm,
+               test_flags2_and_venturi_reason, test_ctrl_node_stamp, test_setpoint_gate,
+               test_qgc_alerter, test_comp_tlm,
                test_sensor_tlm, test_arm_token]:
         fn()
     print()

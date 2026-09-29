@@ -177,6 +177,10 @@ SURF_COUNT = 4
 #                      B desat_rp*100,
 #                      B desat_yaw*100
 #   CTRL_TLM  (+8 B ext2, 55 total): 4h surf[] command, [-1000,1000], 0 = center
+#   CTRL_TLM  (+1 B ext3, 56 total): B air_causes
+#   CTRL_TLM  (+1 B ext4, 57 total): B flags2 (SBUS link + build configuration)
+#   CTRL_TLM  (+4 B ext5, 61 total): I node_stamp_ms (tiny millis() at frame build,
+#                      same clock as SENSOR_TLM / COMP_TLM node_stamp_ms)
 #   SENSOR_TLM (56 B): 6h p_up*10, 6h p_lo*10, 6h t_die*100, 6h mdot*10,
 #                      1h mdot_total*10, H valid_mask, I node_stamp_ms
 #   COMP_TLM   (13 B): H volt*100, H amp*100, h rpm/10, B temp_c, b err, B ok,
@@ -188,6 +192,7 @@ CTRL_TLM_LEN_EXT = 47
 CTRL_TLM_LEN_EXT2 = 55
 CTRL_TLM_LEN_EXT3 = 56          # + air_causes byte (air-delivery severity rides flags bits 6-7)
 CTRL_TLM_LEN_EXT4 = 57          # + flags2 (SBUS link + build-configuration notices)
+CTRL_TLM_LEN_EXT5 = 61          # + node_stamp_ms (u32), 2026-09-29
 SENSOR_TLM_LEN_EXT = 62         # + per-venturi validity reason (6 x u8, VentHealth)
 
 # Tiny VentHealth reasons (types.h) -- why a venturi is (in)valid
@@ -220,7 +225,9 @@ def decode_ctrl_tlm(payload: bytes) -> dict:
              surf=[0] * SURF_COUNT, air_sev=0, air_causes=0,
              # flags2 defaults (pre-2026-09-27 firmware): unknown -> benign
              sbus_lost=False, sbus_ok=False, bench_build=False, cal_flash=False,
-             sim_sensors=False, sim_sbus=False, sim_primary=False, flags2_valid=False)
+             sim_sensors=False, sim_sbus=False, sim_primary=False, flags2_valid=False,
+             # node clock (pre-2026-09-29 firmware): 0 = not reported
+             node_stamp_ms=0)
     if len(payload) >= CTRL_TLM_LEN_EXT:
         mode, flags, drp, dyaw = struct.unpack_from("<BBBB", payload, 43)
         d.update(mode=mode, terminated=bool(flags & 0x01),
@@ -239,6 +246,8 @@ def decode_ctrl_tlm(payload: bytes) -> dict:
         d.update(sbus_lost=bool(f2 & 0x01), sbus_ok=bool(f2 & 0x02), bench_build=bool(f2 & 0x04),
                  cal_flash=bool(f2 & 0x08), sim_sensors=bool(f2 & 0x10), sim_sbus=bool(f2 & 0x20),
                  sim_primary=bool(f2 & 0x40), flags2_valid=True)
+    if len(payload) >= CTRL_TLM_LEN_EXT5:
+        d.update(node_stamp_ms=struct.unpack_from("<I", payload, 57)[0])
     return d
 
 

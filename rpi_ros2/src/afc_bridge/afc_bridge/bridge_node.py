@@ -29,8 +29,9 @@ Command source (PX4 1.14+ control allocation, all uXRCE-DDS / px4_msgs):
     Doodle MAVLink link straight to the FC, not this node.
 
 Fail-safe intent preserved on the Pi side:
-  * CMD is forwarded ONLY while the setpoint stream is fresh -- if it goes stale
-    we stop sending, letting the tiny's USB_CMD_TIMEOUT_MS revert to SBUS.
+  * CMD is forwarded ONLY while BOTH setpoints (torque and thrust) are fresh --
+    if either goes stale we stop sending, letting the tiny's USB_CMD_TIMEOUT_MS
+    revert to SBUS.
   * the arm token advances ONLY while vehicle_status is fresh (see arm_token.py).
 Both degrade toward the tiny's own reversion rather than freezing a last value.
 """
@@ -46,6 +47,7 @@ from std_msgs.msg import Header
 
 from afc_bridge import framing as F
 from afc_bridge.arm_token import ArmTokenTx
+from afc_bridge.cmd_gate import setpoints_fresh
 from afc_bridge.qgc_alert import AirAlerter, encode_text
 
 # All FC I/O is px4_msgs over uXRCE-DDS now (no MAVROS). Resolved lazily so a
@@ -110,11 +112,10 @@ class BridgeNode(Node):
         self._reader = F.FrameReader()
         self._torque = None              # latest (x,y,z) = roll,pitch,yaw demand
         self._thrust = None              # latest (x,y,z); z is the thrust axis
-        # Freshness keyed on the NEWER of the two setpoints: any setpoint arriving
-        # refreshes the command. Both ride the same DDS client at ~250 Hz, so a
-        # partial (one-topic) stall is unlikely; if you want strict both-fresh,
-        # track the two rx times separately and test the older one instead.
-        self._cmd_rx_mono = None         # monotonic time of the most recent setpoint
+        # Freshness is keyed on the OLDER of the two setpoints (cmd_gate): CMD
+        # carries both, so a stalled thrust topic must not ride on live torque.
+        self._torque_rx_mono = None      # monotonic arrival time of each setpoint
+        self._thrust_rx_mono = None
         self._armtx = ArmTokenTx(
             send=self._send_arm,
             heartbeat_s=1.0 / self.arm_hb_hz,
@@ -280,17 +281,16 @@ class BridgeNode(Node):
 
     def _on_torque(self, msg):
         self._torque = (float(msg.xyz[0]), float(msg.xyz[1]), float(msg.xyz[2]))
-        self._cmd_rx_mono = time.monotonic()
+        self._torque_rx_mono = time.monotonic()
 
     def _on_thrust(self, msg):
         self._thrust = (float(msg.xyz[0]), float(msg.xyz[1]), float(msg.xyz[2]))
-        self._cmd_rx_mono = time.monotonic()
+        self._thrust_rx_mono = time.monotonic()
 
     def _cmd_fresh(self, now: float) -> bool:
-        # need one of each setpoint, and the newer arrival within the window.
-        return (self._torque is not None and self._thrust is not None
-                and self._cmd_rx_mono is not None
-                and (now - self._cmd_rx_mono) < self.cmd_stale_s)
+        # both setpoints present, and the OLDER arrival within the window.
+        return setpoints_fresh(now, self._torque_rx_mono, self._thrust_rx_mono,
+                               self.cmd_stale_s)
 
     # ----------------------------------------------------------------- timers
     def _cmd_timer(self):
@@ -353,6 +353,7 @@ class BridgeNode(Node):
         m.surf = d["surf"]
         m.air_sev = d["air_sev"]
         m.air_causes = d["air_causes"]
+        m.node_stamp_ms = int(d["node_stamp_ms"])
         for k in ("flags2_valid", "sbus_lost", "sbus_ok", "bench_build", "cal_flash",
                   "sim_sensors", "sim_sbus", "sim_primary"):
             setattr(m, k, bool(d[k]))

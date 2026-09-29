@@ -1,0 +1,260 @@
+diff --git a/rp2350_valve_node/framing.ino b/rp2350_valve_node/framing.ino
+index 69fd90b..58c5c32 100644
+--- a/rp2350_valve_node/framing.ino
++++ b/rp2350_valve_node/framing.ino
+@@ -10,7 +10,8 @@
+ //  mode switch any more (the old 'tlm on' handshake / g_binary_tlm are gone).
+ //
+ //  Telemetry payloads (all APPENDED fields keep earlier offsets unchanged):
+-//    CTRL_TLM   0x81  55 B = 43 base + 4 fault-tree ext + 8 surfaces (4x i16)
++//    CTRL_TLM   0x81  61 B = 43 base + 4 fault-tree ext + 8 surfaces (4x i16)
++//                     + 1 air_causes + 1 flags2 + 4 node_stamp_ms (u32 millis)
+ //                     flags: bit0 terminated, bit1 FC arm eligible (token live),
+ //                            bit2 SBUS arm eligible, bit3 SBUS arm sw,
+ //                            bit4 surfaces active (allocated), bit5 surface switch on
+@@ -175,7 +176,9 @@ void tlm_service(uint32_t now) {
+                    | (USE_REAL_SBUS    ? 0 : 0x20)                        // bit5 SIMULATED SBUS
+                    | (USE_REAL_PRIMARY ? 0 : 0x40);                       // bit6 SIMULATED primary (Pi) input
+     fput_u8(pl, i, flags2);
+-    send_frame(FT_CTRL_TLM, pl, (uint8_t)i);   // i == 57
++    // ---- node clock (APPENDED 2026-09-29): same millis() as SENSOR_TLM / COMP_TLM ----
++    fput_u32(pl, i, now);
++    send_frame(FT_CTRL_TLM, pl, (uint8_t)i);   // i == 61
+   } else {
+     i = 0;
+     for (int v = 0; v < VALVE_COUNT; ++v) fput_i16(pl, i, (int16_t)lroundf((got?fr.p_up[v]:0)  * 10.0f));
+diff --git a/rpi_ros2/README.md b/rpi_ros2/README.md
+index df1eec4..70c59ed 100644
+--- a/rpi_ros2/README.md
++++ b/rpi_ros2/README.md
+@@ -79,7 +79,7 @@ is always framed and its USB is a console only.
+ cd src/afc_bridge && PYTHONPATH=. python3 tools/wire_check.py
+ ```
+ 
+-Covers CMD/ARM out, CTRL_TLM (43/47/55 B), SENSOR_TLM, COMP_TLM (13/14 B) in,
++Covers CMD/ARM out, CTRL_TLM (43/47/55/56/57/61 B), SENSOR_TLM, COMP_TLM (13/14 B) in,
+ magic resync, CRC-drop recovery, and the arm-token fresh / on-change / stale
+ behavior.
+ 
+diff --git a/rpi_ros2/src/afc_bridge/afc_bridge/bridge_node.py b/rpi_ros2/src/afc_bridge/afc_bridge/bridge_node.py
+index bf303f9..9586e83 100644
+--- a/rpi_ros2/src/afc_bridge/afc_bridge/bridge_node.py
++++ b/rpi_ros2/src/afc_bridge/afc_bridge/bridge_node.py
+@@ -29,8 +29,9 @@ Command source (PX4 1.14+ control allocation, all uXRCE-DDS / px4_msgs):
+     Doodle MAVLink link straight to the FC, not this node.
+ 
+ Fail-safe intent preserved on the Pi side:
+-  * CMD is forwarded ONLY while the setpoint stream is fresh -- if it goes stale
+-    we stop sending, letting the tiny's USB_CMD_TIMEOUT_MS revert to SBUS.
++  * CMD is forwarded ONLY while BOTH setpoints (torque and thrust) are fresh --
++    if either goes stale we stop sending, letting the tiny's USB_CMD_TIMEOUT_MS
++    revert to SBUS.
+   * the arm token advances ONLY while vehicle_status is fresh (see arm_token.py).
+ Both degrade toward the tiny's own reversion rather than freezing a last value.
+ """
+@@ -46,6 +47,7 @@ from std_msgs.msg import Header
+ 
+ from afc_bridge import framing as F
+ from afc_bridge.arm_token import ArmTokenTx
++from afc_bridge.cmd_gate import setpoints_fresh
+ from afc_bridge.qgc_alert import AirAlerter, encode_text
+ 
+ # All FC I/O is px4_msgs over uXRCE-DDS now (no MAVROS). Resolved lazily so a
+@@ -110,11 +112,10 @@ class BridgeNode(Node):
+         self._reader = F.FrameReader()
+         self._torque = None              # latest (x,y,z) = roll,pitch,yaw demand
+         self._thrust = None              # latest (x,y,z); z is the thrust axis
+-        # Freshness keyed on the NEWER of the two setpoints: any setpoint arriving
+-        # refreshes the command. Both ride the same DDS client at ~250 Hz, so a
+-        # partial (one-topic) stall is unlikely; if you want strict both-fresh,
+-        # track the two rx times separately and test the older one instead.
+-        self._cmd_rx_mono = None         # monotonic time of the most recent setpoint
++        # Freshness is keyed on the OLDER of the two setpoints (cmd_gate): CMD
++        # carries both, so a stalled thrust topic must not ride on live torque.
++        self._torque_rx_mono = None      # monotonic arrival time of each setpoint
++        self._thrust_rx_mono = None
+         self._armtx = ArmTokenTx(
+             send=self._send_arm,
+             heartbeat_s=1.0 / self.arm_hb_hz,
+@@ -280,17 +281,16 @@ class BridgeNode(Node):
+ 
+     def _on_torque(self, msg):
+         self._torque = (float(msg.xyz[0]), float(msg.xyz[1]), float(msg.xyz[2]))
+-        self._cmd_rx_mono = time.monotonic()
++        self._torque_rx_mono = time.monotonic()
+ 
+     def _on_thrust(self, msg):
+         self._thrust = (float(msg.xyz[0]), float(msg.xyz[1]), float(msg.xyz[2]))
+-        self._cmd_rx_mono = time.monotonic()
++        self._thrust_rx_mono = time.monotonic()
+ 
+     def _cmd_fresh(self, now: float) -> bool:
+-        # need one of each setpoint, and the newer arrival within the window.
+-        return (self._torque is not None and self._thrust is not None
+-                and self._cmd_rx_mono is not None
+-                and (now - self._cmd_rx_mono) < self.cmd_stale_s)
++        # both setpoints present, and the OLDER arrival within the window.
++        return setpoints_fresh(now, self._torque_rx_mono, self._thrust_rx_mono,
++                               self.cmd_stale_s)
+ 
+     # ----------------------------------------------------------------- timers
+     def _cmd_timer(self):
+@@ -353,6 +353,7 @@ class BridgeNode(Node):
+         m.surf = d["surf"]
+         m.air_sev = d["air_sev"]
+         m.air_causes = d["air_causes"]
++        m.node_stamp_ms = int(d["node_stamp_ms"])
+         for k in ("flags2_valid", "sbus_lost", "sbus_ok", "bench_build", "cal_flash",
+                   "sim_sensors", "sim_sbus", "sim_primary"):
+             setattr(m, k, bool(d[k]))
+diff --git a/rpi_ros2/src/afc_bridge/afc_bridge/cmd_gate.py b/rpi_ros2/src/afc_bridge/afc_bridge/cmd_gate.py
+new file mode 100644
+index 0000000..cad66d5
+--- /dev/null
++++ b/rpi_ros2/src/afc_bridge/afc_bridge/cmd_gate.py
+@@ -0,0 +1,18 @@
++"""Setpoint freshness gate for CMD forwarding (pure logic, no ROS imports).
++
++CMD carries torque (roll/pitch/yaw) AND thrust, so it is forwarded only while
++BOTH setpoints are fresh: the OLDER of the two arrivals must be inside the
++window. Keying on the newer arrival (the pre-2026-09-29 behaviour) let a
++stalled thrust topic ride on a live torque topic, freezing its last value.
++"""
++from __future__ import annotations
++
++from typing import Optional
++
++
++def setpoints_fresh(now: float, t_torque: Optional[float], t_thrust: Optional[float],
++                    window_s: float) -> bool:
++    """True iff both setpoints have arrived and the older is < window_s old."""
++    if t_torque is None or t_thrust is None:
++        return False
++    return (now - min(t_torque, t_thrust)) < window_s
+diff --git a/rpi_ros2/src/afc_bridge/afc_bridge/framing.py b/rpi_ros2/src/afc_bridge/afc_bridge/framing.py
+index aa566ef..1dd4ce7 100644
+--- a/rpi_ros2/src/afc_bridge/afc_bridge/framing.py
++++ b/rpi_ros2/src/afc_bridge/afc_bridge/framing.py
+@@ -177,6 +177,10 @@ SURF_COUNT = 4
+ #                      B desat_rp*100,
+ #                      B desat_yaw*100
+ #   CTRL_TLM  (+8 B ext2, 55 total): 4h surf[] command, [-1000,1000], 0 = center
++#   CTRL_TLM  (+1 B ext3, 56 total): B air_causes
++#   CTRL_TLM  (+1 B ext4, 57 total): B flags2 (SBUS link + build configuration)
++#   CTRL_TLM  (+4 B ext5, 61 total): I node_stamp_ms (tiny millis() at frame build,
++#                      same clock as SENSOR_TLM / COMP_TLM node_stamp_ms)
+ #   SENSOR_TLM (56 B): 6h p_up*10, 6h p_lo*10, 6h t_die*100, 6h mdot*10,
+ #                      1h mdot_total*10, H valid_mask, I node_stamp_ms
+ #   COMP_TLM   (13 B): H volt*100, H amp*100, h rpm/10, B temp_c, b err, B ok,
+@@ -188,6 +192,7 @@ CTRL_TLM_LEN_EXT = 47
+ CTRL_TLM_LEN_EXT2 = 55
+ CTRL_TLM_LEN_EXT3 = 56          # + air_causes byte (air-delivery severity rides flags bits 6-7)
+ CTRL_TLM_LEN_EXT4 = 57          # + flags2 (SBUS link + build-configuration notices)
++CTRL_TLM_LEN_EXT5 = 61          # + node_stamp_ms (u32), 2026-09-29
+ SENSOR_TLM_LEN_EXT = 62         # + per-venturi validity reason (6 x u8, VentHealth)
+ 
+ # Tiny VentHealth reasons (types.h) -- why a venturi is (in)valid
+@@ -220,7 +225,9 @@ def decode_ctrl_tlm(payload: bytes) -> dict:
+              surf=[0] * SURF_COUNT, air_sev=0, air_causes=0,
+              # flags2 defaults (pre-2026-09-27 firmware): unknown -> benign
+              sbus_lost=False, sbus_ok=False, bench_build=False, cal_flash=False,
+-             sim_sensors=False, sim_sbus=False, sim_primary=False, flags2_valid=False)
++             sim_sensors=False, sim_sbus=False, sim_primary=False, flags2_valid=False,
++             # node clock (pre-2026-09-29 firmware): 0 = not reported
++             node_stamp_ms=0)
+     if len(payload) >= CTRL_TLM_LEN_EXT:
+         mode, flags, drp, dyaw = struct.unpack_from("<BBBB", payload, 43)
+         d.update(mode=mode, terminated=bool(flags & 0x01),
+@@ -239,6 +246,8 @@ def decode_ctrl_tlm(payload: bytes) -> dict:
+         d.update(sbus_lost=bool(f2 & 0x01), sbus_ok=bool(f2 & 0x02), bench_build=bool(f2 & 0x04),
+                  cal_flash=bool(f2 & 0x08), sim_sensors=bool(f2 & 0x10), sim_sbus=bool(f2 & 0x20),
+                  sim_primary=bool(f2 & 0x40), flags2_valid=True)
++    if len(payload) >= CTRL_TLM_LEN_EXT5:
++        d.update(node_stamp_ms=struct.unpack_from("<I", payload, 57)[0])
+     return d
+ 
+ 
+diff --git a/rpi_ros2/src/afc_bridge/tools/wire_check.py b/rpi_ros2/src/afc_bridge/tools/wire_check.py
+index aeb6cd7..659ea32 100644
+--- a/rpi_ros2/src/afc_bridge/tools/wire_check.py
++++ b/rpi_ros2/src/afc_bridge/tools/wire_check.py
+@@ -10,6 +10,7 @@ import sys
+ 
+ from afc_bridge import framing as F
+ from afc_bridge.arm_token import ArmTokenTx
++from afc_bridge.cmd_gate import setpoints_fresh
+ from afc_bridge.qgc_alert import AirAlerter, alert_text, encode_text
+ 
+ # Tiny arm-token semantics (Q5, 2026-09-22; config.h):
+@@ -311,6 +312,38 @@ def test_flags2_and_venturi_reason():
+           ds56["why"] == [0 if v else 255 for v in valid])
+ 
+ 
++def test_ctrl_node_stamp():
++    print("CTRL_TLM node clock (61 B)")
++    valve = [0] * 6; servo = [1500] * 12; surf = [0, 0, 0, 0]
++    pl = struct.pack("<BBBBHB", 0, 1, 3, 1, 30000, 5)
++    pl += struct.pack("<6h", *valve) + struct.pack("<12H", *servo)
++    pl += struct.pack("<BBBB", 1, 0x02, 100, 100) + struct.pack("<4h", *surf)
++    pl += bytes([0x00, 0x02])                             # air_causes, flags2 (sbus_ok)
++    stamp = 0xFEDCBA98                                    # > 2^31: catches a signed unpack
++    pl += struct.pack("<I", stamp)
++    got = list(F.FrameReader().feed(F.build_frame(F.FT_CTRL_TLM, pl)))
++    check("one 61-byte CTRL frame", len(got) == 1 and len(got[0].payload) == F.CTRL_TLM_LEN_EXT5)
++    d = F.decode_ctrl_tlm(got[0].payload)
++    check("node_stamp_ms round-trip (unsigned)", d["node_stamp_ms"] == stamp)
++    check("earlier fields unaffected", d["flags2_valid"] and d["sbus_ok"] and d["mode"] == 1)
++    d57 = F.decode_ctrl_tlm(got[0].payload[:57])
++    check("57-byte (older) frame: node_stamp_ms = 0, flags2 still decoded",
++          d57["node_stamp_ms"] == 0 and d57["flags2_valid"])
++
++
++def test_setpoint_gate():
++    print("CMD gate: both torque and thrust must be fresh")
++    w = 0.1
++    check("nothing received -> not fresh", not setpoints_fresh(1.0, None, None, w))
++    check("torque only -> not fresh", not setpoints_fresh(1.0, 0.99, None, w))
++    check("both recent -> fresh", setpoints_fresh(1.0, 0.95, 0.97, w))
++    check("thrust stalled, torque live -> NOT fresh (old behaviour forwarded)",
++          not setpoints_fresh(1.0, 0.999, 0.85, w))
++    check("torque stalled, thrust live -> NOT fresh", not setpoints_fresh(1.0, 0.85, 0.999, w))
++    check("older exactly at the window -> not fresh",       # binary-exact values
++          not setpoints_fresh(2.0, 1.875, 1.95, 0.125))
++
++
+ def test_qgc_alerter():
+     print("QGC alert policy (air severity -> mavlink_log -> STATUSTEXT)")
+     a = AirAlerter(min_gap_s=2.0)
+@@ -335,7 +368,8 @@ def test_qgc_alerter():
+ 
+ def main():
+     for fn in [test_cmd_and_resync, test_ctrl_tlm, test_ctrl_tlm_ext, test_ctrl_tlm_air,
+-               test_flags2_and_venturi_reason, test_qgc_alerter, test_comp_tlm,
++               test_flags2_and_venturi_reason, test_ctrl_node_stamp, test_setpoint_gate,
++               test_qgc_alerter, test_comp_tlm,
+                test_sensor_tlm, test_arm_token]:
+         fn()
+     print()
+diff --git a/rpi_ros2/src/afc_bridge_msgs/msg/ValveNodeCtrl.msg b/rpi_ros2/src/afc_bridge_msgs/msg/ValveNodeCtrl.msg
+index 221e840..04553b4 100644
+--- a/rpi_ros2/src/afc_bridge_msgs/msg/ValveNodeCtrl.msg
++++ b/rpi_ros2/src/afc_bridge_msgs/msg/ValveNodeCtrl.msg
+@@ -1,7 +1,8 @@
+ # Control telemetry from the RP2350 valve node (CTRL_TLM, frame type 0x81).
+-# header.stamp is the Pi's ROS receipt time. This frame carries NO node clock
+-# (only ValveNodeSensor does), so cross-stream correlation uses the sensor
+-# frame's node_stamp_ms plus the offset it establishes.
++# header.stamp is the Pi's ROS receipt time; node_stamp_ms (end of message) is the
++# tiny's own millis() at frame build, the same clock as ValveNodeSensor and
++# ValveNodeComp, so control, sensor and compressor frames align in bags without
++# USB/scheduling jitter.
+ std_msgs/Header header
+ 
+ # active command source
+@@ -57,3 +58,6 @@ bool cal_flash              # calibration loaded from flash (false = compiled de
+ bool sim_sensors            # tiny built with SIMULATED sensors/servos (USE_REAL_I2C=0)
+ bool sim_sbus               # tiny built with SIMULATED SBUS (USE_REAL_SBUS=0)
+ bool sim_primary            # tiny built with SIMULATED primary input (USE_REAL_PRIMARY=0)
++
++# ---- node clock (CTRL_TLM ext5, 2026-09-29) ----
++uint32 node_stamp_ms        # RP2350 millis() when the frame was built; 0 = older firmware
