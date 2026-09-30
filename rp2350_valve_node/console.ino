@@ -72,6 +72,8 @@ static void print_help() {
     "  sweep <A|B|C> <ch> [min max ms]  triangle-sweep one channel (default 1000 2000 2000)\n"
     "  step <A|B|C> <ch> [min max step_us hold_ms]  step one channel (default 1000 2000 100 200)\n"
     "  save                    persist current calibration to LittleFS\n"
+    "  map                     print servo -> valve map (servo s = board s/4, channel s%4)\n"
+    "  map S V                 assign servo S (0..11) to valve V (0..5); 'save' to keep (I13)\n"
     "  zero                    capture no-flow dp offset per valve, then save\n"
     "  calshow                 show calibration source + servo0 coeffs + dp_zero\n"
     "  vhealth                 per-venturi validity reason + per-sensor read/fault counters\n"
@@ -309,6 +311,30 @@ static void dispatch(char* line) {
     }
     Serial.printf("[sens] total=%.3f g/s  nvalid=%u\n", (double)fr.mdot_total, fr.n_valid); 
   }           
+  else if (eq(tok[0], "map")) {
+    // I13: the servo -> valve assignment lives in the calibration blob (LittleFS).
+    // Physical output of servo s is fixed: board 'A'+s/4, channel s%4.
+    if (n >= 3) {
+      if (g_status.armed) { Serial.println(F("[map] refused: disarm first")); return; }
+      int sv = atoi(tok[1]), vv = atoi(tok[2]);
+      if (sv < 0 || sv >= SERVO_COUNT || vv < 0 || vv >= VALVE_COUNT) {
+        Serial.printf("[map] usage: map S V   (S 0..%d, V 0..%d)\n", SERVO_COUNT - 1, VALVE_COUNT - 1);
+        return;
+      }
+      g_servo_valve_map[sv] = (uint8_t)vv;
+      Serial.printf("[map] servo %d (board %c ch%d) -> valve %d  (not saved: 'save' to persist)\n",
+                    sv, 'A' + sv / VALVE_SERVOS_PER_PCA, sv % VALVE_SERVOS_PER_PCA, vv + 1);
+    }
+    int per[VALVE_COUNT] = {0};
+    for (int sv = 0; sv < SERVO_COUNT; ++sv) {
+      int vv = g_servo_valve_map[sv];
+      if (vv < VALVE_COUNT) per[vv]++;
+      Serial.printf("[map] servo %2d  board %c ch%d  -> valve %d\n",
+                    sv, 'A' + sv / VALVE_SERVOS_PER_PCA, sv % VALVE_SERVOS_PER_PCA, vv + 1);
+    }
+    for (int vv = 0; vv < VALVE_COUNT; ++vv)
+      if (per[vv] != 2) Serial.printf("[map] NOTE valve %d has %d servo(s) (expected 2)\n", vv + 1, per[vv]);
+  }
   else if (eq(tok[0], "save")) {
     // Flash writes pause core 1 (sensor reads + servo writes): never while armed.
     if (g_status.armed) { Serial.println(F("[cal] refused: disarm first")); return; }
