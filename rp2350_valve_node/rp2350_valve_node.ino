@@ -149,6 +149,9 @@ static const char* reset_cause_name() {
 
 void setup() {
   g_reset_cause = reset_cause_name();   // before anything else can reboot us
+#if BENCH_HOOKS
+  bench_i2c_boot();           // bench only: re-assert a persisted 'i2cstick'
+#endif
   Serial.begin(115200);
   led_setup();
   framing_setup();
@@ -183,6 +186,7 @@ void setup() {
   Serial.printf("[boot] reset cause: %s\n", g_reset_cause);
 #if BENCH_HOOKS
   Serial.println(F("[boot] *** BENCH_HOOKS ENABLED -- NOT A FLIGHT BUILD ***"));
+  bench_i2c_report_boot();
 #endif
   Serial.println(F("type 'help' for the bench console"));
 
@@ -228,6 +232,9 @@ void loop() {
   tlm_service(now);             // binary telemetry out to the Pi (always)
   console_service(now);         // human status line (if 'mon on')
   watchdog_service(now);        // RGB status + conditional hardware watchdog pet
+#if BENCH_HOOKS
+  bench_i2c_service(now);       // timed release of an 'i2cstick'
+#endif
 }
 
 // =============================================================================
@@ -285,6 +292,9 @@ void loop1() {
     servos_service(tick);                   // gated: cal_load() completes before g_core0_ready
   }
 
+#if BENCH_HOOKS
+  bench_i2c_probe_tick();                   // 'i2cstick probe on': traffic with no devices
+#endif
   g_core1_heartbeat = tick;                 // liveness beat (watched by core 0)
   tick++;
 

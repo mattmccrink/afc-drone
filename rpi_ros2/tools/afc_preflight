@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# afc_preflight -- source ROS + the afc workspace, then run the preflight check.
+# Usage: afc_preflight [--bench] [-t SECONDS]      (see afc_preflight.py)
+set -eo pipefail
+source /opt/ros/humble/setup.bash
+source "${AFC_WS:-/home/pi/afc-drone/rpi_ros2}/install/setup.bash"
+exec python3 "$(dirname "$(readlink -f "$0")")/afc_preflight.py" "$@"

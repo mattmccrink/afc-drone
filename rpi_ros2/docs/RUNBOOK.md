@@ -20,11 +20,17 @@ vcgencmd get_throttled        # want 0x0. nonzero = under-voltage; fix power fir
 ```
 
 ## 1. Get onto the Pi
-Pick the link the PC will use to reach the Pi:
-- **Flight-line / onboard (no router):** join the Pi's WiFi **hotspot**, then
-  `ssh pi@10.42.0.1`  → dashboard URL later is `ws://10.42.0.1:9090`.
-- **Bench over Ethernet/ICS:** `ssh pi@192.168.137.10`
-  → dashboard URL later is `ws://192.168.137.10:9090`.
+The Pi is `phoenix` and answers to **`phoenix.local`** (mDNS) as well as its fixed
+address `192.168.137.10`, over a cable or through the Doodle link (both bridge the
+same Ethernet segment):
+- `ssh pi@phoenix.local`   (or `ssh pi@192.168.137.10`)
+- dashboard URL: `ws://192.168.137.10:9090` (the default), or `ws://phoenix.local:9090`.
+  Prefer the IP over the radio: mDNS is multicast, and a mesh link may carry it poorly.
+
+Once Wi-Fi is disabled (`sudo pi_setup.sh wifi-off`), the old hotspot
+(`10.42.0.1`) no longer exists. If you are ever locked out, see *Recovery* in
+`tools/pi_setup.sh`: every setting it makes can be undone from the SD card's boot
+partition on any laptop.
 
 ## 2. Confirm the two serial devices
 Both links are soldered GPIO UARTs (no USB, no FTDI). The FC is on `serial0`
@@ -82,6 +88,17 @@ ros2 topic hz /fmu/out/vehicle_torque_setpoint   # steady, max ~0.07s (NOT 1.0s)
 - Link dot goes green; valve schematic, charts, and health populate.
 
 ---
+
+## 9. Preflight check (before every flight)
+The agent and bridge normally start at boot as services (`microxrce-agent`,
+`afc-bridge`); the preflight checks for those, so run it against the services, not a
+hand-started stack. With the vehicle disarmed and the FC powered:
+```bash
+afc_preflight            # flight: sim/bench builds, missing venturis, no RC = FAIL
+afc_preflight --bench    # bench: those become WARN
+```
+One PASS / WARN / FAIL line per check, ending GO or NO-GO (exit status 0 = GO).
+Clear every FAIL before arming for flight.
 
 ## Shutdown
 Ctrl-C the launch (or terminals C → B → A). The Tiny reverts to SBUS/SAFE when

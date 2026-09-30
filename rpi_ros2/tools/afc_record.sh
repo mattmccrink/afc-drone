@@ -29,6 +29,7 @@ TOPICS=(
   /fmu/out/vehicle_torque_setpoint
   /fmu/out/vehicle_thrust_setpoint
   /fmu/out/vehicle_status_v1
+  /fmu/out/vehicle_gps_position     # GPS UTC <-> FC time: aligns the bag with the ulog and wall clock
   /afc/ctrl_tlm
   /afc/sensor_tlm
   /afc/compressor

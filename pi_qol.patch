@@ -1,0 +1,853 @@
+diff --git a/rpi_ros2/docs/RUNBOOK.md b/rpi_ros2/docs/RUNBOOK.md
+index 7a830ca..40294e2 100644
+--- a/rpi_ros2/docs/RUNBOOK.md
++++ b/rpi_ros2/docs/RUNBOOK.md
+@@ -20,11 +20,17 @@ vcgencmd get_throttled        # want 0x0. nonzero = under-voltage; fix power fir
+ ```
+ 
+ ## 1. Get onto the Pi
+-Pick the link the PC will use to reach the Pi:
+-- **Flight-line / onboard (no router):** join the Pi's WiFi **hotspot**, then
+-  `ssh pi@10.42.0.1`  → dashboard URL later is `ws://10.42.0.1:9090`.
+-- **Bench over Ethernet/ICS:** `ssh pi@192.168.137.10`
+-  → dashboard URL later is `ws://192.168.137.10:9090`.
++The Pi is `phoenix` and answers to **`phoenix.local`** (mDNS) as well as its fixed
++address `192.168.137.10`, over a cable or through the Doodle link (both bridge the
++same Ethernet segment):
++- `ssh pi@phoenix.local`   (or `ssh pi@192.168.137.10`)
++- dashboard URL: `ws://192.168.137.10:9090` (the default), or `ws://phoenix.local:9090`.
++  Prefer the IP over the radio: mDNS is multicast, and a mesh link may carry it poorly.
++
++Once Wi-Fi is disabled (`sudo pi_setup.sh wifi-off`), the old hotspot
++(`10.42.0.1`) no longer exists. If you are ever locked out, see *Recovery* in
++`tools/pi_setup.sh`: every setting it makes can be undone from the SD card's boot
++partition on any laptop.
+ 
+ ## 2. Confirm the two serial devices
+ Both links are soldered GPIO UARTs (no USB, no FTDI). The FC is on `serial0`
+@@ -83,6 +89,17 @@ ros2 topic hz /fmu/out/vehicle_torque_setpoint   # steady, max ~0.07s (NOT 1.0s)
+ 
+ ---
+ 
++## 9. Preflight check (before every flight)
++The agent and bridge normally start at boot as services (`microxrce-agent`,
++`afc-bridge`); the preflight checks for those, so run it against the services, not a
++hand-started stack. With the vehicle disarmed and the FC powered:
++```bash
++afc_preflight            # flight: sim/bench builds, missing venturis, no RC = FAIL
++afc_preflight --bench    # bench: those become WARN
++```
++One PASS / WARN / FAIL line per check, ending GO or NO-GO (exit status 0 = GO).
++Clear every FAIL before arming for flight.
++
+ ## Shutdown
+ Ctrl-C the launch (or terminals C → B → A). The Tiny reverts to SBUS/SAFE when
+ the bridge stops (by design); if it was armed with no SBUS it terminates after 3 s.
+diff --git a/rpi_ros2/tools/INSTALL.md b/rpi_ros2/tools/INSTALL.md
+index 90168f8..fade853 100644
+--- a/rpi_ros2/tools/INSTALL.md
++++ b/rpi_ros2/tools/INSTALL.md
+@@ -61,3 +61,56 @@ Checks: reboot the Pi and confirm the dashboard connects with no manual steps;
+ `sudo systemctl restart afc-bridge` while armed recovers PRIMARY without an FC
+ reboot (repeat of T-C2); `systemctl status microxrce-agent` shows the agent's
+ uptime unchanged by bridge restarts.
++
++---
++
++# Pi configuration + preflight (2026-09-29)
++
++`pi_setup.sh` makes the one-time Pi settings; `afc_preflight` is the go/no-go check.
++
++```bash
++cd ~/afc-drone/rpi_ros2/tools
++chmod +x pi_setup.sh afc_preflight afc_preflight.py
++ln -sf "$PWD/afc_preflight" ~/.local/bin/afc_preflight
++sudo ln -sf "$PWD/pi_setup.sh" /usr/local/bin/pi_setup.sh   # /usr/local/bin: sudo does not search ~/.local/bin
++
++pi_setup.sh status                    # read-only summary of what is set
++sudo pi_setup.sh hostname              # 'phoenix' + mDNS -> ssh pi@phoenix.local
++sudo pi_setup.sh wifi-off              # refuses unless eth0 is up and autoconnecting, and
++                                       # (if you are on SSH) unless your session is on eth0; then reboot
++```
++
++**Read-only root (protects the SD card from hard power cuts).** With it on, every
++write to the root filesystem goes to RAM and is discarded at power-off, so the
++bags must live on a separate filesystem first; `ro-root on` refuses otherwise. It
++uses the `overlayroot` package (install it once while the Pi has network:
++`sudo apt install overlayroot`) with `recurse=0`, so the bag drive and `/boot/firmware`
++stay real, writable filesystems. Not yet tried on this Pi: after the first reboot
++check `findmnt -R /` shows `/` as `overlay` and the bag drive and `/boot/firmware` as
++their own devices.
++
++```bash
++# 1. a USB drive for bags (ext4), mounted at ~/bags at every boot
++sudo mkfs.ext4 -L PHXBAGS /dev/sda1          # CHECK the device name first: lsblk
++echo 'LABEL=PHXBAGS /home/pi/bags ext4 defaults,noatime,nofail 0 2' | sudo tee -a /etc/fstab
++sudo mount -a && sudo chown pi:pi /home/pi/bags
++# 2. then
++sudo pi_setup.sh ro-root on && sudo reboot
++```
++To update software later: `sudo pi_setup.sh ro-root off`, reboot, `git pull` /
++`colcon build`, `ro-root on`, reboot.
++
++**Clock.** The Pi has no real-time clock and no internet in the field, so its time
++can be wrong, which scrambles bag names. Alignment with the PX4 log does not depend
++on it (bags carry FC timestamps, and now `/fmu/out/vehicle_gps_position`, which maps
++FC time to GPS UTC). To correct the Pi clock itself, with a GPS fix:
++
++```bash
++sudo systemctl stop afc-bridge; sudo pi_setup.sh time-from-gps; sudo systemctl start afc-bridge
++```
++It refuses while the bridge or a bag recording runs: stepping the clock under live
++ROS nodes can stall timers that run on system time. The agent keeps running (it
++carries the GPS topic).
++
++**Preflight:** `afc_preflight` (add `--bench` on the bench, where sim builds, missing
++venturis and no RC are WARN instead of FAIL). Exit status 0 = GO.
+diff --git a/rpi_ros2/tools/afc_dashboard.html b/rpi_ros2/tools/afc_dashboard.html
+index 154ea52..aa6381d 100644
+--- a/rpi_ros2/tools/afc_dashboard.html
++++ b/rpi_ros2/tools/afc_dashboard.html
+@@ -62,6 +62,11 @@
+   .ramp i{height:6px;border-radius:3px;background:linear-gradient(90deg,var(--neg),var(--mid) 45%,var(--mid) 55%,var(--pos))}
+   .health{display:grid;grid-template-columns:1fr 1fr;column-gap:18px}
+   .health .wide{grid-column:1/-1}
++  table.lq{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
++  table.lq th{font-weight:400;color:var(--dim);text-align:right;padding:1px 4px;font-size:11px}
++  table.lq th:first-child, table.lq td:first-child{text-align:left}
++  table.lq td{text-align:right;padding:1px 4px}
++  table.lq tr.stale td{color:var(--mute)}
+   .sub{font-size:10px;color:var(--dim);margin:0 0 6px}
+   .blk{position:relative}
+   .blk.stale > *{opacity:.28}
+@@ -168,6 +173,8 @@
+       <div class="kv"><span>arm counter</span><span id="hCtr" class="num">--</span></div>
+       <div class="kv"><span>node offset (ms)</span><span id="hOff" class="num">--</span></div>
+     </div>
++    <h2 class="sec">Link quality (last 10 s, as received here)</h2>
++    <table class="lq" id="lq"></table>
+   </div>
+ 
+   <!-- RIGHT: the air supply -- compressor, upstream pressure, mass flow -->
+@@ -213,13 +220,19 @@ const CFG = {
+     {x:258, y:85,  label:"RC"},
+   ],
+   valveAbsMax: 1000,     // |valve[]| full-scale for fill (int16 aero-intent units)
+-  deadband: 0.03,
++  deadband: 0.03,        // |value|/full-scale below this shows as neutral (no side colour)
+   // Upstream pressure is shown above ambient. The Tiny has no ambient sensor, so the
+   // reference is each venturi's own p_up while the compressor is at rest (disarmed,
+   // rpm below restRpm for restHoldMs); it also absorbs per-sensor offset. Frozen
+   // while running; kept in this browser for refHoldH so a mid-flight reconnect keeps it.
+   pGaugeFS: 150,         // mbar full-scale for the gauge bars (tweak once real data exists)
+-  restRpm: 500, restHoldMs: 2000, refHoldH: 2,        // |value|/full-scale below this shows as neutral (no side colour)
++  restRpm: 500, restHoldMs: 2000, refHoldH: 2,
++  // NO DATA overlay + alert greying, with hysteresis so a marginal radio link does
++  // not make them flicker: a source goes stale after staleEnterMs without a message
++  // (health, a 1 Hz topic: staleEnterHealthMs) and recovers once messages have
++  // flowed again for staleExitMs.
++  staleEnterMs: 2500, staleEnterHealthMs: 3500, staleExitMs: 500,
++  linkWindowMs: 10000,   // link-quality readout window
+   window: 300,           // samples kept in the strip charts (~15s @20Hz)
+   // Valve layout: index 0-5 = valves 1-6. Canard aircraft, top-down, nose UP.
+   //   1(idx0) port-outboard, 2(idx1) left-inboard, 3(idx2) right-inboard,
+@@ -362,15 +375,15 @@ function connect(){
+   const url=document.getElementById("url").value.trim();
+   ros=new ROSLIB.Ros({url});
+   const dot=document.getElementById("link"),txt=document.getElementById("linkTxt");
+-  ros.on("connection",()=>{dot.classList.add("on");txt.textContent="connected "+url;S.ros_up=true;subscribe();});
++  ros.on("connection",()=>{dot.classList.add("on");txt.textContent="connected "+url;S.ros_up=true;S.t_conn=performance.now();subscribe();});
+   ros.on("error",()=>{dot.classList.remove("on");txt.textContent="error";S.ros_up=false;});
+   ros.on("close",()=>{dot.classList.remove("on");txt.textContent="disconnected";S.ros_up=false;});
+ }
+ function sub(t){return new ROSLIB.Topic({ros,name:t.name,messageType:t.type,
+   throttle_rate:t.throttle,queue_length:1,queue_size:1});}
+ function subscribe(){
+-  sub(CFG.topics.torque).subscribe(m=>{TSRC.torque=performance.now();push(torque,[m.xyz[0],m.xyz[1],m.xyz[2]]);});
+-  sub(CFG.topics.thrust).subscribe(m=>{TSRC.thrust=performance.now();push(thrust,[m.xyz[2]]);});   // z-axis thrust
++  sub(CFG.topics.torque).subscribe(m=>{seen("torque");push(torque,[m.xyz[0],m.xyz[1],m.xyz[2]]);});
++  sub(CFG.topics.thrust).subscribe(m=>{seen("thrust");push(thrust,[m.xyz[2]]);});   // z-axis thrust
+   sub(CFG.topics.ctrl).subscribe(onCtrl);
+   sub(CFG.topics.sensor).subscribe(onSensor);
+   sub(CFG.topics.health).subscribe(onHealth);
+@@ -399,7 +412,7 @@ function updateAmbient(m){
+ }
+ function onSensor(m){
+   lastValid = m.valid;
+-  S.t_sensor = TSRC.sensor = performance.now();
++  seen("sensor"); S.t_sensor = TSRC.sensor;
+   S.why = m.why ? Array.from(m.why) : null;
+   for(let i=0;i<6;i++){
+     const why = S.why ? vhName(S.why[i]) : "x";
+@@ -503,7 +516,7 @@ const RULES = [
+    when:S=>S.f2 && !S.cal_flash, msg:"Tiny calibration from compiled defaults (no flash cal loaded)"},
+   // ---- links -------------------------------------------------------------
+   {id:"data", g:"Links", cls:"C", label:"DASH DATA", noStale:true,
+-   when:S=>!S.ros_up || now()-S.t_ctrl>1500, msg:S=>S.ros_up?"Dashboard data stale (no vehicle telemetry for >1.5 s)":"Dashboard disconnected from rosbridge"},
++   when:S=>!S.ros_up || STALE.ctrl, msg:S=>S.ros_up?"Dashboard data stale (no vehicle telemetry for >"+(CFG.staleEnterMs/1000)+" s)":"Dashboard disconnected from rosbridge"},
+   {id:"ser", g:"Links", cls:"C", label:"PI-TINY",
+    when:S=>S.serial===false, msg:"Pi <-> Tiny serial link DOWN"},
+   {id:"rate", g:"Links", cls:"A", label:"TLM RATE", holdMs:2000,
+@@ -549,7 +562,7 @@ function tone(freq, n){
+     g.gain.exponentialRampToValueAtTime(0.0001,t+0.14); o.start(t); o.stop(t+0.15);
+   }
+ }
+-function dataStale(){ return !S.ros_up || now()-S.t_ctrl>1500; }
++function dataStale(){ return !S.ros_up || STALE.ctrl; }     // hysteresis: see CFG.staleEnterMs
+ function evaluate(){
+   const tnow=now(), stale=dataStale();
+   for(const r of RULES){
+@@ -610,7 +623,7 @@ buildAnnunciator();
+ setInterval(evaluate, 200);
+ 
+ function onCtrl(m){
+-  lastCtrlT=performance.now(); TSRC.ctrl=lastCtrlT;
++  seen("ctrl"); lastCtrlT=TSRC.ctrl;
+   Object.assign(S, {t_ctrl:lastCtrlT, armed:!!m.armed, source:m.source, n_valid:m.n_valid,
+     surf:!!m.surf_engaged, surf_sw:!!m.surf_switch,
+     air_sev:(m.air_sev!==undefined?m.air_sev:0), air_causes:(m.air_causes||0),
+@@ -631,16 +644,52 @@ let lastCompT=0, lastCtrlT=0;
+ // frozen chart can never pass for a steady signal.
+ // ---------------------------------------------------------------------------
+ const TSRC = {torque:0, thrust:0, ctrl:0, sensor:0, comp:0, health:0};
+-const STALE_MS = {health:3000};            // 1 Hz topic; the rest stream at 10-25 Hz
+-setInterval(()=>{
++const ARR = {torque:[], thrust:[], ctrl:[], sensor:[], comp:[], health:[]};   // arrival times, linkWindowMs
++const STALE = {torque:true, thrust:true, ctrl:true, sensor:true, comp:true, health:true};
++function seen(k){
++  const t=performance.now(); TSRC[k]=t;
++  const a=ARR[k]; a.push(t);
++  while(a.length && t-a[0] > CFG.linkWindowMs) a.shift();
++}
++function updateStale(){
+   const t=performance.now();
+-  document.querySelectorAll(".blk[data-src]").forEach(el=>{
+-    const k=el.dataset.src;
+-    el.classList.toggle("stale", !S.ros_up || t-TSRC[k] > (STALE_MS[k]||1500));
+-  });
+-},250);
++  for(const k in STALE){
++    const enter = k==="health" ? CFG.staleEnterHealthMs : CFG.staleEnterMs;
++    if(!S.ros_up){ STALE[k]=true; continue; }
++    if(!STALE[k]){ if(t-TSRC[k] > enter) STALE[k]=true; continue; }
++    // recover only once data has flowed again for staleExitMs (health: any fresh message)
++    const recent = ARR[k].filter(x => t-x <= CFG.staleExitMs).length;
++    const flowing = k==="health" ? t-TSRC[k] < 1500 : (recent>=2 && t-TSRC[k] < 250);
++    const since = ARR[k].find(x => t-x <= CFG.staleExitMs + 250);
++    if(flowing && (k==="health" || (since!==undefined && t-since >= CFG.staleExitMs))) STALE[k]=false;
++  }
++  document.querySelectorAll(".blk[data-src]").forEach(el=>el.classList.toggle("stale", STALE[el.dataset.src]));
++}
++setInterval(updateStale,250);
++// ---- link quality: messages/s and worst gap per topic, as received by this browser ----
++const LQ_ROWS = [["torque","FC torque"],["thrust","FC thrust"],["ctrl","Tiny ctrl"],
++                 ["sensor","Tiny sensor"],["comp","compressor"],["health","bridge health"]];
++function renderLQ(){
++  const t=performance.now(), W=CFG.linkWindowMs;
++  let h='<tr><th>topic</th><th>msg/s</th><th>worst gap</th><th>last</th></tr>';
++  for(const [k,label] of LQ_ROWS){
++    const a=ARR[k].filter(x=>t-x<=W);
++    const span=Math.min(W, S.ros_up&&S.t_conn ? t-S.t_conn : W);
++    const rate = span>500 ? a.length/(span/1000) : 0;
++    let gap=0; for(let i=1;i<a.length;i++) gap=Math.max(gap,a[i]-a[i-1]);
++    if(a.length) gap=Math.max(gap, t-a[a.length-1]); else gap=span;
++    const bad = k==="health" ? gap>3000 : gap>1000;
++    const warn = k==="health" ? gap>1600 : gap>300;
++    const cls = bad?"pill bad":warn?"pill warn":"";
++    const last = TSRC[k] ? ((t-TSRC[k])/1000).toFixed(1)+" s" : "--";
++    h+=`<tr class="${STALE[k]?"stale":""}"><td>${label}</td><td>${rate.toFixed(1)}</td>`+
++       `<td><span class="${cls}">${(gap/1000).toFixed(2)} s</span></td><td>${last}</td></tr>`;
++  }
++  document.getElementById("lq").innerHTML=h;
++}
++setInterval(renderLQ,1000);
+ function onComp(m){
+-  lastCompT=performance.now(); TSRC.comp=lastCompT; S.rpm=m.rpm;
++  seen("comp"); lastCompT=TSRC.comp; S.rpm=m.rpm;
+   Object.assign(S, {t_comp:lastCompT, esc_err:m.err, esc_tlm_ok:!!m.tlm_ok,
+     thermal:!!m.thermal_suspect, esc_temp:m.temp_c});
+   if(m.err===-11) S.err11_t=lastCompT;     // -1/-8 outrank -11/-12 for a reply: hold ~1 s
+@@ -658,7 +707,7 @@ function onComp(m){
+ }
+ function onHealth(m){
+   if(S.crc!==null && m.crc_errors>S.crc) S.crc_rise_t=performance.now();   // rising, not the backlog
+-  TSRC.health=performance.now();
++  seen("health");
+   Object.assign(S, {t_health:TSRC.health, mode:m.mode, terminated:!!m.terminated,
+     serial:!!m.serial_connected, ctrl_hz:m.ctrl_hz, sensor_hz:m.sensor_hz, comp_hz:m.comp_hz,
+     crc:m.crc_errors, cmd_fresh:!!m.cmd_fresh, arm_fresh:!!m.arm_fresh,
+diff --git a/rpi_ros2/tools/afc_preflight b/rpi_ros2/tools/afc_preflight
+new file mode 100755
+index 0000000..343bcd5
+--- /dev/null
++++ b/rpi_ros2/tools/afc_preflight
+@@ -0,0 +1,7 @@
++#!/usr/bin/env bash
++# afc_preflight -- source ROS + the afc workspace, then run the preflight check.
++# Usage: afc_preflight [--bench] [-t SECONDS]      (see afc_preflight.py)
++set -eo pipefail
++source /opt/ros/humble/setup.bash
++source "${AFC_WS:-/home/pi/afc-drone/rpi_ros2}/install/setup.bash"
++exec python3 "$(dirname "$(readlink -f "$0")")/afc_preflight.py" "$@"
+diff --git a/rpi_ros2/tools/afc_preflight.py b/rpi_ros2/tools/afc_preflight.py
+new file mode 100755
+index 0000000..9f2f2d5
+--- /dev/null
++++ b/rpi_ros2/tools/afc_preflight.py
+@@ -0,0 +1,345 @@
++#!/usr/bin/env python3
++"""afc_preflight -- one-command go/no-go check of the Phoenix stack, run on the Pi.
++
++Listens to the live topics for a few seconds, reads a little system state, and
++prints one PASS / WARN / FAIL line per check. Exit status: 0 = no FAIL, 1 = at
++least one FAIL, 2 = could not run (ROS not sourced, etc.).
++
++    afc_preflight            # flight check: build flags, venturis, RC must be flight-ready
++    afc_preflight --bench    # bench: sim/bench builds, missing venturis, no RC -> WARN, not FAIL
++    afc_preflight -t 8       # listen 8 s instead of 5
++
++Run it with the vehicle DISARMED, the FC powered and the full stack up. It is
++read-only: it subscribes and reads; it never publishes or changes anything.
++
++The checks themselves (evaluate()) are plain Python so they can be tested off
++the Pi; only collect() needs ROS.
++"""
++from __future__ import annotations
++
++import argparse
++import os
++import shutil
++import subprocess
++import sys
++import time
++from dataclasses import dataclass, field
++from typing import Any, Dict, List, Optional
++
++PASS, WARN, FAIL, INFO = "PASS", "WARN", "FAIL", "INFO"
++
++BAG_DIR = os.environ.get("AFC_BAG_DIR", "/home/pi/bags")
++SERVICES = ["microxrce-agent", "afc-bridge"]
++
++# topic key -> (name, message type path)
++TOPICS = {
++    "torque": ("/fmu/out/vehicle_torque_setpoint", "px4_msgs.msg.VehicleTorqueSetpoint"),
++    "status": ("/fmu/out/vehicle_status_v1", "px4_msgs.msg.VehicleStatus"),
++    "gps":    ("/fmu/out/vehicle_gps_position", "px4_msgs.msg.SensorGps"),
++    "ctrl":   ("/afc/ctrl_tlm", "afc_bridge_msgs.msg.ValveNodeCtrl"),
++    "sensor": ("/afc/sensor_tlm", "afc_bridge_msgs.msg.ValveNodeSensor"),
++    "comp":   ("/afc/compressor", "afc_bridge_msgs.msg.ValveNodeComp"),
++    "health": ("/afc/health", "afc_bridge_msgs.msg.ValveNodeHealth"),
++}
++
++
++@dataclass
++class TopicObs:
++    times: List[float] = field(default_factory=list)   # monotonic arrival times
++    first: Any = None                                   # first message seen
++    last: Any = None                                    # latest message seen
++
++    @property
++    def n(self) -> int:
++        return len(self.times)
++
++    def rate(self, window: float) -> float:
++        return self.n / window if window > 0 else 0.0
++
++    def max_gap(self, t0: float, t1: float) -> float:
++        """Longest silence inside [t0, t1], counting the edges of the window."""
++        if not self.times:
++            return t1 - t0
++        pts = [t0] + self.times + [t1]
++        return max(b - a for a, b in zip(pts, pts[1:]))
++
++
++@dataclass
++class Result:
++    level: str
++    area: str
++    text: str
++
++
++def _lvl(bench: bool) -> str:
++    """Severity for flight-readiness items: FAIL in flight mode, WARN on the bench."""
++    return WARN if bench else FAIL
++
++
++def evaluate(obs: Dict[str, TopicObs], t0: float, t1: float, sysinfo: Dict[str, Any],
++             bench: bool = False) -> List[Result]:
++    R: List[Result] = []
++    win = t1 - t0
++    add = lambda lvl, area, text: R.append(Result(lvl, area, text))
++
++    # ---- services -----------------------------------------------------------
++    for svc, state in sysinfo.get("services", {}).items():
++        add(PASS if state == "active" else FAIL, "service", f"{svc}: {state}")
++
++    # ---- FC over DDS --------------------------------------------------------
++    tq = obs["torque"]
++    if tq.n == 0:
++        add(FAIL, "FC link", "no torque setpoints from the FC (DDS agent / TELEM2 / FC off?)")
++    else:
++        rate, gap = tq.rate(win), tq.max_gap(t0, t1)
++        lvl = PASS if rate >= 15 and gap < 0.3 else WARN
++        add(lvl, "FC link", f"torque setpoints {rate:.1f} Hz, longest gap {gap:.2f} s")
++    st = obs["status"]
++    if st.n == 0:
++        add(FAIL, "FC link", "no vehicle_status (arm token has no source)")
++    else:
++        armed = getattr(st.last, "arming_state", 0) == 2      # ARMING_STATE_ARMED
++        add(WARN if armed else PASS, "FC state", "FC ARMED -- preflight is meant to run disarmed"
++            if armed else "FC disarmed")
++
++    # ---- Pi <-> Tiny link (bridge health) -----------------------------------
++    h = obs["health"]
++    if h.n == 0:
++        add(FAIL, "Tiny link", "no /afc/health (bridge not running?)")
++    else:
++        m = h.last
++        if not m.serial_connected:
++            add(FAIL, "Tiny link", "Pi <-> Tiny serial DOWN")
++        else:
++            ok = m.ctrl_hz >= 20 and m.sensor_hz >= 20 and m.comp_hz >= 20
++            add(PASS if ok else WARN, "Tiny link",
++                f"ctrl {m.ctrl_hz:.1f} Hz, sensor {m.sensor_hz:.1f} Hz, comp {m.comp_hz:.1f} Hz")
++        dcrc = int(h.last.crc_errors) - int(h.first.crc_errors)
++        if dcrc < 0:
++            add(WARN, "Tiny link", "CRC counter went backwards: the bridge restarted during the check")
++        else:
++            add(PASS if dcrc == 0 else WARN, "Tiny link",
++                f"CRC errors +{dcrc} during the check (total {h.last.crc_errors})")
++        add(PASS if m.cmd_fresh else FAIL, "command path",
++            "bridge forwarding fresh FC commands" if m.cmd_fresh
++            else "bridge NOT forwarding commands (setpoints stale at the Pi)")
++        add(PASS if m.arm_fresh else FAIL, "command path",
++            f"arm token advancing (counter {m.arm_counter})" if m.arm_fresh
++            else "arm token NOT advancing (vehicle_status stale)")
++        if m.terminated:
++            add(FAIL, "mode", "Tiny TERMINATED (latched) -- re-arm from the FC or reboot the Tiny")
++        else:
++            add(INFO, "mode", f"Tiny mode {m.mode_str or m.mode}")
++
++    # ---- Tiny build + configuration (CTRL_TLM flags2) ----------------------
++    c = obs["ctrl"]
++    if c.n == 0:
++        add(FAIL, "Tiny build", "no /afc/ctrl_tlm")
++    else:
++        m = c.last
++        if not m.flags2_valid:
++            add(_lvl(bench), "Tiny build",
++                "build flags NOT reported (old firmware?): sim/bench build, calibration and RC unverified")
++        else:
++            sims = [n for n, on in (("sensors/servos", m.sim_sensors), ("SBUS", m.sim_sbus),
++                                    ("primary input", m.sim_primary)) if on]
++            add(_lvl(bench) if sims else PASS, "Tiny build",
++                "SIMULATED " + ", ".join(sims) if sims else "real sensors, SBUS and primary input")
++            add(_lvl(bench) if m.bench_build else PASS, "Tiny build",
++                "BENCH_HOOKS build (not a flight build)" if m.bench_build else "flight build (no bench hooks)")
++            add(PASS if m.cal_flash else _lvl(bench), "calibration",
++                "loaded from flash" if m.cal_flash else "compiled DEFAULTS (no flash calibration)")
++            # RC reversion must be available before flight
++            if m.sbus_ok and not m.sbus_lost:
++                add(PASS, "RC", "clean SBUS frames: reversion available")
++            else:
++                add(_lvl(bench), "RC", "no clean SBUS: reversion UNAVAILABLE")
++        stamp0, stamp1 = int(getattr(c.first, "node_stamp_ms", 0)), int(getattr(m, "node_stamp_ms", 0))
++        if c.n < 2:
++            add(INFO, "Tiny clock", "too few frames to check the node clock")
++        elif stamp1 == 0:
++            add(INFO, "Tiny clock", "CTRL_TLM carries no node timestamp (pre-61 B firmware)")
++        elif stamp1 <= stamp0:
++            add(WARN, "Tiny clock", f"node_stamp_ms not advancing ({stamp0} -> {stamp1}): Tiny rebooted?")
++        else:
++            add(PASS, "Tiny clock", f"up {stamp1 / 1000:.0f} s")
++        add(PASS if m.n_valid == 6 else _lvl(bench), "venturis",
++            f"{m.n_valid}/6 valid" + ("" if m.n_valid == 6 else " (all six required to fly)"))
++        if m.air_sev:
++            add(INFO, "air", f"air severity {m.air_sev} (causes 0x{m.air_causes:02X}) -- expected while disarmed if a venturi is out")
++
++    # ---- compressor controller --------------------------------------------
++    cp = obs["comp"]
++    if cp.n == 0:
++        add(FAIL, "compressor", "no /afc/compressor (Tiny <-> Teensy link?)")
++    else:
++        m = cp.last
++        # Disarmed, the Teensy only parses ESC telemetry while the motor runs, so a
++        # stale err / tlm_ok=false at rest is normal; only the build flag is decisive.
++        if m.err == -12:
++            add(_lvl(bench), "compressor", "Teensy is an ESC-EMULATION build (err -12): telemetry is fake")
++        elif m.err in (-10, -11):
++            add(WARN, "compressor", f"last ESC telemetry state err {m.err} (lost / open loop) -- check once spun up")
++        else:
++            add(PASS, "compressor", f"Teensy reporting (err {m.err}, ESC {m.temp_c} C)")
++        if m.thermal_suspect:
++            add(WARN, "compressor", "ESC thermal-derate flag set")
++
++    # ---- Pi health ------------------------------------------------------------
++    fs = sysinfo.get("bag_fstype")
++    if fs is None:
++        add(_lvl(bench), "Pi disk", f"bag directory {BAG_DIR} missing")
++    elif fs in ("overlay", "tmpfs"):
++        add(FAIL, "Pi disk", f"bags would go to RAM ({BAG_DIR} is on {fs}): is the bag drive mounted?")
++    elif not sysinfo.get("bag_writable", True):
++        add(FAIL, "Pi disk", f"{BAG_DIR} is not writable")
++    free = sysinfo.get("bag_free_gb")
++    if free is not None and fs is not None:
++        lvl = FAIL if free < 1 else WARN if free < 5 else PASS
++        add(lvl, "Pi disk", f"{free:.1f} GB free for bags ({BAG_DIR})")
++    thr = sysinfo.get("throttled")
++    if thr is not None:
++        if thr & 0x1:
++            add(FAIL, "Pi power", f"UNDER-VOLTAGE now (get_throttled 0x{thr:X})")
++        elif thr & 0xC:
++            add(WARN, "Pi power", f"CPU throttled / at temperature limit now (0x{thr:X})")
++        elif thr & 0x10000:
++            add(WARN, "Pi power", f"under-voltage has occurred since boot (0x{thr:X})")
++        else:
++            add(PASS, "Pi power", "no under-voltage since boot")
++    ro = sysinfo.get("overlay")
++    if ro is not None:
++        add(PASS if ro else INFO, "Pi SD card", "root is read-only (overlay): safe to power-cut"
++            if ro else "root is writable: a hard power cut can corrupt the SD card")
++    if sysinfo.get("wlan0"):
++        add(INFO, "Pi network", "Wi-Fi interface present (pi_setup.sh wifi-off to disable)")
++    rec = sysinfo.get("recording")
++    add(INFO, "recording", f"recording: {rec}" if rec else "not recording (afc_rec start <tag>)")
++
++    # ---- Pi clock vs GPS -----------------------------------------------------
++    g = obs["gps"]
++    if g.n and getattr(g.last, "fix_type", 0) >= 3 and getattr(g.last, "time_utc_usec", 0) > 0:
++        # time_utc_usec is the GPS solution time; transport lag is tens of ms.
++        off = sysinfo.get("wall_at_gps", time.time()) - g.last.time_utc_usec / 1e6
++        add(PASS if abs(off) < 5 else WARN, "Pi clock",
++            f"Pi clock {off:+.1f} s vs GPS" + ("" if abs(off) < 5 else
++                                               "  (fix: pi_setup.sh time-from-gps, with the bridge stopped)"))
++    else:
++        yr = time.gmtime(sysinfo.get("wall_at_gps", time.time())).tm_year
++        add(INFO if yr >= 2025 else WARN, "Pi clock", "no GPS fix to compare; Pi says "
++            + time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(sysinfo.get("wall_at_gps", time.time()))))
++    return R
++
++
++# ---------------------------------------------------------------------------- #
++#  collection (ROS + system)
++# ---------------------------------------------------------------------------- #
++def _sh(cmd: List[str]) -> Optional[str]:
++    try:
++        return subprocess.run(cmd, capture_output=True, text=True, timeout=5).stdout.strip()
++    except Exception:
++        return None
++
++
++def sysinfo_collect() -> Dict[str, Any]:
++    info: Dict[str, Any] = {"services": {s: (_sh(["systemctl", "is-active", s]) or "unknown")
++                                         for s in SERVICES}}
++    if os.path.isdir(BAG_DIR):
++        info["bag_fstype"] = _sh(["findmnt", "-n", "-o", "FSTYPE", "--target", BAG_DIR]) or "?"
++        info["bag_writable"] = os.access(BAG_DIR, os.W_OK)
++        try:
++            info["bag_free_gb"] = shutil.disk_usage(BAG_DIR).free / 1e9
++        except OSError:
++            pass
++    out = _sh(["vcgencmd", "get_throttled"])            # "throttled=0x50000"
++    if out and "=" in out:
++        try:
++            info["throttled"] = int(out.split("=")[1], 16)
++        except ValueError:
++            pass
++    mounts = _sh(["findmnt", "-n", "-o", "FSTYPE", "/"])
++    if mounts is not None:
++        info["overlay"] = (mounts == "overlay")
++    info["wlan0"] = os.path.exists("/sys/class/net/wlan0")
++    rec = _sh(["systemctl", "list-units", "--state=active", "--no-legend", "--plain", "afc-record@*"])
++    info["recording"] = ", ".join(l.split()[0] for l in rec.splitlines()) if rec else ""
++    return info
++
++
++def collect(window: float):
++    import importlib
++    import rclpy
++    from rclpy.node import Node
++    from rclpy.qos import QoSPresetProfiles
++
++    rclpy.init()
++    node = Node("afc_preflight")
++    qos = QoSPresetProfiles.SENSOR_DATA.value     # best effort: matches PX4 and reads reliable pubs too
++    obs = {k: TopicObs() for k in TOPICS}
++    gps_wall = [None]
++
++    def cb_for(key):
++        def cb(msg):
++            o = obs[key]
++            o.times.append(time.monotonic())
++            if o.first is None:
++                o.first = msg
++            o.last = msg
++            if key == "gps":
++                gps_wall[0] = time.time()
++        return cb
++
++    for key, (name, tpath) in TOPICS.items():
++        mod, cls = tpath.rsplit(".", 1)
++        node.create_subscription(getattr(importlib.import_module(mod), cls), name, cb_for(key), qos)
++
++    # DDS discovery takes 1-2 s: wait for the core topics (max 3 s) so the window
++    # measures the link, not discovery; then start the window clean.
++    tw = time.monotonic()
++    while time.monotonic() - tw < 3.0 and not all(obs[k].n for k in ("torque", "ctrl", "health")):
++        rclpy.spin_once(node, timeout_sec=0.05)
++    for o in obs.values():
++        o.times.clear()
++        o.first = o.last            # baseline for counters (CRC, node clock)
++    t0 = time.monotonic()
++    while time.monotonic() - t0 < window:
++        rclpy.spin_once(node, timeout_sec=0.05)
++    t1 = time.monotonic()
++    node.destroy_node()
++    rclpy.shutdown()
++    return obs, t0, t1, gps_wall[0]
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
++    ap.add_argument("--bench", action="store_true", help="bench mode: flight-readiness items WARN instead of FAIL")
++    ap.add_argument("-t", "--time", type=float, default=5.0, help="listen window, s (default 5)")
++    a = ap.parse_args()
++    try:
++        obs, t0, t1, gps_wall = collect(a.time)
++    except ImportError as e:
++        print(f"cannot run: {e} -- source ROS 2 and the afc workspace first (the afc_preflight wrapper does)")
++        return 2
++    except Exception as e:                      # rclpy init etc.: not a vehicle FAIL
++        print(f"cannot run: {type(e).__name__}: {e}")
++        return 2
++    info = sysinfo_collect()
++    if gps_wall is not None:
++        info["wall_at_gps"] = gps_wall
++    res = evaluate(obs, t0, t1, info, bench=a.bench)
++
++    color = sys.stdout.isatty()
++    col = {PASS: "\033[32m", WARN: "\033[33m", FAIL: "\033[31;1m", INFO: "\033[36m"}
++    print(f"Phoenix preflight ({'BENCH' if a.bench else 'FLIGHT'} mode, {a.time:.0f} s listen)")
++    for r in res:
++        tag = f"{col[r.level]}{r.level}\033[0m" if color else r.level
++        print(f"  {tag}  {r.area:<13} {r.text}")
++    nf = sum(r.level == FAIL for r in res)
++    nw = sum(r.level == WARN for r in res)
++    verdict = "NO-GO" if nf else "GO"
++    print(f"\n{verdict}: {nf} fail, {nw} warn")
++    return 1 if nf else 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/rpi_ros2/tools/afc_record.sh b/rpi_ros2/tools/afc_record.sh
+index f87a8e1..f8cb812 100755
+--- a/rpi_ros2/tools/afc_record.sh
++++ b/rpi_ros2/tools/afc_record.sh
+@@ -29,6 +29,7 @@ TOPICS=(
+   /fmu/out/vehicle_torque_setpoint
+   /fmu/out/vehicle_thrust_setpoint
+   /fmu/out/vehicle_status_v1
++  /fmu/out/vehicle_gps_position     # GPS UTC <-> FC time: aligns the bag with the ulog and wall clock
+   /afc/ctrl_tlm
+   /afc/sensor_tlm
+   /afc/compressor
+diff --git a/rpi_ros2/tools/pi_setup.sh b/rpi_ros2/tools/pi_setup.sh
+new file mode 100755
+index 0000000..463a619
+--- /dev/null
++++ b/rpi_ros2/tools/pi_setup.sh
+@@ -0,0 +1,193 @@
++#!/usr/bin/env bash
++# pi_setup.sh -- one-time / occasional Pi configuration for the Phoenix onboard computer.
++#
++#   pi_setup.sh status               what is set right now (read-only; no sudo needed)
++#   pi_setup.sh hostname [name]      hostname (default phoenix) + mDNS: ssh pi@phoenix.local
++#   pi_setup.sh wifi-off | wifi-on   disable / re-enable the Wi-Fi radio (firmware overlay; reboot)
++#   pi_setup.sh ro-root on|off       read-only root filesystem (overlayroot; reboot)
++#   pi_setup.sh time-from-gps        set the Pi clock once from the FC's GPS (stack must be stopped)
++#
++# Run with sudo. Install the link in /usr/local/bin (sudo does not search ~/.local/bin).
++#
++# RECOVERY (locked out): every change here can be undone from the SD card's FAT boot
++# partition on any laptop. Pull the card, open the boot partition, and
++#   - Wi-Fi:      in config.txt delete the line  dtoverlay=disable-wifi
++#   - read-only:  in cmdline.txt delete the word  overlayroot=tmpfs:recurse=0
++#                 (cmdline.txt must stay ONE line)
++# This script never write-protects the boot partition, so both files stay editable
++# from the Pi too.
++set -euo pipefail
++
++BOOT=${PI_SETUP_BOOT:-/boot/firmware}      # override only for testing
++[[ -d $BOOT ]] || BOOT=/boot
++CONFIG=$BOOT/config.txt
++CMDLINE=$BOOT/cmdline.txt
++RUSER=${SUDO_USER:-pi}                     # the real user behind sudo
++RHOME=$(getent passwd "$RUSER" | cut -d: -f6 || echo /home/pi)
++BAG_DIR="${AFC_BAG_DIR:-$RHOME/bags}"
++MARK="# phoenix: pi_setup.sh wifi-off"
++OVL_TOKEN="overlayroot=tmpfs:recurse=0"    # recurse=0: separate mounts (bags, /boot) stay real
++
++die()  { echo "pi_setup: $*" >&2; exit 1; }
++need_root() { [[ $EUID -eq 0 ]] || die "run with sudo"; }
++overlay_active() { [[ $(findmnt -n -o FSTYPE /) == overlay ]]; }
++no_overlay() { overlay_active && die "root is a read-only overlay; changes would vanish at reboot. Run 'pi_setup.sh ro-root off', reboot, then retry." || true; }
++
++# ---------------------------------------------------------------------------- #
++eth_ip() {
++  ip -4 -o addr show eth0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1
++}
++
++eth_ok() {
++  # a wired IPv4 address, and NetworkManager set to bring that profile up at boot
++  local ip con
++  ip=$(eth_ip); [[ -n $ip ]] || return 1
++  if command -v nmcli >/dev/null; then
++    con=$(nmcli -g GENERAL.CONNECTION device show eth0 2>/dev/null | head -1)
++    [[ -n $con && $con != "--" ]] || return 1
++    [[ $(nmcli -g connection.autoconnect connection show "$con" | head -1) == yes ]] || return 1
++  fi
++  echo "$ip"
++}
++
++ssh_ifaces() {
++  # interfaces carrying established inbound SSH sessions (works under sudo, which
++  # drops $SSH_CONNECTION)
++  local a
++  for a in $(ss -Htn state established '( sport = :22 )' 2>/dev/null | awk '{print $3}' | sed 's/:22$//; s/^\[//; s/\]$//'); do
++    ip -o addr show | awk -v a="$a" '{split($4,x,"/"); if (x[1]==a) print $2}'
++  done | sort -u
++}
++
++# ---------------------------------------------------------------------------- #
++cmd_status() {
++  echo "hostname      : $(hostname)  (mDNS avahi-daemon: $(systemctl is-active avahi-daemon 2>/dev/null || true))"
++  echo "eth0          : $(eth_ip)"
++  if [[ -e /sys/class/net/wlan0 ]]; then echo "Wi-Fi         : present"; else echo "Wi-Fi         : off"; fi
++  if grep -q '^dtoverlay=disable-wifi' "$CONFIG" 2>/dev/null; then echo "                (disable-wifi set in $CONFIG)"; fi
++  if overlay_active; then echo "root fs       : read-only overlay"; else echo "root fs       : writable"; fi
++  if grep -q 'overlayroot=' "$CMDLINE" 2>/dev/null; then echo "                ($(grep -o 'overlayroot=[^ ]*' "$CMDLINE") in cmdline.txt)"; fi
++  echo "boot fs       : $(findmnt -n -o OPTIONS "$BOOT" 2>/dev/null | cut -d, -f1)"
++  echo "bag dir       : $BAG_DIR -> $(findmnt -n -o SOURCE,FSTYPE --target "$BAG_DIR" 2>/dev/null || echo missing)"
++  echo "clock (UTC)   : $(date -u '+%Y-%m-%d %H:%M:%S')  ntp-synced=$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo ?)"
++}
++
++cmd_hostname() {
++  need_root; no_overlay
++  local name=${1:-phoenix}
++  [[ $name =~ ^[a-z0-9-]+$ ]] || die "hostname must be lower-case letters, digits, '-'"
++  # /etc/hosts first, so sudo never loses track of the host name
++  if grep -q '^127\.0\.1\.1' /etc/hosts; then
++    sed -i "s/^127\.0\.1\.1.*/127.0.1.1\t$name/" /etc/hosts
++  else
++    printf '127.0.1.1\t%s\n' "$name" >> /etc/hosts
++  fi
++  hostnamectl set-hostname "$name"
++  command -v avahi-daemon >/dev/null || apt-get install -y avahi-daemon
++  systemctl enable --now avahi-daemon
++  systemctl restart avahi-daemon
++  echo "hostname is now '$name'. From a laptop on the same network: ping $name.local / ssh pi@$name.local"
++}
++
++cmd_wifi_off() {
++  need_root
++  local ip ifs
++  ip=$(eth_ok) || die "eth0 is not up with an autoconnecting NetworkManager profile -- fix Ethernet first, or you may be locked out"
++  ifs=$(ssh_ifaces)
++  if grep -qx wlan0 <<<"$ifs"; then die "an SSH session is over Wi-Fi; reconnect over Ethernet ($ip) and close the Wi-Fi session first"; fi
++  if [[ -n $ifs ]] && ! grep -qx eth0 <<<"$ifs"; then die "no SSH session over eth0 -- prove Ethernet works (ssh pi@$ip) before turning Wi-Fi off"; fi
++  if grep -q '^dtoverlay=disable-wifi' "$CONFIG"; then echo "already set in $CONFIG"; return; fi
++  cp "$CONFIG" "$CONFIG.phoenix-bak"
++  # A trailing [all] resets any model-specific [section] the file ends in, so the
++  # overlay applies to every board.
++  printf '\n%s\n[all]\ndtoverlay=disable-wifi\n' "$MARK" >> "$CONFIG"
++  echo "Wi-Fi off from the next boot. Ethernet: $ip (also $(hostname).local)."
++  echo "Recovery without network: delete 'dtoverlay=disable-wifi' from config.txt on the SD card."
++  echo "Reboot when ready:  sudo reboot"
++}
++
++cmd_wifi_on() {
++  need_root
++  cp "$CONFIG" "$CONFIG.phoenix-bak"
++  # drop our three-line block (marker, [all], overlay), then any other copy of the line
++  sed -i "/^${MARK//\//\\/}\$/{N;N;d}" "$CONFIG"
++  sed -i '/^dtoverlay=disable-wifi/d' "$CONFIG"
++  echo "Wi-Fi back on from the next boot (sudo reboot)."
++}
++
++cmd_ro_root() {
++  need_root
++  case "${1:-}" in
++    on)
++      overlay_active && { echo "already active"; return; }
++      dpkg -s overlayroot >/dev/null 2>&1 || die "package 'overlayroot' not installed (needs network once): sudo apt install overlayroot"
++      grep -q '^auto_initramfs=1' "$CONFIG" || die "config.txt lacks auto_initramfs=1 (Bookworm default); overlayroot needs the initramfs"
++      # Bags written to the overlay would live in RAM and vanish at power-off.
++      local bagfs
++      bagfs=$(findmnt -n -o TARGET --target "$BAG_DIR" 2>/dev/null || echo /)
++      [[ $bagfs != / ]] || die "$BAG_DIR is on the root filesystem; with a read-only root every bag would be lost at power-off.
++Mount a USB drive (or separate partition) at $BAG_DIR first (fstab entry with nofail; see INSTALL.md), then re-run."
++      cp "$CMDLINE" "$CMDLINE.phoenix-bak"
++      sed -i 's/ *overlayroot=[^ ]*//g; s/$/ '"$OVL_TOKEN"'/' "$CMDLINE"
++      grep -q "$OVL_TOKEN" "$CMDLINE" || die "failed to write $CMDLINE (restored from .phoenix-bak)"
++      [[ $(wc -l < "$CMDLINE") -le 1 ]] || { cp "$CMDLINE.phoenix-bak" "$CMDLINE"; die "cmdline.txt is not one line; left unchanged"; }
++      echo "Read-only root from the next boot (sudo reboot). Bags stay on $bagfs; /boot stays writable."
++      echo "After the reboot, check:  findmnt -R /   (/ = overlay, $bagfs and $BOOT = real devices)"
++      echo "To update software: sudo pi_setup.sh ro-root off, reboot, update, ro-root on, reboot."
++      ;;
++    off)
++      cp "$CMDLINE" "$CMDLINE.phoenix-bak"
++      sed -i 's/ *overlayroot=[^ ]*//g' "$CMDLINE"
++      echo "Read-only root off from the next boot (sudo reboot)."
++      ;;
++    *) die "usage: pi_setup.sh ro-root on|off" ;;
++  esac
++}
++
++cmd_time_from_gps() {
++  need_root
++  # Stepping the clock under live ROS nodes can stall timers that run on system time,
++  # and puts a jump in any bag being recorded. Refuse unless the stack is down.
++  systemctl is-active --quiet afc-bridge && die "stop the bridge first: sudo systemctl stop afc-bridge"
++  pgrep -f 'bridge_node|afc_system.launch' >/dev/null && die "a hand-started bridge is running; stop it first"
++  [[ -z $(systemctl list-units --state=active --no-legend --plain 'afc-record@*' 2>/dev/null) ]] \
++    || die "a bag is recording (afc_rec stop first)"
++  # Read the GPS as the normal user, with their ROS environment (ROS_DOMAIN_ID etc.);
++  # only the clock step itself runs as root.
++  local utc
++  utc=$(sudo -u "$RUSER" -H bash -ic '
++    source /opt/ros/humble/setup.bash >/dev/null 2>&1
++    source "${AFC_WS:-$HOME/afc-drone/rpi_ros2}/install/setup.bash" >/dev/null 2>&1
++    python3 - <<EOF
++import sys, time, rclpy
++from rclpy.qos import QoSPresetProfiles
++from px4_msgs.msg import SensorGps
++rclpy.init(); n = rclpy.create_node("afc_time_from_gps"); got = []
++n.create_subscription(SensorGps, "/fmu/out/vehicle_gps_position",
++                      lambda m: got.append((time.monotonic(), m)), QoSPresetProfiles.SENSOR_DATA.value)
++t0 = time.monotonic()
++while time.monotonic() - t0 < 20:
++    rclpy.spin_once(n, timeout_sec=0.1)
++    if got and got[-1][1].fix_type >= 3 and got[-1][1].time_utc_usec > 0:
++        break
++rclpy.shutdown()
++if not got or got[-1][1].fix_type < 3 or got[-1][1].time_utc_usec == 0:
++    sys.exit(1)
++t_rx, m = got[-1]
++print(f"{m.time_utc_usec / 1e6 + (time.monotonic() - t_rx):.3f}")   # carried forward to now
++EOF' 2>/dev/null | tail -1) || true
++  [[ $utc =~ ^[0-9]+\.[0-9]+$ ]] || die "no 3D GPS fix with UTC time within 20 s (agent running? antenna outside?)"
++  echo "Pi clock was $(python3 -c "import time;print(f'{time.time()-$utc:+.2f}')") s vs GPS (+-0.3 s transport lag); setting it"
++  date -u -s "@$utc" >/dev/null
++  echo "now $(date -u '+%Y-%m-%d %H:%M:%S UTC'). Restart the stack: sudo systemctl start afc-bridge"
++}
++
++case "${1:-status}" in
++  status)        cmd_status ;;
++  hostname)      cmd_hostname "${2:-}" ;;
++  wifi-off)      cmd_wifi_off ;;
++  wifi-on)       cmd_wifi_on ;;
++  ro-root)       cmd_ro_root "${2:-}" ;;
++  time-from-gps) cmd_time_from_gps ;;
++  *) sed -n '2,19p' "$0"; exit 1 ;;
++esac
