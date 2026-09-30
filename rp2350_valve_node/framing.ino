@@ -171,7 +171,7 @@ void tlm_service(uint32_t now) {
     uint8_t flags2 = ((g_sbus_failsafe || g_sbus_framelost) ? 0x01 : 0)   // bit0 SBUS failsafe/frame-lost
                    | (g_sbus_in.valid        ? 0x02 : 0)                  // bit1 SBUS clean frames arriving
                    | (BENCH_HOOKS            ? 0x04 : 0)                  // bit2 bench-hook build (not flight)
-                   | (g_cal_from_flash       ? 0x08 : 0)                  // bit3 calibration loaded from flash
+                   | ((g_cal_from_flash && servo_cal_complete()) ? 0x08 : 0) // bit3 calibration complete: flash cal loaded AND real servo fits compiled
                    | (USE_REAL_I2C     ? 0 : 0x10)                        // bit4 SIMULATED sensors/servos
                    | (USE_REAL_SBUS    ? 0 : 0x20)                        // bit5 SIMULATED SBUS
                    | (USE_REAL_PRIMARY ? 0 : 0x40);                       // bit6 SIMULATED primary (Pi) input

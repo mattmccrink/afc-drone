@@ -88,7 +88,6 @@ volatile bool g_fault_valve[VALVE_COUNT] = { false };
 volatile bool g_fault_aggregate = false;
 
 // Curve-fit calibration (loaded by cal_littlefs; consumed by servos).
-float   g_servo_cubic[SERVO_COUNT][4];      // per-servo c0..c3 (us = c0 + c1 x + c2 x^2 + c3 x^3)
 uint8_t g_servo_valve_map[SERVO_COUNT];     // which valve drives each servo
 float   g_valve_gain[VALVE_COUNT];          // per-valve gain schedule
 float   g_valve_bias[VALVE_COUNT];          // per-valve bias schedule
@@ -275,6 +274,7 @@ void setup1() {
 #endif
   sensors_setup();
   servos_setup();
+  i2c_guard_arm();            // from here a timeout opens the I2C breaker (i2c_guard.ino)
   g_core1_ready = true;
 }
 
@@ -287,6 +287,7 @@ void loop1() {
   if (next_deadline_us == 0) next_deadline_us = micros() + TICK_US;
 
   // ---- the 10 ms tick body ----
+  i2c_guard_tick_begin();                   // at most one I2C timeout per tick
   sensors_tick(tick);                       // read-back, venturi, publish frame
   if (g_core0_ready && (tick % SERVO_EVERY_N) == 0) {  // every other tick -> 50 Hz
     servos_service(tick);                   // gated: cal_load() completes before g_core0_ready

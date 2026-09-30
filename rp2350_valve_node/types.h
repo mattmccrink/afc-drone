@@ -138,14 +138,24 @@ struct SensorSlot {
 // Calibration blob persisted to LittleFS (see cal_littlefs.ino). Defined here,
 // not in the tab, so Arduino's hoisted prototypes for the helpers that take it
 // by reference can see the type.
-struct CalBlob {
+struct CalBlob {                   // "CAL3": servo curves are compiled (servo_cal.h), not stored
   uint32_t magic;
-  float    servo_cubic[SERVO_COUNT][4];
   uint8_t  servo_valve_map[SERVO_COUNT];
   float    valve_gain[VALVE_COUNT];
   float    valve_bias[VALVE_COUNT];
   float    dp_zero[VALVE_COUNT];   // per-valve no-flow (p_up - p_lo) offset, mbar
   uint32_t crc32;                  // over all preceding bytes
+};
+// Previous layout ("CAL2", with per-servo cubics): read once to migrate the
+// map, gain/bias and zero offsets; its cubics are ignored.
+struct CalBlobV2 {
+  uint32_t magic;
+  float    servo_cubic[SERVO_COUNT][4];
+  uint8_t  servo_valve_map[SERVO_COUNT];
+  float    valve_gain[VALVE_COUNT];
+  float    valve_bias[VALVE_COUNT];
+  float    dp_zero[VALVE_COUNT];
+  uint32_t crc32;
 };
 
 // -----------------------------------------------------------------------------
