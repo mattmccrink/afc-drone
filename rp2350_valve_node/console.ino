@@ -80,7 +80,9 @@ static void print_help() {
   Serial.println(F(
     "bench hooks (BENCH_HOOKS=1 -- not a flight build):\n"
     "  hang core0|core1        stall a core -> watchdog reset (T-S3 / T-S7)\n"
-    "  tdrop N                 skip the next N Teensy frames, 20 ms each (T-C4 / T-C5)"));
+    "  tdrop N                 skip the next N Teensy frames, 20 ms each (T-C4 / T-C5)\n"
+    "  i2cstick sda|scl <ms>|hold|persist N|off, i2cstick probe on|off\n"
+    "                          hold an I2C line low at the pad: a stuck device (needs USE_REAL_I2C)"));
 #endif
 }
 
@@ -169,6 +171,13 @@ static void dispatch(char* line) {
              Serial.printf("[tdrop] skipping next %d Teensy frame(s) (~%d ms; only while armed)\n",
                            k, k * (1000 / TEENSY_STREAM_HZ)); }
     } else Serial.println(F("usage: hang core0|core1 | tdrop N"));
+#else
+    Serial.println(F("[bench] hooks not compiled in (BENCH_HOOKS=0)"));
+#endif
+  }
+  else if (eq(tok[0], "i2cstick")) {
+#if BENCH_HOOKS
+    bench_i2c_command(tok, n);
 #else
     Serial.println(F("[bench] hooks not compiled in (BENCH_HOOKS=0)"));
 #endif

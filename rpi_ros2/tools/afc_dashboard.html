@@ -62,6 +62,11 @@
   .ramp i{height:6px;border-radius:3px;background:linear-gradient(90deg,var(--neg),var(--mid) 45%,var(--mid) 55%,var(--pos))}
   .health{display:grid;grid-template-columns:1fr 1fr;column-gap:18px}
   .health .wide{grid-column:1/-1}
+  table.lq{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+  table.lq th{font-weight:400;color:var(--dim);text-align:right;padding:1px 4px;font-size:11px}
+  table.lq th:first-child, table.lq td:first-child{text-align:left}
+  table.lq td{text-align:right;padding:1px 4px}
+  table.lq tr.stale td{color:var(--mute)}
   .sub{font-size:10px;color:var(--dim);margin:0 0 6px}
   .blk{position:relative}
   .blk.stale > *{opacity:.28}
@@ -168,6 +173,8 @@
       <div class="kv"><span>arm counter</span><span id="hCtr" class="num">--</span></div>
       <div class="kv"><span>node offset (ms)</span><span id="hOff" class="num">--</span></div>
     </div>
+    <h2 class="sec">Link quality (last 10 s, as received here)</h2>
+    <table class="lq" id="lq"></table>
   </div>
 
   <!-- RIGHT: the air supply -- compressor, upstream pressure, mass flow -->
@@ -213,13 +220,19 @@ const CFG = {
     {x:258, y:85,  label:"RC"},
   ],
   valveAbsMax: 1000,     // |valve[]| full-scale for fill (int16 aero-intent units)
-  deadband: 0.03,
+  deadband: 0.03,        // |value|/full-scale below this shows as neutral (no side colour)
   // Upstream pressure is shown above ambient. The Tiny has no ambient sensor, so the
   // reference is each venturi's own p_up while the compressor is at rest (disarmed,
   // rpm below restRpm for restHoldMs); it also absorbs per-sensor offset. Frozen
   // while running; kept in this browser for refHoldH so a mid-flight reconnect keeps it.
   pGaugeFS: 150,         // mbar full-scale for the gauge bars (tweak once real data exists)
-  restRpm: 500, restHoldMs: 2000, refHoldH: 2,        // |value|/full-scale below this shows as neutral (no side colour)
+  restRpm: 500, restHoldMs: 2000, refHoldH: 2,
+  // NO DATA overlay + alert greying, with hysteresis so a marginal radio link does
+  // not make them flicker: a source goes stale after staleEnterMs without a message
+  // (health, a 1 Hz topic: staleEnterHealthMs) and recovers once messages have
+  // flowed again for staleExitMs.
+  staleEnterMs: 2500, staleEnterHealthMs: 3500, staleExitMs: 500,
+  linkWindowMs: 10000,   // link-quality readout window
   window: 300,           // samples kept in the strip charts (~15s @20Hz)
   // Valve layout: index 0-5 = valves 1-6. Canard aircraft, top-down, nose UP.
   //   1(idx0) port-outboard, 2(idx1) left-inboard, 3(idx2) right-inboard,
@@ -362,15 +375,15 @@ function connect(){
   const url=document.getElementById("url").value.trim();
   ros=new ROSLIB.Ros({url});
   const dot=document.getElementById("link"),txt=document.getElementById("linkTxt");
-  ros.on("connection",()=>{dot.classList.add("on");txt.textContent="connected "+url;S.ros_up=true;subscribe();});
+  ros.on("connection",()=>{dot.classList.add("on");txt.textContent="connected "+url;S.ros_up=true;S.t_conn=performance.now();subscribe();});
   ros.on("error",()=>{dot.classList.remove("on");txt.textContent="error";S.ros_up=false;});
   ros.on("close",()=>{dot.classList.remove("on");txt.textContent="disconnected";S.ros_up=false;});
 }
 function sub(t){return new ROSLIB.Topic({ros,name:t.name,messageType:t.type,
   throttle_rate:t.throttle,queue_length:1,queue_size:1});}
 function subscribe(){
-  sub(CFG.topics.torque).subscribe(m=>{TSRC.torque=performance.now();push(torque,[m.xyz[0],m.xyz[1],m.xyz[2]]);});
-  sub(CFG.topics.thrust).subscribe(m=>{TSRC.thrust=performance.now();push(thrust,[m.xyz[2]]);});   // z-axis thrust
+  sub(CFG.topics.torque).subscribe(m=>{seen("torque");push(torque,[m.xyz[0],m.xyz[1],m.xyz[2]]);});
+  sub(CFG.topics.thrust).subscribe(m=>{seen("thrust");push(thrust,[m.xyz[2]]);});   // z-axis thrust
   sub(CFG.topics.ctrl).subscribe(onCtrl);
   sub(CFG.topics.sensor).subscribe(onSensor);
   sub(CFG.topics.health).subscribe(onHealth);
@@ -399,7 +412,7 @@ function updateAmbient(m){
 }
 function onSensor(m){
   lastValid = m.valid;
-  S.t_sensor = TSRC.sensor = performance.now();
+  seen("sensor"); S.t_sensor = TSRC.sensor;
   S.why = m.why ? Array.from(m.why) : null;
   for(let i=0;i<6;i++){
     const why = S.why ? vhName(S.why[i]) : "x";
@@ -503,7 +516,7 @@ const RULES = [
    when:S=>S.f2 && !S.cal_flash, msg:"Tiny calibration from compiled defaults (no flash cal loaded)"},
   // ---- links -------------------------------------------------------------
   {id:"data", g:"Links", cls:"C", label:"DASH DATA", noStale:true,
-   when:S=>!S.ros_up || now()-S.t_ctrl>1500, msg:S=>S.ros_up?"Dashboard data stale (no vehicle telemetry for >1.5 s)":"Dashboard disconnected from rosbridge"},
+   when:S=>!S.ros_up || STALE.ctrl, msg:S=>S.ros_up?"Dashboard data stale (no vehicle telemetry for >"+(CFG.staleEnterMs/1000)+" s)":"Dashboard disconnected from rosbridge"},
   {id:"ser", g:"Links", cls:"C", label:"PI-TINY",
    when:S=>S.serial===false, msg:"Pi <-> Tiny serial link DOWN"},
   {id:"rate", g:"Links", cls:"A", label:"TLM RATE", holdMs:2000,
@@ -549,7 +562,7 @@ function tone(freq, n){
     g.gain.exponentialRampToValueAtTime(0.0001,t+0.14); o.start(t); o.stop(t+0.15);
   }
 }
-function dataStale(){ return !S.ros_up || now()-S.t_ctrl>1500; }
+function dataStale(){ return !S.ros_up || STALE.ctrl; }     // hysteresis: see CFG.staleEnterMs
 function evaluate(){
   const tnow=now(), stale=dataStale();
   for(const r of RULES){
@@ -610,7 +623,7 @@ buildAnnunciator();
 setInterval(evaluate, 200);
 
 function onCtrl(m){
-  lastCtrlT=performance.now(); TSRC.ctrl=lastCtrlT;
+  seen("ctrl"); lastCtrlT=TSRC.ctrl;
   Object.assign(S, {t_ctrl:lastCtrlT, armed:!!m.armed, source:m.source, n_valid:m.n_valid,
     surf:!!m.surf_engaged, surf_sw:!!m.surf_switch,
     air_sev:(m.air_sev!==undefined?m.air_sev:0), air_causes:(m.air_causes||0),
@@ -631,16 +644,52 @@ let lastCompT=0, lastCtrlT=0;
 // frozen chart can never pass for a steady signal.
 // ---------------------------------------------------------------------------
 const TSRC = {torque:0, thrust:0, ctrl:0, sensor:0, comp:0, health:0};
-const STALE_MS = {health:3000};            // 1 Hz topic; the rest stream at 10-25 Hz
-setInterval(()=>{
+const ARR = {torque:[], thrust:[], ctrl:[], sensor:[], comp:[], health:[]};   // arrival times, linkWindowMs
+const STALE = {torque:true, thrust:true, ctrl:true, sensor:true, comp:true, health:true};
+function seen(k){
+  const t=performance.now(); TSRC[k]=t;
+  const a=ARR[k]; a.push(t);
+  while(a.length && t-a[0] > CFG.linkWindowMs) a.shift();
+}
+function updateStale(){
   const t=performance.now();
-  document.querySelectorAll(".blk[data-src]").forEach(el=>{
-    const k=el.dataset.src;
-    el.classList.toggle("stale", !S.ros_up || t-TSRC[k] > (STALE_MS[k]||1500));
-  });
-},250);
+  for(const k in STALE){
+    const enter = k==="health" ? CFG.staleEnterHealthMs : CFG.staleEnterMs;
+    if(!S.ros_up){ STALE[k]=true; continue; }
+    if(!STALE[k]){ if(t-TSRC[k] > enter) STALE[k]=true; continue; }
+    // recover only once data has flowed again for staleExitMs (health: any fresh message)
+    const recent = ARR[k].filter(x => t-x <= CFG.staleExitMs).length;
+    const flowing = k==="health" ? t-TSRC[k] < 1500 : (recent>=2 && t-TSRC[k] < 250);
+    const since = ARR[k].find(x => t-x <= CFG.staleExitMs + 250);
+    if(flowing && (k==="health" || (since!==undefined && t-since >= CFG.staleExitMs))) STALE[k]=false;
+  }
+  document.querySelectorAll(".blk[data-src]").forEach(el=>el.classList.toggle("stale", STALE[el.dataset.src]));
+}
+setInterval(updateStale,250);
+// ---- link quality: messages/s and worst gap per topic, as received by this browser ----
+const LQ_ROWS = [["torque","FC torque"],["thrust","FC thrust"],["ctrl","Tiny ctrl"],
+                 ["sensor","Tiny sensor"],["comp","compressor"],["health","bridge health"]];
+function renderLQ(){
+  const t=performance.now(), W=CFG.linkWindowMs;
+  let h='<tr><th>topic</th><th>msg/s</th><th>worst gap</th><th>last</th></tr>';
+  for(const [k,label] of LQ_ROWS){
+    const a=ARR[k].filter(x=>t-x<=W);
+    const span=Math.min(W, S.ros_up&&S.t_conn ? t-S.t_conn : W);
+    const rate = span>500 ? a.length/(span/1000) : 0;
+    let gap=0; for(let i=1;i<a.length;i++) gap=Math.max(gap,a[i]-a[i-1]);
+    if(a.length) gap=Math.max(gap, t-a[a.length-1]); else gap=span;
+    const bad = k==="health" ? gap>3000 : gap>1000;
+    const warn = k==="health" ? gap>1600 : gap>300;
+    const cls = bad?"pill bad":warn?"pill warn":"";
+    const last = TSRC[k] ? ((t-TSRC[k])/1000).toFixed(1)+" s" : "--";
+    h+=`<tr class="${STALE[k]?"stale":""}"><td>${label}</td><td>${rate.toFixed(1)}</td>`+
+       `<td><span class="${cls}">${(gap/1000).toFixed(2)} s</span></td><td>${last}</td></tr>`;
+  }
+  document.getElementById("lq").innerHTML=h;
+}
+setInterval(renderLQ,1000);
 function onComp(m){
-  lastCompT=performance.now(); TSRC.comp=lastCompT; S.rpm=m.rpm;
+  seen("comp"); lastCompT=TSRC.comp; S.rpm=m.rpm;
   Object.assign(S, {t_comp:lastCompT, esc_err:m.err, esc_tlm_ok:!!m.tlm_ok,
     thermal:!!m.thermal_suspect, esc_temp:m.temp_c});
   if(m.err===-11) S.err11_t=lastCompT;     // -1/-8 outrank -11/-12 for a reply: hold ~1 s
@@ -658,7 +707,7 @@ function onComp(m){
 }
 function onHealth(m){
   if(S.crc!==null && m.crc_errors>S.crc) S.crc_rise_t=performance.now();   // rising, not the backlog
-  TSRC.health=performance.now();
+  seen("health");
   Object.assign(S, {t_health:TSRC.health, mode:m.mode, terminated:!!m.terminated,
     serial:!!m.serial_connected, ctrl_hz:m.ctrl_hz, sensor_hz:m.sensor_hz, comp_hz:m.comp_hz,
     crc:m.crc_errors, cmd_fresh:!!m.cmd_fresh, arm_fresh:!!m.arm_fresh,
