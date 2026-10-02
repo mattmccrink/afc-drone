@@ -1,0 +1,627 @@
+diff --git a/rpi_ros2/src/afc_bridge/afc_bridge/dash_mux.py b/rpi_ros2/src/afc_bridge/afc_bridge/dash_mux.py
+new file mode 100644
+index 0000000..ec83fbc
+--- /dev/null
++++ b/rpi_ros2/src/afc_bridge/afc_bridge/dash_mux.py
+@@ -0,0 +1,225 @@
++"""
++dash_mux.py -- merge everything the browser dashboard shows into ONE message per tick.
++
++Why: over the 3 MHz Doodle link, per-packet airtime overhead dominates. Six topics
++at their own rates (~110 rosbridge messages/s) queue behind each other in the radio
++and arrive bunched; that bunching is the dashboard's jitter. One compact frame at a
++fixed rate (default 10 Hz) cuts the packet count ~10x and makes arrivals regular.
++
++  /afc/dash  std_msgs/String, compact JSON, published at rate_hz:
++    {"v":1, "seq":N, "t":<pi ms>,
++     "src":{"<k>":{"n":updates, "g":worst gap ms, "age":ms}, ...},  per source, at the Pi
++     "ctrl":{...}, "sensor":{...}, "health":{...}, "comp":{...},  latest message, only
++                                                                    if it changed since the
++                                                                    previous frame
++     "ts":{"torque":[[t_ms,x,y,z],...], "thrust":[[t_ms,z],...],   samples since the previous
++           "rpm":[[t_ms,rpm,target],...]}}                          frame, SOURCE timestamps
++  Message dicts keep the ROS field names (minus header), so the dashboard's handlers
++  take them unchanged. Torque/thrust times are PX4 time (ms), rpm times the Tiny's
++  node_stamp_ms: the dashboard plots by source time behind a short playout delay.
++
++Read-only and off the command path: this node only subscribes to topics that
++already exist, so it cannot affect the bridge, and rosbags keep recording the
++original topics. The flight-critical bridge does not depend on it.
++
++The merging logic (DashMux) has no ROS dependency, so tools/dash_check.py tests it
++without a ROS install.
++"""
++from __future__ import annotations
++
++import array
++import json
++import math
++import time
++from typing import Any, Dict, List, Optional
++
++SOURCES = ("torque", "thrust", "ctrl", "sensor", "health", "comp")
++STATE_SOURCES = ("ctrl", "sensor", "health", "comp")       # latest message only
++MAX_SAMPLES = 40                                            # per stream per frame (bounds a stall)
++
++
++def _round(x: float, nd: int = 4) -> Any:
++    if math.isnan(x) or math.isinf(x):
++        return None                                         # JSON has no NaN
++    r = round(x, nd)
++    return int(r) if r == int(r) and abs(r) < 1e15 else r
++
++
++def to_plain(msg: Any, nd: int = 4) -> Any:
++    """ROS message (or any nested value) -> JSON-ready plain data, header dropped,
++    floats rounded. Works on anything exposing get_fields_and_field_types()."""
++    if hasattr(msg, "get_fields_and_field_types"):
++        return {k: to_plain(getattr(msg, k), nd)
++                for k in msg.get_fields_and_field_types() if k != "header"}
++    if isinstance(msg, float):
++        return _round(msg, nd)
++    if isinstance(msg, bool) or isinstance(msg, (int, str)) or msg is None:
++        return msg
++    if isinstance(msg, (bytes, bytearray)):
++        return list(msg)
++    if isinstance(msg, array.array) or hasattr(msg, "tolist"):  # array.array / numpy
++        return to_plain(msg.tolist(), nd)
++    if isinstance(msg, (list, tuple)):
++        return [to_plain(v, nd) for v in msg]
++    if isinstance(msg, dict):
++        return {k: to_plain(v, nd) for k, v in msg.items() if k != "header"}
++    return msg
++
++
++class DashMux:
++    """Pure merging logic. Times are milliseconds on the caller's monotonic clock."""
++
++    def __init__(self, px4_sample_hz: float = 25.0) -> None:
++        # Decimate PX4 streams to px4_sample_hz on a grid in SOURCE time: the mean rate is
++        # exact and the kept spacing varies by at most one source period (no beat with our timer).
++        self._period = 1000.0 / px4_sample_hz if px4_sample_hz > 0 else 0.0
++        self._n = {k: 0 for k in SOURCES}
++        self._last_rx: Dict[str, Optional[float]] = {k: None for k in SOURCES}
++        self._gap = {k: 0.0 for k in SOURCES}               # worst rx gap since last frame
++        self._latest: Dict[str, Optional[dict]] = {k: None for k in STATE_SOURCES}
++        self._dirty = {k: False for k in STATE_SOURCES}
++        self._samples: Dict[str, List[list]] = {"torque": [], "thrust": [], "rpm": []}
++        self._due: Dict[str, Optional[float]] = {"torque": None, "thrust": None}
++        self._sbus_gap_max = 0                              # merged over every ctrl message
++        self._rpm_target = 0
++        self.seq = 0
++
++    # ---- inputs ---------------------------------------------------------------
++    def _rx(self, k: str, now: float) -> None:
++        last = self._last_rx[k]
++        if last is not None:
++            self._gap[k] = max(self._gap[k], now - last)
++        self._last_rx[k] = now
++        self._n[k] += 1
++
++    def _keep(self, stream: str, src_ms: float) -> bool:
++        P = self._period
++        due = self._due[stream]
++        if P <= 0 or due is None or src_ms < due - 2 * P:   # first sample, or FC rebooted
++            self._due[stream] = src_ms + P
++            return True
++        if src_ms < due - 0.1 * P:
++            return False                                    # too soon: decimate
++        due += P
++        self._due[stream] = due if due > src_ms else src_ms + P   # resync after a gap
++        return True
++
++    def _push(self, stream: str, row: list) -> None:
++        s = self._samples[stream]
++        s.append(row)
++        if len(s) > MAX_SAMPLES:
++            del s[0]
++
++    def on_torque(self, now: float, src_ms: float, xyz) -> None:
++        self._rx("torque", now)
++        if self._keep("torque", src_ms):
++            self._push("torque", [int(src_ms)] + [_round(float(v)) for v in xyz])
++
++    def on_thrust(self, now: float, src_ms: float, z: float) -> None:
++        self._rx("thrust", now)
++        if self._keep("thrust", src_ms):
++            self._push("thrust", [int(src_ms), _round(float(z))])
++
++    def on_state(self, k: str, now: float, d: dict) -> None:
++        """k in STATE_SOURCES; d = to_plain(msg)."""
++        self._rx(k, now)
++        if k == "ctrl":
++            self._sbus_gap_max = max(self._sbus_gap_max, int(d.get("sbus_gap_ms", 0) or 0))
++            self._rpm_target = int(d.get("rpm_target", 0)) if d.get("armed") else 0
++        if k == "comp":
++            self._push("rpm", [int(d.get("node_stamp_ms", 0)), d.get("rpm", 0), self._rpm_target])
++        self._latest[k] = d
++        self._dirty[k] = True
++
++    # ---- output ---------------------------------------------------------------
++    def frame(self, now: float) -> dict:
++        self.seq += 1
++        src = {}
++        for k in SOURCES:
++            last = self._last_rx[k]
++            age = None if last is None else int(now - last)
++            g = self._gap[k] if last is None else max(self._gap[k], now - last)
++            src[k] = {"n": self._n[k], "g": int(g), "age": age}
++            self._gap[k] = 0.0
++        f: Dict[str, Any] = {"v": 1, "seq": self.seq, "t": int(now), "src": src}
++        for k in STATE_SOURCES:
++            if self._dirty[k] and self._latest[k] is not None:
++                d = self._latest[k]
++                if k == "ctrl" and "sbus_gap_ms" in d:
++                    d = dict(d, sbus_gap_ms=self._sbus_gap_max)   # worst over every ctrl since last frame
++                f[k] = d
++                self._dirty[k] = False
++        self._sbus_gap_max = 0
++        ts = {s: rows for s, rows in self._samples.items() if rows}
++        if ts:
++            f["ts"] = ts
++        self._samples = {"torque": [], "thrust": [], "rpm": []}
++        return f
++
++    @staticmethod
++    def encode(f: dict) -> str:
++        return json.dumps(f, separators=(",", ":"), allow_nan=False)
++
++
++# ---- ROS 2 node ---------------------------------------------------------------
++def main(args=None) -> None:
++    import rclpy
++    from rclpy.node import Node
++    from rclpy.qos import QoSPresetProfiles
++    from std_msgs.msg import String
++    from afc_bridge_msgs.msg import ValveNodeCtrl, ValveNodeSensor, ValveNodeHealth, ValveNodeComp
++
++    class DashMuxNode(Node):
++        def __init__(self) -> None:
++            super().__init__("afc_dash_mux")
++            p = self.declare_parameter
++            rate = float(p("rate_hz", 10.0).value)
++            self.mux = DashMux(px4_sample_hz=float(p("px4_sample_hz", 25.0).value))
++            self.pub = self.create_publisher(String, p("dash_topic", "/afc/dash").value, 10)
++            q = 10
++            self.create_subscription(ValveNodeCtrl, p("ctrl_topic", "/afc/ctrl_tlm").value,
++                                     lambda m: self._state("ctrl", m), q)
++            self.create_subscription(ValveNodeSensor, p("sensor_topic", "/afc/sensor_tlm").value,
++                                     lambda m: self._state("sensor", m), q)
++            self.create_subscription(ValveNodeHealth, p("health_topic", "/afc/health").value,
++                                     lambda m: self._state("health", m), q)
++            self.create_subscription(ValveNodeComp, p("comp_topic", "/afc/compressor").value,
++                                     lambda m: self._state("comp", m), q)
++            try:
++                from px4_msgs.msg import VehicleTorqueSetpoint, VehicleThrustSetpoint
++                sq = QoSPresetProfiles.SENSOR_DATA.value            # PX4 /fmu/out is best-effort
++                self.create_subscription(
++                    VehicleTorqueSetpoint, p("torque_topic", "/fmu/out/vehicle_torque_setpoint").value,
++                    lambda m: self.mux.on_torque(self._now(), m.timestamp / 1000.0, m.xyz), sq)
++                self.create_subscription(
++                    VehicleThrustSetpoint, p("thrust_topic", "/fmu/out/vehicle_thrust_setpoint").value,
++                    lambda m: self.mux.on_thrust(self._now(), m.timestamp / 1000.0, m.xyz[2]), sq)
++            except ImportError:
++                self.get_logger().warn("px4_msgs not importable: torque/thrust not in /afc/dash")
++            self.create_timer(1.0 / rate, self._tick)
++            self.get_logger().info(f"dash_mux: /afc/dash at {rate:g} Hz")
++
++        @staticmethod
++        def _now() -> float:
++            return time.monotonic() * 1000.0
++
++        def _state(self, k: str, m) -> None:
++            self.mux.on_state(k, self._now(), to_plain(m))
++
++        def _tick(self) -> None:
++            self.pub.publish(String(data=DashMux.encode(self.mux.frame(self._now()))))
++
++    rclpy.init(args=args)
++    node = DashMuxNode()
++    try:
++        rclpy.spin(node)
++    except KeyboardInterrupt:
++        pass
++    finally:
++        node.destroy_node()
++        if rclpy.ok():
++            rclpy.shutdown()
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/rpi_ros2/src/afc_bridge/launch/afc_system.launch.py b/rpi_ros2/src/afc_bridge/launch/afc_system.launch.py
+index 6dd22f7..a255df7 100644
+--- a/rpi_ros2/src/afc_bridge/launch/afc_system.launch.py
++++ b/rpi_ros2/src/afc_bridge/launch/afc_system.launch.py
+@@ -4,6 +4,7 @@ afc_system.launch.py -- one-command bring-up of the whole onboard stack:
+     uXRCE-DDS agent  (serial to Pixhawk/TELEM2)
+     afc_bridge node  (FC setpoints -> RP2350; RP2350 telemetry -> ROS)
+     rosbridge server (websocket :9090 for the browser dashboard)
++    dash_mux         (/afc/dash: one merged frame per tick for the dashboard; read-only)
+ 
+   # everything, defaults (Tiny on uart3 = /dev/ttyAMA1, FC on serial0 = ttyAMA0):
+   ros2 launch afc_bridge afc_system.launch.py
+@@ -34,6 +35,8 @@ def generate_launch_description():
+     agent_baud = LaunchConfiguration("agent_baud")
+     start_agent = LaunchConfiguration("start_agent")
+     start_rosbridge = LaunchConfiguration("start_rosbridge")
++    start_dash_mux = LaunchConfiguration("start_dash_mux")
++    dash_rate = LaunchConfiguration("dash_rate_hz")
+     rosbridge_port = LaunchConfiguration("rosbridge_port")
+ 
+     # 1. uXRCE-DDS agent over the Pi PL011 (serial0 -> ttyAMA0) to Pixhawk TELEM2.
+@@ -57,6 +60,17 @@ def generate_launch_description():
+     )
+ 
+     # 3. rosbridge websocket for the browser dashboard.
++    # Merges the dashboard's topics into one frame per tick (fewer, regular radio
++    # packets). Subscribe-only; nothing on the command path depends on it.
++    dash_mux = Node(
++        package="afc_bridge",
++        executable="dash_mux",
++        name="afc_dash_mux",
++        output="screen",
++        condition=IfCondition(start_dash_mux),
++        parameters=[{"rate_hz": dash_rate}],
++    )
++
+     rosbridge = GroupAction(
+         condition=IfCondition(start_rosbridge),
+         actions=[IncludeLaunchDescription(
+@@ -74,7 +88,10 @@ def generate_launch_description():
+         DeclareLaunchArgument("start_agent", default_value="false"),
+         DeclareLaunchArgument("start_rosbridge", default_value="true"),
+         DeclareLaunchArgument("rosbridge_port", default_value="9090"),
++        DeclareLaunchArgument("start_dash_mux", default_value="true"),
++        DeclareLaunchArgument("dash_rate_hz", default_value="10.0"),
+         agent,
+         bridge,
++        dash_mux,
+         rosbridge,
+     ])
+diff --git a/rpi_ros2/src/afc_bridge/setup.py b/rpi_ros2/src/afc_bridge/setup.py
+index 5cda260..66c8f91 100644
+--- a/rpi_ros2/src/afc_bridge/setup.py
++++ b/rpi_ros2/src/afc_bridge/setup.py
+@@ -23,6 +23,7 @@ setup(
+     entry_points={
+         "console_scripts": [
+             "bridge_node = afc_bridge.bridge_node:main",
++            "dash_mux = afc_bridge.dash_mux:main",
+         ],
+     },
+ )
+diff --git a/rpi_ros2/src/afc_bridge/tools/dash_check.py b/rpi_ros2/src/afc_bridge/tools/dash_check.py
+new file mode 100644
+index 0000000..02b1479
+--- /dev/null
++++ b/rpi_ros2/src/afc_bridge/tools/dash_check.py
+@@ -0,0 +1,156 @@
++#!/usr/bin/env python3
++"""dash_check.py -- offline tests for dash_mux.DashMux (no ROS needed).
++
++  cd rpi_ros2/src/afc_bridge && PYTHONPATH=. python3 tools/dash_check.py
++"""
++import array
++import json
++import sys
++
++from afc_bridge.dash_mux import DashMux, to_plain
++
++_fails = 0
++
++
++def check(name, cond):
++    global _fails
++    print(f"  [{'PASS' if cond else 'FAIL'}] {name}")
++    if not cond:
++        _fails += 1
++
++
++class FakeMsg:
++    """Stands in for a generated ROS message: exposes get_fields_and_field_types()."""
++    def __init__(self, **kw):
++        self.__dict__.update(kw)
++        self._fields = list(kw)
++
++    def get_fields_and_field_types(self):
++        return {k: "x" for k in self._fields}
++
++
++def test_to_plain():
++    print("to_plain: ROS message -> JSON-ready dict")
++    m = FakeMsg(header=FakeMsg(stamp=1), armed=True, rpm_target=30000, desat_rp=0.123456,
++                valve=array.array("h", [1, -2, 3]), surf=[0.5, float("nan")], mode_str="PRIMARY")
++    d = to_plain(m)
++    check("header dropped", "header" not in d)
++    check("bool/int/str kept", d["armed"] is True and d["rpm_target"] == 30000 and d["mode_str"] == "PRIMARY")
++    check("float rounded to 4 dp", d["desat_rp"] == 0.1235)
++    check("array.array -> list", d["valve"] == [1, -2, 3])
++    check("NaN -> null (valid JSON)", d["surf"] == [0.5, None])
++    json.dumps(d, allow_nan=False)
++    check("whole-number float -> int (shorter)", to_plain(2.0) == 2)
++
++
++def test_state_only_when_changed():
++    print("state sources: latest message, only when it changed")
++    mx = DashMux()
++    f = mx.frame(0)
++    check("empty frame has no state keys", not any(k in f for k in ("ctrl", "sensor", "health", "comp")))
++    mx.on_state("ctrl", 10, {"armed": False, "rpm_target": 0, "sbus_gap_ms": 18})
++    mx.on_state("ctrl", 50, {"armed": False, "rpm_target": 0, "sbus_gap_ms": 21})
++    mx.on_state("sensor", 30, {"mdot_total": 45.3})
++    f = mx.frame(100)
++    check("ctrl and sensor present", "ctrl" in f and "sensor" in f and "health" not in f)
++    check("latest ctrl wins", f["ctrl"]["sbus_gap_ms"] == 21)
++    f2 = mx.frame(200)
++    check("unchanged sources omitted next frame", "ctrl" not in f2 and "sensor" not in f2)
++    check("counters keep counting", f2["src"]["ctrl"]["n"] == 2 and f2["src"]["sensor"]["n"] == 1)
++    check("seq increments", f2["seq"] == f["seq"] + 1)
++
++
++def test_sbus_gap_merged():
++    print("RC gap: worst over EVERY ctrl message since the last frame")
++    mx = DashMux()
++    for t, g in ((0, 18), (40, 95), (80, 20)):           # the 95 ms gap is in a message we don't forward
++        mx.on_state("ctrl", t, {"armed": False, "rpm_target": 0, "sbus_gap_ms": g})
++    f = mx.frame(100)
++    check("frame carries 95, not the latest 20", f["ctrl"]["sbus_gap_ms"] == 95)
++    mx.on_state("ctrl", 120, {"armed": False, "rpm_target": 0, "sbus_gap_ms": 19})
++    check("reset after each frame", mx.frame(200)["ctrl"]["sbus_gap_ms"] == 19)
++
++
++def test_source_gaps():
++    print("per-source worst gap and age, measured at the Pi")
++    mx = DashMux()
++    for t in (0, 40, 80, 230, 270):                      # one 150 ms hole
++        mx.on_state("sensor", t, {"x": t})
++    f = mx.frame(300)
++    check("worst gap 150 ms", f["src"]["sensor"]["g"] == 150)
++    check("age 30 ms", f["src"]["sensor"]["age"] == 30)
++    f = mx.frame(900)
++    check("a gap still in progress counts", f["src"]["sensor"]["g"] == 630 and f["src"]["sensor"]["age"] == 630)
++    check("never-seen source: age null", f["src"]["torque"]["age"] is None)
++
++
++def test_px4_decimation():
++    print("PX4 streams: decimated to ~25 Hz in SOURCE time, timestamps carried")
++    mx = DashMux(px4_sample_hz=25)
++    for i in range(100):                                  # 250 Hz for 0.4 s
++        t = 1000.0 + i * 4.0
++        mx.on_torque(t, t, [0.1, 0.2, 0.3])
++        mx.on_thrust(t, t, -0.45)
++    f = mx.frame(2000)
++    tq = f["ts"]["torque"]
++    dts = [b[0] - a[0] for a, b in zip(tq, tq[1:])]
++    check(f"~10 torque samples in 0.4 s (got {len(tq)})", 9 <= len(tq) <= 11)
++    check(f"kept spacing within one source period of 40 ms {sorted(set(dts))}", all(36 <= d <= 44 for d in dts))
++    check("sample row = [t, x, y, z]", tq[0] == [1000, 0.1, 0.2, 0.3])
++    check("thrust rows = [t, z]", f["ts"]["thrust"][0] == [1000, -0.45])
++    check("samples cleared after the frame", "ts" not in mx.frame(2100))
++    mx.on_torque(3000, 50.0, [0, 0, 0])                    # FC rebooted: source clock restarts
++    check("source clock going backwards is kept (reboot)", len(mx.frame(3100)["ts"]["torque"]) == 1)
++
++
++def test_rpm_stream():
++    print("rpm samples ride the Tiny clock, with the armed target")
++    mx = DashMux()
++    mx.on_state("ctrl", 0, {"armed": True, "rpm_target": 30000, "sbus_gap_ms": 0})
++    mx.on_state("comp", 5, {"rpm": 29950, "node_stamp_ms": 123456})
++    mx.on_state("ctrl", 10, {"armed": False, "rpm_target": 30000, "sbus_gap_ms": 0})
++    mx.on_state("comp", 45, {"rpm": 0, "node_stamp_ms": 123496})
++    rows = mx.frame(100)["ts"]["rpm"]
++    check("rows = [node ms, rpm, target]", rows[0] == [123456, 29950, 30000])
++    check("target 0 once disarmed", rows[1] == [123496, 0, 0])
++
++
++def test_size():
++    print("frame size with realistic content")
++    mx = DashMux()
++    ctrl = {k: False for k in ("armed", "flow_fallback", "terminated", "elig_fc", "elig_sbus", "sbus_sw",
++                               "surf_engaged", "surf_switch", "flags2_valid", "sbus_lost", "sbus_ok",
++                               "bench_build", "cal_flash", "sim_sensors", "sim_sbus", "sim_primary",
++                               "sbus_stats_valid")}
++    ctrl.update(source=0, comp_mode=3, rpm_target=30000, n_valid=6, valve=[-900, -250, 12, -20, 420, 860],
++                servo_us=[1500] * 12, mode=1, desat_rp=1, desat_yaw=1, surf=[0, 0, 0, 0], air_sev=0,
++                air_causes=0, node_stamp_ms=123456789, sbus_n_frames=1234567, sbus_n_lost=12,
++                sbus_n_fs=0, sbus_n_bad=0, sbus_gap_ms=18)
++    sensor = dict(p_up=[1013.4] * 6, p_lo=[1003.1] * 6, t_die=[25.31] * 6, mdot=[9.1] * 6,
++                  mdot_total=54.6, valid=[True] * 6, why=[0] * 6, node_stamp_ms=123456789)
++    comp = dict(volt=24.1, amp=18.3, rpm=29950, temp_c=54, err=0, tlm_ok=True, thermal_suspect=False,
++                node_stamp_ms=123456789)
++    for i in range(4):                                    # 100 ms at 10 Hz: ~4 of each 25 Hz source
++        t = i * 25.0
++        mx.on_state("ctrl", t, ctrl); mx.on_state("sensor", t, sensor); mx.on_state("comp", t, comp)
++        mx.on_torque(t, 5e6 + t, [0.1234, -0.0567, 0.0089]); mx.on_thrust(t, 5e6 + t, -0.4512)
++    s = DashMux.encode(mx.frame(100))
++    rosbridge = len(json.dumps({"op": "publish", "topic": "/afc/dash", "msg": {"data": s}}))
++    print(f"    frame {len(s)} B, as rosbridge sends it {rosbridge} B "
++          f"-> {rosbridge * 10 * 8 / 1000:.0f} kbit/s at 10 Hz")
++    check("under 4 kB per frame on the wire", rosbridge < 4000)
++
++
++def main():
++    for fn in (test_to_plain, test_state_only_when_changed, test_sbus_gap_merged, test_source_gaps,
++               test_px4_decimation, test_rpm_stream, test_size):
++        fn()
++    print()
++    if _fails:
++        print(f"{_fails} check(s) FAILED")
++        sys.exit(1)
++    print("all checks passed")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/rpi_ros2/tools/afc_dashboard.html b/rpi_ros2/tools/afc_dashboard.html
+index e6b5ada..ee18f89 100644
+--- a/rpi_ros2/tools/afc_dashboard.html
++++ b/rpi_ros2/tools/afc_dashboard.html
+@@ -173,7 +173,7 @@
+       <div class="kv"><span>arm counter</span><span id="hCtr" class="num">--</span></div>
+       <div class="kv"><span>node offset (ms)</span><span id="hOff" class="num">--</span></div>
+     </div>
+-    <h2 class="sec">Link quality (last 10 s, as received here)</h2>
++    <h2 class="sec" id="lqTitle">Link quality (last 10 s, as received here)</h2>
+     <table class="lq" id="lq"></table>
+     <table class="lq" id="rcq" style="margin-top:6px"></table>
+   </div>
+@@ -211,7 +211,16 @@ const CFG = {
+     sensor: {name:"/afc/sensor_tlm", type:"afc_bridge_msgs/msg/ValveNodeSensor", throttle:50},
+     health: {name:"/afc/health",     type:"afc_bridge_msgs/msg/ValveNodeHealth", throttle:200},
+     comp:   {name:"/afc/compressor", type:"afc_bridge_msgs/msg/ValveNodeComp",   throttle:100},
++    // dash_mux on the Pi merges all of the above into one frame per tick (fewer, regular
++    // radio packets = less jitter). If it is not running, the page falls back to the
++    // individual topics after muxWaitMs.
++    dash:   {name:"/afc/dash",       type:"std_msgs/msg/String",                 throttle:0},
+   },
++  muxWaitMs: 3000,
++  // Strip charts plot by SOURCE timestamp (PX4 time for torque/thrust, Tiny time for
++  // rpm), mapped to this browser's clock and drawn playoutMs behind real time, so radio
++  // bunching does not show as jerky traces. Must exceed the link's worst extra delay.
++  playoutMs: 300,
+   escTempWarn: 80, escTempBad: 90,   // deg C colour bands (flag logic lives on the Tiny)
+   // Traditional surfaces (surf[] order: L wing, R wing, L canard, R canard)
+   surfPos: [
+@@ -334,6 +343,41 @@ function push(ch,vals){
+   if(ch.data[0].length>CFG.window) ch.data.forEach(a=>a.shift());
+   ch.u.setData(ch.data);
+ }
++// ---- playout (merged-frame mode): plot by source time, a fixed delay behind now ----
++// Each source clock is mapped to this browser's clock by the smallest (arrival - source)
++// offset seen in the last 20 s, i.e. the fastest delivery. A sample is then drawn at
++// source time + that offset, released playoutMs later: delivery jitter up to playoutMs
++// changes nothing on screen. A source clock that jumps back (reboot) restarts its window.
++const CLK = {px4:{w:[],last:null}, tiny:{w:[],last:null}};
++function clockOff(c, src, a){
++  const k=CLK[c];
++  if(k.last!==null && src < k.last-2000) k.w.length=0;
++  k.last=src; k.w.push([a, a-src]);
++  while(k.w.length && a-k.w[0][0] > 20000) k.w.shift();
++  let m=Infinity; for(const x of k.w) if(x[1]<m) m=x[1];
++  return m;
++}
++function playIn(ch, clk, src, vals, a){
++  const q=ch.q||(ch.q=[]), d=src+clockOff(clk,src,a);
++  let i=q.length; while(i>0 && q[i-1][0]>d) i--;           // keep the queue in display-time order
++  q.splice(i,0,[d,vals]);
++}
++function pushAt(ch, dms, vals){
++  const x=ch.data[0]; let t=dms/1000 - t0;
++  if(x.length && t < x[x.length-1]) t=x[x.length-1];     // late sample: never step back in time
++  x.push(t); vals.forEach((v,i)=>ch.data[i+1].push(v));
++  if(x.length>CFG.window) ch.data.forEach(a=>a.shift());
++}
++setInterval(()=>{
++  const rel=performance.now()-CFG.playoutMs;
++  for(const ch of [torque,thrust,rpmCh]){
++    if(!ch.q || !ch.q.length) continue;
++    let moved=false;
++    while(ch.q.length && ch.q[0][0] <= rel){ const [d,v]=ch.q.shift(); pushAt(ch,d,v); moved=true; }
++    if(ch.q.length > 4*CFG.window) ch.q.splice(0, ch.q.length-CFG.window);   // never grow without bound
++    if(moved) ch.u.setData(ch.data);
++  }
++}, 40);
+ 
+ // ---------------------------------------------------------------------------
+ // Bar rows (mdot, pressure) built once, updated per message.
+@@ -382,7 +426,37 @@ function connect(){
+ }
+ function sub(t){return new ROSLIB.Topic({ros,name:t.name,messageType:t.type,
+   throttle_rate:t.throttle,queue_length:1,queue_size:1});}
++// Merged-frame mode (dash_mux) first; individual topics if no frame arrives in muxWaitMs.
++const MUX = {on:false, fallback:false, topic:null, timer:null, src:[]};
+ function subscribe(){
++  MUX.on=false; MUX.fallback=false; MUX.src.length=0;
++  MUX.topic=sub(CFG.topics.dash); MUX.topic.subscribe(onDash);
++  clearTimeout(MUX.timer);
++  MUX.timer=setTimeout(()=>{
++    if(MUX.on) return;
++    try{ MUX.topic.unsubscribe(); }catch(e){}
++    MUX.fallback=true; subscribeTopics();
++  }, CFG.muxWaitMs);
++}
++function onDash(m){
++  if(MUX.fallback) return;
++  let f; try{ f=JSON.parse(m.data); }catch(e){ return; }
++  MUX.on=true; seen("dash"); const a=TSRC.dash;
++  if(f.src){
++    if(MUX.src.length && f.src.ctrl && f.src.ctrl.n < MUX.src[MUX.src.length-1].s.ctrl.n) MUX.src.length=0;  // dash_mux restarted
++    MUX.src.push({t:a, s:f.src});
++    while(MUX.src.length && a-MUX.src[0].t > CFG.linkWindowMs) MUX.src.shift();
++  }
++  if(f.ctrl) onCtrl(f.ctrl);
++  if(f.sensor) onSensor(f.sensor);
++  if(f.health) onHealth(f.health);
++  if(f.comp) onComp(f.comp);
++  const ts=f.ts||{};
++  if(ts.torque && ts.torque.length){ seen("torque"); for(const r of ts.torque) playIn(torque,"px4",r[0],[r[1],r[2],r[3]],a); }
++  if(ts.thrust && ts.thrust.length){ seen("thrust"); for(const r of ts.thrust) playIn(thrust,"px4",r[0],[r[1]],a); }
++  if(ts.rpm) for(const r of ts.rpm) playIn(rpmCh,"tiny",r[0],[r[1],r[2]],a);
++}
++function subscribeTopics(){
+   sub(CFG.topics.torque).subscribe(m=>{seen("torque");push(torque,[m.xyz[0],m.xyz[1],m.xyz[2]]);});
+   sub(CFG.topics.thrust).subscribe(m=>{seen("thrust");push(thrust,[m.xyz[2]]);});   // z-axis thrust
+   sub(CFG.topics.ctrl).subscribe(onCtrl);
+@@ -654,8 +728,8 @@ let lastCompT=0, lastCtrlT=0;
+ // updated recently (or with rosbridge down) is dimmed and labelled NO DATA, so a
+ // frozen chart can never pass for a steady signal.
+ // ---------------------------------------------------------------------------
+-const TSRC = {torque:0, thrust:0, ctrl:0, sensor:0, comp:0, health:0};
+-const ARR = {torque:[], thrust:[], ctrl:[], sensor:[], comp:[], health:[]};   // arrival times, linkWindowMs
++const TSRC = {torque:0, thrust:0, ctrl:0, sensor:0, comp:0, health:0, dash:0};
++const ARR = {torque:[], thrust:[], ctrl:[], sensor:[], comp:[], health:[], dash:[]};   // arrival times, linkWindowMs
+ const STALE = {torque:true, thrust:true, ctrl:true, sensor:true, comp:true, health:true};
+ function seen(k){
+   const t=performance.now(); TSRC[k]=t;
+@@ -681,6 +755,8 @@ setInterval(updateStale,250);
+ const LQ_ROWS = [["torque","FC torque"],["thrust","FC thrust"],["ctrl","Tiny ctrl"],
+                  ["sensor","Tiny sensor"],["comp","compressor"],["health","bridge health"]];
+ function renderLQ(){
++  if(MUX.on) return renderLQmux();
++  document.getElementById("lqTitle").textContent="Link quality (last 10 s, as received here)";
+   const t=performance.now(), W=CFG.linkWindowMs;
+   let h='<tr><th>topic</th><th>msg/s</th><th>worst gap</th><th>last</th></tr>';
+   for(const [k,label] of LQ_ROWS){
+@@ -699,6 +775,32 @@ function renderLQ(){
+   document.getElementById("lq").innerHTML=h;
+ }
+ setInterval(renderLQ,1000);
++// Merged-frame mode: one row for the radio (frames as received here), then each source
++// as dash_mux saw it at the Pi (rate, worst gap between updates, age), so a source fault
++// and a radio fault read differently.
++function renderLQmux(){
++  document.getElementById("lqTitle").textContent="Link quality (last 10 s): radio as received here, sources at the Pi";
++  const t=performance.now(), W=CFG.linkWindowMs;
++  const cls=(gap,k)=>{ const bad=k==="health"?gap>3000:gap>1000, warn=k==="health"?gap>1600:gap>300;
++                       return bad?"pill bad":warn?"pill warn":""; };
++  let h='<tr><th></th><th>msg/s</th><th>worst gap</th><th>last</th></tr>';
++  const a=ARR.dash.filter(x=>t-x<=W), span=Math.min(W, S.t_conn ? t-S.t_conn : W);
++  let gap=0; for(let i=1;i<a.length;i++) gap=Math.max(gap,a[i]-a[i-1]);
++  gap = a.length ? Math.max(gap, t-a[a.length-1]) : span;
++  h+=`<tr><td>radio (merged frames)</td><td>${(span>500?a.length/(span/1000):0).toFixed(1)}</td>`+
++     `<td><span class="${cls(gap,"dash")}">${(gap/1000).toFixed(2)} s</span></td><td>${((t-TSRC.dash)/1000).toFixed(1)} s</td></tr>`;
++  const R=MUX.src;
++  for(const [k,label] of LQ_ROWS){
++    if(R.length<2 || !R[0].s[k]){ h+=`<tr><td>${label}</td><td colspan="3">--</td></tr>`; continue; }
++    const z=R[R.length-1], dt=(z.t-R[0].t)/1000;
++    const rate = dt>0.5 ? (z.s[k].n-R[0].s[k].n)/dt : 0;
++    let g=0; for(let i=1;i<R.length;i++) g=Math.max(g, R[i].s[k].g||0);
++    const age = z.s[k].age===null ? null : z.s[k].age + (t-z.t);
++    h+=`<tr class="${STALE[k]?"stale":""}"><td>${label}</td><td>${rate.toFixed(1)}</td>`+
++       `<td><span class="${cls(g,k)}">${(g/1000).toFixed(2)} s</span></td><td>${age===null?"--":(age/1000).toFixed(1)+" s"}</td></tr>`;
++  }
++  document.getElementById("lq").innerHTML=h;
++}
+ // ---- RC (SBUS) link quality: the Tiny's cumulative decoder counters (CTRL_TLM ext6) ----
+ // SBUS has no RSSI; the receiver's frame-lost flag (an RF packet missed, data repeated)
+ // is its own per-frame verdict. Gap = longest time between clean frames: the Tiny drops
+@@ -738,7 +840,7 @@ function onComp(m){
+   if(m.err===-11) S.err11_t=lastCompT;     // -1/-8 outrank -11/-12 for a reply: hold ~1 s
+   if(m.err===-12) S.err12_t=lastCompT;
+   document.getElementById("cRpm").textContent = m.rpm;
+-  push(rpmCh,[m.rpm, lastRpmTarget]);
++  if(!MUX.on) push(rpmCh,[m.rpm, lastRpmTarget]);     // merged mode: rpm samples come via playout
+   const t=document.getElementById("cTemp");
+   t.textContent = m.temp_c+" C";
+   t.className = m.temp_c>=CFG.escTempBad?"pill bad":m.temp_c>=CFG.escTempWarn?"pill warn":"";

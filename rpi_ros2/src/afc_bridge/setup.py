@@ -23,6 +23,7 @@ setup(
     entry_points={
         "console_scripts": [
             "bridge_node = afc_bridge.bridge_node:main",
+            "dash_mux = afc_bridge.dash_mux:main",
         ],
     },
 )

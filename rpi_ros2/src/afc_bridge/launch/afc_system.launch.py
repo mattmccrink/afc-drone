@@ -4,6 +4,7 @@ afc_system.launch.py -- one-command bring-up of the whole onboard stack:
     uXRCE-DDS agent  (serial to Pixhawk/TELEM2)
     afc_bridge node  (FC setpoints -> RP2350; RP2350 telemetry -> ROS)
     rosbridge server (websocket :9090 for the browser dashboard)
+    dash_mux         (/afc/dash: one merged frame per tick for the dashboard; read-only)
 
   # everything, defaults (Tiny on uart3 = /dev/ttyAMA1, FC on serial0 = ttyAMA0):
   ros2 launch afc_bridge afc_system.launch.py
@@ -34,6 +35,8 @@ def generate_launch_description():
     agent_baud = LaunchConfiguration("agent_baud")
     start_agent = LaunchConfiguration("start_agent")
     start_rosbridge = LaunchConfiguration("start_rosbridge")
+    start_dash_mux = LaunchConfiguration("start_dash_mux")
+    dash_rate = LaunchConfiguration("dash_rate_hz")
     rosbridge_port = LaunchConfiguration("rosbridge_port")
 
     # 1. uXRCE-DDS agent over the Pi PL011 (serial0 -> ttyAMA0) to Pixhawk TELEM2.
@@ -57,6 +60,17 @@ def generate_launch_description():
     )
 
     # 3. rosbridge websocket for the browser dashboard.
+    # Merges the dashboard's topics into one frame per tick (fewer, regular radio
+    # packets). Subscribe-only; nothing on the command path depends on it.
+    dash_mux = Node(
+        package="afc_bridge",
+        executable="dash_mux",
+        name="afc_dash_mux",
+        output="screen",
+        condition=IfCondition(start_dash_mux),
+        parameters=[{"rate_hz": dash_rate}],
+    )
+
     rosbridge = GroupAction(
         condition=IfCondition(start_rosbridge),
         actions=[IncludeLaunchDescription(
@@ -74,7 +88,10 @@ def generate_launch_description():
         DeclareLaunchArgument("start_agent", default_value="false"),
         DeclareLaunchArgument("start_rosbridge", default_value="true"),
         DeclareLaunchArgument("rosbridge_port", default_value="9090"),
+        DeclareLaunchArgument("start_dash_mux", default_value="true"),
+        DeclareLaunchArgument("dash_rate_hz", default_value="10.0"),
         agent,
         bridge,
+        dash_mux,
         rosbridge,
     ])

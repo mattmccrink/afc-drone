@@ -173,7 +173,7 @@
       <div class="kv"><span>arm counter</span><span id="hCtr" class="num">--</span></div>
       <div class="kv"><span>node offset (ms)</span><span id="hOff" class="num">--</span></div>
     </div>
-    <h2 class="sec">Link quality (last 10 s, as received here)</h2>
+    <h2 class="sec" id="lqTitle">Link quality (last 10 s, as received here)</h2>
     <table class="lq" id="lq"></table>
     <table class="lq" id="rcq" style="margin-top:6px"></table>
   </div>
@@ -211,7 +211,16 @@ const CFG = {
     sensor: {name:"/afc/sensor_tlm", type:"afc_bridge_msgs/msg/ValveNodeSensor", throttle:50},
     health: {name:"/afc/health",     type:"afc_bridge_msgs/msg/ValveNodeHealth", throttle:200},
     comp:   {name:"/afc/compressor", type:"afc_bridge_msgs/msg/ValveNodeComp",   throttle:100},
+    // dash_mux on the Pi merges all of the above into one frame per tick (fewer, regular
+    // radio packets = less jitter). If it is not running, the page falls back to the
+    // individual topics after muxWaitMs.
+    dash:   {name:"/afc/dash",       type:"std_msgs/msg/String",                 throttle:0},
   },
+  muxWaitMs: 3000,
+  // Strip charts plot by SOURCE timestamp (PX4 time for torque/thrust, Tiny time for
+  // rpm), mapped to this browser's clock and drawn playoutMs behind real time, so radio
+  // bunching does not show as jerky traces. Must exceed the link's worst extra delay.
+  playoutMs: 300,
   escTempWarn: 80, escTempBad: 90,   // deg C colour bands (flag logic lives on the Tiny)
   // Traditional surfaces (surf[] order: L wing, R wing, L canard, R canard)
   surfPos: [
@@ -334,6 +343,41 @@ function push(ch,vals){
   if(ch.data[0].length>CFG.window) ch.data.forEach(a=>a.shift());
   ch.u.setData(ch.data);
 }
+// ---- playout (merged-frame mode): plot by source time, a fixed delay behind now ----
+// Each source clock is mapped to this browser's clock by the smallest (arrival - source)
+// offset seen in the last 20 s, i.e. the fastest delivery. A sample is then drawn at
+// source time + that offset, released playoutMs later: delivery jitter up to playoutMs
+// changes nothing on screen. A source clock that jumps back (reboot) restarts its window.
+const CLK = {px4:{w:[],last:null}, tiny:{w:[],last:null}};
+function clockOff(c, src, a){
+  const k=CLK[c];
+  if(k.last!==null && src < k.last-2000) k.w.length=0;
+  k.last=src; k.w.push([a, a-src]);
+  while(k.w.length && a-k.w[0][0] > 20000) k.w.shift();
+  let m=Infinity; for(const x of k.w) if(x[1]<m) m=x[1];
+  return m;
+}
+function playIn(ch, clk, src, vals, a){
+  const q=ch.q||(ch.q=[]), d=src+clockOff(clk,src,a);
+  let i=q.length; while(i>0 && q[i-1][0]>d) i--;           // keep the queue in display-time order
+  q.splice(i,0,[d,vals]);
+}
+function pushAt(ch, dms, vals){
+  const x=ch.data[0]; let t=dms/1000 - t0;
+  if(x.length && t < x[x.length-1]) t=x[x.length-1];     // late sample: never step back in time
+  x.push(t); vals.forEach((v,i)=>ch.data[i+1].push(v));
+  if(x.length>CFG.window) ch.data.forEach(a=>a.shift());
+}
+setInterval(()=>{
+  const rel=performance.now()-CFG.playoutMs;
+  for(const ch of [torque,thrust,rpmCh]){
+    if(!ch.q || !ch.q.length) continue;
+    let moved=false;
+    while(ch.q.length && ch.q[0][0] <= rel){ const [d,v]=ch.q.shift(); pushAt(ch,d,v); moved=true; }
+    if(ch.q.length > 4*CFG.window) ch.q.splice(0, ch.q.length-CFG.window);   // never grow without bound
+    if(moved) ch.u.setData(ch.data);
+  }
+}, 40);
 
 // ---------------------------------------------------------------------------
 // Bar rows (mdot, pressure) built once, updated per message.
@@ -382,7 +426,37 @@ function connect(){
 }
 function sub(t){return new ROSLIB.Topic({ros,name:t.name,messageType:t.type,
   throttle_rate:t.throttle,queue_length:1,queue_size:1});}
+// Merged-frame mode (dash_mux) first; individual topics if no frame arrives in muxWaitMs.
+const MUX = {on:false, fallback:false, topic:null, timer:null, src:[]};
 function subscribe(){
+  MUX.on=false; MUX.fallback=false; MUX.src.length=0;
+  MUX.topic=sub(CFG.topics.dash); MUX.topic.subscribe(onDash);
+  clearTimeout(MUX.timer);
+  MUX.timer=setTimeout(()=>{
+    if(MUX.on) return;
+    try{ MUX.topic.unsubscribe(); }catch(e){}
+    MUX.fallback=true; subscribeTopics();
+  }, CFG.muxWaitMs);
+}
+function onDash(m){
+  if(MUX.fallback) return;
+  let f; try{ f=JSON.parse(m.data); }catch(e){ return; }
+  MUX.on=true; seen("dash"); const a=TSRC.dash;
+  if(f.src){
+    if(MUX.src.length && f.src.ctrl && f.src.ctrl.n < MUX.src[MUX.src.length-1].s.ctrl.n) MUX.src.length=0;  // dash_mux restarted
+    MUX.src.push({t:a, s:f.src});
+    while(MUX.src.length && a-MUX.src[0].t > CFG.linkWindowMs) MUX.src.shift();
+  }
+  if(f.ctrl) onCtrl(f.ctrl);
+  if(f.sensor) onSensor(f.sensor);
+  if(f.health) onHealth(f.health);
+  if(f.comp) onComp(f.comp);
+  const ts=f.ts||{};
+  if(ts.torque && ts.torque.length){ seen("torque"); for(const r of ts.torque) playIn(torque,"px4",r[0],[r[1],r[2],r[3]],a); }
+  if(ts.thrust && ts.thrust.length){ seen("thrust"); for(const r of ts.thrust) playIn(thrust,"px4",r[0],[r[1]],a); }
+  if(ts.rpm) for(const r of ts.rpm) playIn(rpmCh,"tiny",r[0],[r[1],r[2]],a);
+}
+function subscribeTopics(){
   sub(CFG.topics.torque).subscribe(m=>{seen("torque");push(torque,[m.xyz[0],m.xyz[1],m.xyz[2]]);});
   sub(CFG.topics.thrust).subscribe(m=>{seen("thrust");push(thrust,[m.xyz[2]]);});   // z-axis thrust
   sub(CFG.topics.ctrl).subscribe(onCtrl);
@@ -654,8 +728,8 @@ let lastCompT=0, lastCtrlT=0;
 // updated recently (or with rosbridge down) is dimmed and labelled NO DATA, so a
 // frozen chart can never pass for a steady signal.
 // ---------------------------------------------------------------------------
-const TSRC = {torque:0, thrust:0, ctrl:0, sensor:0, comp:0, health:0};
-const ARR = {torque:[], thrust:[], ctrl:[], sensor:[], comp:[], health:[]};   // arrival times, linkWindowMs
+const TSRC = {torque:0, thrust:0, ctrl:0, sensor:0, comp:0, health:0, dash:0};
+const ARR = {torque:[], thrust:[], ctrl:[], sensor:[], comp:[], health:[], dash:[]};   // arrival times, linkWindowMs
 const STALE = {torque:true, thrust:true, ctrl:true, sensor:true, comp:true, health:true};
 function seen(k){
   const t=performance.now(); TSRC[k]=t;
@@ -681,6 +755,8 @@ setInterval(updateStale,250);
 const LQ_ROWS = [["torque","FC torque"],["thrust","FC thrust"],["ctrl","Tiny ctrl"],
                  ["sensor","Tiny sensor"],["comp","compressor"],["health","bridge health"]];
 function renderLQ(){
+  if(MUX.on) return renderLQmux();
+  document.getElementById("lqTitle").textContent="Link quality (last 10 s, as received here)";
   const t=performance.now(), W=CFG.linkWindowMs;
   let h='<tr><th>topic</th><th>msg/s</th><th>worst gap</th><th>last</th></tr>';
   for(const [k,label] of LQ_ROWS){
@@ -699,6 +775,32 @@ function renderLQ(){
   document.getElementById("lq").innerHTML=h;
 }
 setInterval(renderLQ,1000);
+// Merged-frame mode: one row for the radio (frames as received here), then each source
+// as dash_mux saw it at the Pi (rate, worst gap between updates, age), so a source fault
+// and a radio fault read differently.
+function renderLQmux(){
+  document.getElementById("lqTitle").textContent="Link quality (last 10 s): radio as received here, sources at the Pi";
+  const t=performance.now(), W=CFG.linkWindowMs;
+  const cls=(gap,k)=>{ const bad=k==="health"?gap>3000:gap>1000, warn=k==="health"?gap>1600:gap>300;
+                       return bad?"pill bad":warn?"pill warn":""; };
+  let h='<tr><th></th><th>msg/s</th><th>worst gap</th><th>last</th></tr>';
+  const a=ARR.dash.filter(x=>t-x<=W), span=Math.min(W, S.t_conn ? t-S.t_conn : W);
+  let gap=0; for(let i=1;i<a.length;i++) gap=Math.max(gap,a[i]-a[i-1]);
+  gap = a.length ? Math.max(gap, t-a[a.length-1]) : span;
+  h+=`<tr><td>radio (merged frames)</td><td>${(span>500?a.length/(span/1000):0).toFixed(1)}</td>`+
+     `<td><span class="${cls(gap,"dash")}">${(gap/1000).toFixed(2)} s</span></td><td>${((t-TSRC.dash)/1000).toFixed(1)} s</td></tr>`;
+  const R=MUX.src;
+  for(const [k,label] of LQ_ROWS){
+    if(R.length<2 || !R[0].s[k]){ h+=`<tr><td>${label}</td><td colspan="3">--</td></tr>`; continue; }
+    const z=R[R.length-1], dt=(z.t-R[0].t)/1000;
+    const rate = dt>0.5 ? (z.s[k].n-R[0].s[k].n)/dt : 0;
+    let g=0; for(let i=1;i<R.length;i++) g=Math.max(g, R[i].s[k].g||0);
+    const age = z.s[k].age===null ? null : z.s[k].age + (t-z.t);
+    h+=`<tr class="${STALE[k]?"stale":""}"><td>${label}</td><td>${rate.toFixed(1)}</td>`+
+       `<td><span class="${cls(g,k)}">${(g/1000).toFixed(2)} s</span></td><td>${age===null?"--":(age/1000).toFixed(1)+" s"}</td></tr>`;
+  }
+  document.getElementById("lq").innerHTML=h;
+}
 // ---- RC (SBUS) link quality: the Tiny's cumulative decoder counters (CTRL_TLM ext6) ----
 // SBUS has no RSSI; the receiver's frame-lost flag (an RF packet missed, data repeated)
 // is its own per-frame verdict. Gap = longest time between clean frames: the Tiny drops
@@ -738,7 +840,7 @@ function onComp(m){
   if(m.err===-11) S.err11_t=lastCompT;     // -1/-8 outrank -11/-12 for a reply: hold ~1 s
   if(m.err===-12) S.err12_t=lastCompT;
   document.getElementById("cRpm").textContent = m.rpm;
-  push(rpmCh,[m.rpm, lastRpmTarget]);
+  if(!MUX.on) push(rpmCh,[m.rpm, lastRpmTarget]);     // merged mode: rpm samples come via playout
   const t=document.getElementById("cTemp");
   t.textContent = m.temp_c+" C";
   t.className = m.temp_c>=CFG.escTempBad?"pill bad":m.temp_c>=CFG.escTempWarn?"pill warn":"";
