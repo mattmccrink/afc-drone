@@ -518,7 +518,7 @@ const RULES = [
   {id:"emu", g:"Configuration", cls:"C", label:"ESC EMUL",
    when:S=>now()-S.err12_t<1500, msg:"TEENSY IS AN ESC-EMULATION BUILD - telemetry is fake; reflash before any real ESC"},
   {id:"cal", g:"Configuration", cls:"A", label:"CAL DEFAULT",
-   when:S=>S.f2 && !S.cal_flash, msg:"Tiny calibration from compiled defaults (no flash cal loaded)"},
+   when:S=>S.f2 && !S.cal_flash, msg:"Tiny calibration incomplete: no /cal.bin (zero/map) or placeholder servo fits (servo_cal.h)"},
   // ---- links -------------------------------------------------------------
   {id:"data", g:"Links", cls:"C", label:"DASH DATA", noStale:true,
    when:S=>!S.ros_up || STALE.ctrl, msg:S=>S.ros_up?"Dashboard data stale (no vehicle telemetry for >"+(CFG.staleEnterMs/1000)+" s)":"Dashboard disconnected from rosbridge"},

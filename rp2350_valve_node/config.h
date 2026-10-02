@@ -353,3 +353,4 @@
 #define WDT_TIMEOUT_MS       500   // hardware watchdog period
 #define WDT_BOOT_GRACE_MS   1500   // pet unconditionally during early boot
 #define CORE1_STALL_TRIP_MS  120   // core-1 heartbeat must advance within this
+#define I2C_BACKOFF_MS       100   // i2c_guard: no I2C for this long after a timeout (core 1 keeps beating)

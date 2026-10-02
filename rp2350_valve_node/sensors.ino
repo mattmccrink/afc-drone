@@ -112,6 +112,7 @@ static void ms_compensate(const uint16_t prom[8], uint32_t D1, uint32_t D2,
 // ---------------------------------------------------------------------------
 static void mux_select_only(uint8_t target, uint8_t ch) {
   for (int i = 0; i < s_nmux; ++i) {
+    if (!i2c_ok()) return;             // breaker open (always true during setup)
     Wire.beginTransmission(s_mux[i]);
     Wire.write(s_mux[i] == target ? (uint8_t)(1u << ch) : (uint8_t)0x00);
     Wire.endTransmission();
@@ -122,6 +123,7 @@ static void mux_open_all_populated() {
   for (int i = 0; i < s_nmux; ++i) {
     uint8_t mask = 0;
     for (int k = 0; k < N_SLOTS; ++k) if (SENSOR_MAP[k].mux == s_mux[i]) mask |= (1u << SENSOR_MAP[k].ch);
+    if (!i2c_ok()) return;
     Wire.beginTransmission(s_mux[i]);
     Wire.write(mask);
     Wire.endTransmission();
@@ -139,6 +141,7 @@ static bool ms_read_adc(uint32_t& out) {
 
 static void mux_close_all() {
   for (int i = 0; i < s_nmux; ++i) {
+    if (!i2c_ok()) return;
     Wire.beginTransmission(s_mux[i]);
     Wire.write(0x00);              // all channels off
     Wire.endTransmission();
@@ -238,7 +241,9 @@ void sensors_tick(uint32_t tick) {
   if (s_conv_pending && (int32_t)(tick - s_conv_ready_tick) >= 0) {
     for (int k = 0; k < N_SLOTS; ++k) {
       if (!s_prom_ok[k]) continue;
+      if (!i2c_ok()) break;                 // breaker open: unread slots age toward STALE
       mux_select_only(SENSOR_MAP[k].mux, SENSOR_MAP[k].ch);
+      if (!i2c_ok()) break;                 // never read through a half-done mux select
       uint32_t raw = 0;
       bool xfer = ms_read_adc(raw);
       // Bad transfers, 0 / 0xFFFFFF and D1 spikes never reach compensation.
@@ -328,12 +333,14 @@ void sensors_tick(uint32_t tick) {
   g_sensor_pub.publish(out);
 
   // ---- 4) if nothing is in flight, kick the next conversion (broadcast) ----
-  if (!s_conv_pending) {
+  if (!s_conv_pending && i2c_ok()) {
     int type = ((s_conv_count % D2_CADENCE_TICKS) == 0) ? 1 : 0;   // D2 temp vs D1 pressure
     mux_open_all_populated();
+    if (!i2c_ok()) return;                  // muxes not all open: don't start a conversion
     Wire.beginTransmission(ADDR_MS5837);
     Wire.write(type ? MS_D2_CMD : MS_D1_CMD);
     Wire.endTransmission();
+    if (!i2c_ok()) return;                  // convert command timed out: retry after back-off
     s_conv_type       = type;
     s_conv_ready_tick = tick + CONV_LATENCY_TICKS;
     s_conv_pending    = true;

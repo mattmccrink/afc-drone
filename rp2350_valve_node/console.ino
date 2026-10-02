@@ -75,7 +75,7 @@ static void print_help() {
     "  map                     print servo -> valve map (servo s = board s/4, channel s%4)\n"
     "  map S V                 assign servo S (0..11) to valve V (0..5); 'save' to keep (I13)\n"
     "  zero                    capture no-flow dp offset per valve, then save\n"
-    "  calshow                 show calibration source + servo0 coeffs + dp_zero\n"
+    "  calshow                 calibration: all 12 servo fits (checked), gain/bias, dp_zero\n"
     "  vhealth                 per-venturi validity reason + per-sensor read/fault counters\n"
     "  air                     air-delivery severity, causes and the inputs behind them"));
 #if BENCH_HOOKS
@@ -129,6 +129,7 @@ static void dispatch(char* line) {
     Serial.printf("[health] cal source=%s\n", g_cal_from_flash ? "flash" : "default");
     sensors_health_print();
     servos_health_print();
+    i2c_guard_print();
     sensors_vhealth_print();
   }
   else if (eq(tok[0], "vhealth")) { sensors_vhealth_print(); }
@@ -373,10 +374,11 @@ static void dispatch(char* line) {
     Serial.printf("[zero] captured %d valve(s); save %s\n", n, ok ? "OK" : "FAILED");
   }
   else if (eq(tok[0], "calshow")) {
-    Serial.printf("[cal] source=%s servo0 c=[%.1f %.1f %.1f %.1f] map0=%u gain0=%.2f\n",
-      g_cal_from_flash?"flash":"default",
-      (double)g_servo_cubic[0][0],(double)g_servo_cubic[0][1],(double)g_servo_cubic[0][2],(double)g_servo_cubic[0][3],
-      g_servo_valve_map[0], (double)g_valve_gain[0]);
+    Serial.printf("[cal] /cal.bin (map, gain/bias, zero): %s\n", g_cal_from_flash ? "loaded from flash" : "compiled defaults");
+    servo_cal_report(true);
+    Serial.print("[cal] valve gain/bias =");
+    for (int v = 0; v < VALVE_COUNT; ++v) Serial.printf(" %.2f/%+.2f", (double)g_valve_gain[v], (double)g_valve_bias[v]);
+    Serial.println();
     Serial.print("[cal] dp_zero =");
     for (int v = 0; v < VALVE_COUNT; ++v) Serial.printf(" %.2f", (double)g_dp_zero[v]);
     Serial.println(" mbar");

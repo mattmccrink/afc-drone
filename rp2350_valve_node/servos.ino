@@ -20,6 +20,7 @@
 //  (hold-last) until the watchdog reset re-establishes the pose.
 // =============================================================================
 #include "config.h"
+#include "servo_cal.h"
 #include "types.h"
 #include <Wire.h>
 
@@ -144,17 +145,71 @@ void servos_health_print() {
 #else
   Serial.println(F("[health] PCA9685: simulated (USE_REAL_I2C=0, not probed)"));
 #endif
+  int bad = servo_cal_report(false);                   // prints only problem servos
+  Serial.printf("[health] servo curves: %s, %d of %d with problems ('calshow' for all)\n",
+                SERVO_CAL_PLACEHOLDER ? "PLACEHOLDER" : "compiled quartics", bad, SERVO_COUNT);
 }
 
-// Evaluate one servo's cubic for a normalized, gain/bias-shaped valve position.
+// ---------------------------------------------------------------------------
+//  Servo curves: compiled per-servo quartics (servo_cal.h), per-servo clamp.
+// ---------------------------------------------------------------------------
+static const float   SERVO_Q[SERVO_COUNT][5]   = SERVO_QUARTIC;
+static const int16_t SERVO_LIM[SERVO_COUNT][2] = SERVO_US_LIMITS;
+
+static inline float quartic(int s, float x) {          // Horner
+  const float* c = SERVO_Q[s];
+  return c[0] + x * (c[1] + x * (c[2] + x * (c[3] + x * c[4])));
+}
+
+bool servo_cal_complete() { return !SERVO_CAL_PLACEHOLDER; }
+
+// Evaluate one servo's fit for a normalized, gain/bias-shaped valve position.
 static uint16_t curve_us(int servo, float x_norm) {
   int vv = g_servo_valve_map[servo];
   float xg = g_valve_gain[vv] * x_norm + g_valve_bias[vv];
-  const float* c = g_servo_cubic[servo];
-  float us = c[0] + c[1]*xg + c[2]*xg*xg + c[3]*xg*xg*xg;
-  if (us < SERVO_US_MIN) us = SERVO_US_MIN;
-  if (us > SERVO_US_MAX) us = SERVO_US_MAX;
+  if (xg < -1.0f) xg = -1.0f;                          // the fit is only valid on [-1, 1]
+  if (xg >  1.0f) xg =  1.0f;
+  float us = quartic(servo, xg);
+  float lo = SERVO_LIM[servo][0], hi = SERVO_LIM[servo][1];
+  if (lo < SERVO_US_MIN) lo = SERVO_US_MIN;
+  if (hi > SERVO_US_MAX) hi = SERVO_US_MAX;
+  if (us < lo) us = lo;
+  if (us > hi) us = hi;
   return (uint16_t)lroundf(us);
+}
+
+// Per-servo sanity of the compiled fits over x in [-1, 1]: range vs the clamp,
+// and monotonicity (a linearizing fit should be). Returns the number of servos
+// with a problem; prints one line per servo when 'full', else only problems.
+int servo_cal_report(bool full) {
+  int bad = 0;
+  if (SERVO_CAL_PLACEHOLDER)
+    Serial.println(F("[servo cal] PLACEHOLDER linear fits (servo_cal.h): NOT calibrated"));
+  for (int s = 0; s < SERVO_COUNT; ++s) {
+    float mn = 1e9f, mx = -1e9f, prev = 0.0f; int up = 0, dn = 0;
+    for (int i = 0; i <= 40; ++i) {
+      float x = -1.0f + i * 0.05f, u = quartic(s, x);
+      if (u < mn) mn = u;
+      if (u > mx) mx = u;
+      if (i) { if (u > prev + 0.01f) up++; else if (u < prev - 0.01f) dn++; }
+      prev = u;
+    }
+    bool mono = (up == 0 || dn == 0);
+    bool inlim = mn >= SERVO_LIM[s][0] - 0.5f && mx <= SERVO_LIM[s][1] + 0.5f &&
+                 SERVO_LIM[s][0] >= SERVO_US_MIN && SERVO_LIM[s][1] <= SERVO_US_MAX;
+    bool ok = mono && inlim;
+    if (!ok) bad++;
+    if (full || !ok)
+      Serial.printf("[servo cal] s%-2d %c ch%d -> valve %d | c=[%.2f %.3f %.3f %.3f %.3f] | "
+                    "x=-1:%.0f 0:%.0f +1:%.0f | range %.0f..%.0f, clamp %d..%d%s%s\n",
+                    s, 'A' + s / VALVE_SERVOS_PER_PCA, s % VALVE_SERVOS_PER_PCA, g_servo_valve_map[s] + 1,
+                    (double)SERVO_Q[s][0], (double)SERVO_Q[s][1], (double)SERVO_Q[s][2],
+                    (double)SERVO_Q[s][3], (double)SERVO_Q[s][4],
+                    (double)quartic(s, -1.0f), (double)quartic(s, 0.0f), (double)quartic(s, 1.0f),
+                    (double)mn, (double)mx, SERVO_LIM[s][0], SERVO_LIM[s][1],
+                    mono ? "" : "  NOT MONOTONIC", inlim ? "" : "  EXCEEDS CLAMP (will be clipped)");
+  }
+  return bad;
 }
 
 void servos_service(uint32_t tick) {
@@ -173,7 +228,7 @@ void servos_service(uint32_t tick) {
         uint16_t us = g_servo_man_tbl[d][c];
         counts[c] = us ? us_to_count(us) : us_to_count(SERVO_US_NEUTRAL);
       }
-      pca9685_write_board(PCA_ADDRS[d], counts, nch);   // burst, actively re-asserted
+      if (i2c_ok()) pca9685_write_board(PCA_ADDRS[d], counts, nch);   // burst, actively re-asserted
     }
 #endif
     return;   // NB: still bypasses the staleness failsafe -- bench only
@@ -234,7 +289,8 @@ void servos_service(uint32_t tick) {
     if (o.dev < PCA9685_COUNT && o.ch < PCA9685_MAX_CH) counts[o.dev][o.ch] = us_to_count(sus[k]);
   }
   for (int d = 0; d < PCA9685_COUNT; ++d) {
-    if (s_pca_ok[d]) pca9685_write_board(PCA_ADDRS[d], counts[d], PCA9685_MAX_CH);
+    // breaker open: skip; each PCA9685 holds its last pulse by itself
+    if (s_pca_ok[d] && i2c_ok()) pca9685_write_board(PCA_ADDRS[d], counts[d], PCA9685_MAX_CH);
   }
 #endif
 }

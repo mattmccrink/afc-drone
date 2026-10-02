@@ -388,7 +388,7 @@ int DSHOT_send( uint16_t *cmd, uint8_t *tlm ) {
 
 #endif
 
-  // Check if there is a DMA error
+  // Check if there is a DMA errorino
   // TODO: test this error code
   for ( i = 0; i < DSHOT_n; i++ ) {
     if ( dma[i].error( ) ) {

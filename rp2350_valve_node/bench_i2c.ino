@@ -13,6 +13,13 @@
 //                                (1..20): a device that stays stuck through the
 //                                watchdog reset. Watchdog scratch[0] survives a
 //                                watchdog reset; a power cycle clears it.
+//    ... add 'hard' (e.g. 'i2cstick sda 500 hard'): keep the line held even through
+//                                Wire's own timeout recovery. Without it, the first
+//                                25 ms timeout makes Wire reset the peripheral and run
+//                                its bus clear, which re-muxes the pins and so clears
+//                                the override: that emulates a stuck slave that a bus
+//                                clear frees. 'hard' re-asserts it from core 0 every
+//                                loop: a shorted line or dead device. persist is hard.
 //    i2cstick off                release now and cancel any persist
 //    i2cstick probe on|off       core 1 also writes to an (absent is fine) address
 //                                PROBE_PER_TICK times per 10 ms tick, so the test
@@ -26,17 +33,21 @@
 #if BENCH_HOOKS && USE_REAL_I2C
 #include "hardware/gpio.h"
 #include "hardware/structs/watchdog.h"
+#include "hardware/structs/io_bank0.h"
 
 static const uint32_t STICK_MAGIC = 0x5C1C0000u;   // scratch[0]: magic | boots_left<<8 | pin
 static int      s_stick_pin      = -1;
 static uint32_t s_stick_until    = 0;              // millis() release time; 0 = no timed release
 static int      s_stick_boot_left = -1;            // >=0: re-asserted at this boot, N boots left
+static bool     s_stick_hard     = false;          // re-assert after Wire's recovery clears it
+static uint32_t s_reassert       = 0;              // times the override had been cleared
 
 // Evidence that the hold actually hit I2C traffic, and how close core 1 came to the
 // watchdog: servo-write result counts (g_i2c_rc_hist) and the longest core-1
 // heartbeat gap seen from core 0 while the line was held.
 extern volatile uint32_t g_i2c_rc_hist[8];
-static uint32_t s_rc0[8];
+extern volatile uint32_t g_i2c_trips;
+static uint32_t s_rc0[8], s_trips0 = 0;
 static uint32_t s_hold_t0 = 0, s_hb_last = 0, s_hb_t = 0, s_hb_gap_max = 0;
 
 // ---- probe traffic (core 1 writes; core 0 only reads these) ----
@@ -51,6 +62,7 @@ static uint32_t s_pn0, s_pok0, s_pto0, s_perr0;
 void bench_i2c_probe_tick() {
   if (!g_i2c_probe) return;
   for (int k = 0; k < PROBE_PER_TICK; ++k) {
+    if (!i2c_ok()) return;                         // same breaker as the real traffic
     uint32_t t0 = micros();
     Wire.beginTransmission(PROBE_ADDR);
     Wire.write((uint8_t)0x00);                     // MODE1 register pointer: harmless
@@ -64,7 +76,7 @@ void bench_i2c_probe_tick() {
 
 static void stick_stats_begin(uint32_t now) {
   for (int i = 0; i < 8; ++i) s_rc0[i] = g_i2c_rc_hist[i];
-  s_hold_t0 = now; s_hb_last = g_core1_heartbeat; s_hb_t = now; s_hb_gap_max = 0;
+  s_hold_t0 = now; s_hb_last = g_core1_heartbeat; s_hb_t = now; s_hb_gap_max = 0; s_trips0 = g_i2c_trips;
   s_pn0 = g_probe_n; s_pok0 = g_probe_ok; s_pto0 = g_probe_timeout; s_perr0 = g_probe_err;
   g_probe_max_us = 0;
 }
@@ -79,24 +91,33 @@ static void stick_stats_track(uint32_t now) {
 }
 static void stick_stats_print(uint32_t now) {
   uint32_t d[8]; for (int i = 0; i < 8; ++i) d[i] = g_i2c_rc_hist[i] - s_rc0[i];
-  Serial.printf("[i2cstick] held %lu ms | core-1 max heartbeat gap %lu ms (trip %d) | "
+  Serial.printf("[i2cstick] held %lu ms%s | core-1 max heartbeat gap %lu ms (trip %d) | "
                 "servo writes: ok %lu, nack %lu, timeout %lu, other %lu\n",
-                (unsigned long)(now - s_hold_t0), (unsigned long)s_hb_gap_max, CORE1_STALL_TRIP_MS,
+                (unsigned long)(now - s_hold_t0), s_stick_hard ? " HARD" : "",
+                (unsigned long)s_hb_gap_max, CORE1_STALL_TRIP_MS,
                 (unsigned long)d[0], (unsigned long)(d[2] + d[3]), (unsigned long)d[5],
                 (unsigned long)(d[1] + d[4] + d[6] + d[7]));
+  Serial.printf("[i2cstick] I2C breaker opened %lu time(s) during the hold\n", (unsigned long)(g_i2c_trips - s_trips0));
+  Serial.printf("[i2cstick] override cleared by Wire recovery %lu time(s)%s\n", (unsigned long)s_reassert,
+                s_stick_hard ? " (re-asserted each time)" : " (line released at the first recovery)");
   uint32_t pn = g_probe_n - s_pn0;
   if (pn)
     Serial.printf("[i2cstick] probe: %lu writes (ok %lu, timeout %lu, error %lu), slowest %lu us\n",
                   (unsigned long)pn, (unsigned long)(g_probe_ok - s_pok0),
                   (unsigned long)(g_probe_timeout - s_pto0), (unsigned long)(g_probe_err - s_perr0),
                   (unsigned long)g_probe_max_us);
-  if (d[0] + d[1] + d[2] + d[3] + d[4] + d[5] + d[6] + d[7] == 0 && pn == 0)
+  if (d[0] + d[1] + d[2] + d[3] + d[4] + d[5] + d[6] + d[7] == 0 && pn == 0 && g_i2c_trips == s_trips0)
     Serial.println(F("[i2cstick] WARNING: no I2C traffic during the hold -- no PCA9685s present? use 'i2cstick probe on'"));
 }
 
 static void stick_assert(int pin) {
   gpio_set_oeover(pin, GPIO_OVERRIDE_HIGH);        // drive...
   gpio_set_outover(pin, GPIO_OVERRIDE_LOW);        // ...low
+}
+static bool stick_asserted(int pin) {
+  uint32_t c = io_bank0_hw->io[pin].ctrl;
+  return ((c & IO_BANK0_GPIO0_CTRL_OUTOVER_BITS) >> IO_BANK0_GPIO0_CTRL_OUTOVER_LSB) == GPIO_OVERRIDE_LOW &&
+         ((c & IO_BANK0_GPIO0_CTRL_OEOVER_BITS)  >> IO_BANK0_GPIO0_CTRL_OEOVER_LSB)  == GPIO_OVERRIDE_HIGH;
 }
 static void stick_release(int pin) {
   gpio_set_outover(pin, GPIO_OVERRIDE_NORMAL);
@@ -113,6 +134,7 @@ void bench_i2c_boot() {
   watchdog_hw->scratch[0] = STICK_MAGIC | ((uint32_t)(left - 1) << 8) | (uint32_t)pin;
   stick_assert(pin);
   s_stick_pin = pin; s_stick_until = 0; s_stick_boot_left = left - 1;
+  s_stick_hard = true;              // boot bus_clear() re-muxes the pin; keep it held
   stick_stats_begin(millis());
 }
 
@@ -127,11 +149,15 @@ void bench_i2c_report_boot() {
 void bench_i2c_service(uint32_t now) {
   if (s_stick_pin < 0) return;
   stick_stats_track(now);
+  if (!stick_asserted(s_stick_pin)) {             // Wire's timeout recovery re-muxed the pin
+    s_reassert++;
+    if (s_stick_hard) stick_assert(s_stick_pin);
+  }
   if (s_stick_until && (int32_t)(now - s_stick_until) >= 0) {
     stick_release(s_stick_pin);
     Serial.printf("[i2cstick] released at %lu ms\n", (unsigned long)now);
     stick_stats_print(now);
-    s_stick_pin = -1; s_stick_until = 0;
+    s_stick_pin = -1; s_stick_until = 0; s_stick_hard = false;
   }
 }
 
@@ -147,15 +173,17 @@ void bench_i2c_command(char** tok, int n) {
   if (n >= 2 && !strcmp(tok[1], "off")) {
     watchdog_hw->scratch[0] = 0;
     if (s_stick_pin >= 0) { stick_release(s_stick_pin); stick_stats_print(millis()); }
-    s_stick_pin = -1; s_stick_until = 0; s_stick_boot_left = -1;
+    s_stick_pin = -1; s_stick_until = 0; s_stick_boot_left = -1; s_stick_hard = false;
     Serial.println(F("[i2cstick] released; persist cleared"));
     return;
   }
   int pin = -1;
   if (n >= 2 && !strcasecmp(tok[1], "sda")) pin = PIN_I2C_SDA;
   if (n >= 2 && !strcasecmp(tok[1], "scl")) pin = PIN_I2C_SCL;
+  bool hard = (n >= 4 && !strcmp(tok[n - 1], "hard"));
+  if (hard) n--;
   if (pin < 0 || n < 3) {
-    Serial.println(F("usage: i2cstick sda|scl <ms> | sda|scl hold | sda|scl persist N | off | probe on|off"));
+    Serial.println(F("usage: i2cstick sda|scl <ms>|hold|persist N [hard] | off | probe on|off"));
     return;
   }
   if (s_stick_pin >= 0 && s_stick_pin != pin) stick_release(s_stick_pin);   // one line at a time
@@ -167,8 +195,8 @@ void bench_i2c_command(char** tok, int n) {
     int k = atoi(tok[3]);
     if (k < 1 || k > 20) { Serial.println(F("[i2cstick] persist N must be 1..20")); return; }
     watchdog_hw->scratch[0] = STICK_MAGIC | ((uint32_t)k << 8) | (uint32_t)pin;
-    s_stick_until = 0;
-    Serial.printf("[i2cstick] %s held low at %lu ms; re-asserted for the next %d boot(s). Power-cycle to abort.\n",
+    s_stick_until = 0; hard = true;
+    Serial.printf("[i2cstick] %s held low (hard) at %lu ms; re-asserted for the next %d boot(s). Power-cycle to abort.\n",
                   tok[1], (unsigned long)now, k);
   } else {
     long ms = atol(tok[2]);
@@ -177,8 +205,10 @@ void bench_i2c_command(char** tok, int n) {
     if (s_stick_until == 0) s_stick_until = 1;
     Serial.printf("[i2cstick] %s held low at %lu ms for %ld ms\n", tok[1], (unsigned long)now, ms);
   }
+  if (hard) Serial.println(F("[i2cstick] HARD: re-asserted through Wire's recovery (a shorted line / dead device)"));
   Serial.flush();
   stick_stats_begin(now);
+  s_stick_hard = hard; s_reassert = 0;
   stick_assert(pin);
   s_stick_pin = pin;
 }

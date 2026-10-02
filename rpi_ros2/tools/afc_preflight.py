@@ -148,7 +148,8 @@ def evaluate(obs: Dict[str, TopicObs], t0: float, t1: float, sysinfo: Dict[str, 
             add(_lvl(bench) if m.bench_build else PASS, "Tiny build",
                 "BENCH_HOOKS build (not a flight build)" if m.bench_build else "flight build (no bench hooks)")
             add(PASS if m.cal_flash else _lvl(bench), "calibration",
-                "loaded from flash" if m.cal_flash else "compiled DEFAULTS (no flash calibration)")
+                "complete: /cal.bin loaded and servo fits compiled" if m.cal_flash else
+                "INCOMPLETE: no /cal.bin (zero/map) or placeholder servo fits (servo_cal.h)")
             # RC reversion must be available before flight
             if m.sbus_ok and not m.sbus_lost:
                 add(PASS, "RC", "clean SBUS frames: reversion available")

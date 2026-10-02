@@ -1,0 +1,347 @@
+diff --git a/rp2350_valve_node/cal_littlefs.ino b/rp2350_valve_node/cal_littlefs.ino
+index 435bdc2..8d41fbd 100644
+--- a/rp2350_valve_node/cal_littlefs.ino
++++ b/rp2350_valve_node/cal_littlefs.ino
+@@ -17,7 +17,8 @@
+ #include <LittleFS.h>
+ 
+ #define CAL_PATH    "/cal.bin"
+-#define CAL_MAGIC   0x43414C32u   // "CAL2" (bumped: added dp_zero[])
++#define CAL_MAGIC   0x43414C33u   // "CAL3": servo curves moved to compiled servo_cal.h
++#define CAL_MAGIC_V2 0x43414C32u  // "CAL2": had per-servo cubics; migrated on load
+ 
+ // (CalBlob is defined in types.h so the auto-generated prototypes can see it.)
+ 
+@@ -30,14 +31,10 @@ static uint32_t crc32_calc(const uint8_t* p, size_t n) {
+   return ~c;
+ }
+ 
+-// Compiled-in defaults: identity-ish linear (c0=neutral, c1=half-span), servo s
+-// driven by valve s/2, unity gain, zero bias.
++// Compiled-in defaults: servo s driven by valve s/2, unity gain, zero bias, no
++// zero offsets. (Servo curves are compiled in servo_cal.h, not stored here.)
+ void cal_apply_defaults() {
+   for (int s = 0; s < SERVO_COUNT; ++s) {
+-    g_servo_cubic[s][0] = (float)SERVO_US_NEUTRAL;                    // c0
+-    g_servo_cubic[s][1] = (float)(SERVO_US_MAX - SERVO_US_NEUTRAL);   // c1 (x in [-1,1])
+-    g_servo_cubic[s][2] = 0.0f;                                      // c2
+-    g_servo_cubic[s][3] = 0.0f;                                      // c3
+     g_servo_valve_map[s] = (uint8_t)(s / 2);                          // 2 servos per valve
+   }
+   for (int v = 0; v < VALVE_COUNT; ++v) { g_valve_gain[v] = 1.0f; g_valve_bias[v] = 0.0f; g_dp_zero[v] = 0.0f; }
+@@ -46,7 +43,6 @@ void cal_apply_defaults() {
+ 
+ static void blob_from_ram(CalBlob& b) {
+   b.magic = CAL_MAGIC;
+-  memcpy(b.servo_cubic, g_servo_cubic, sizeof(b.servo_cubic));
+   memcpy(b.servo_valve_map, g_servo_valve_map, sizeof(b.servo_valve_map));
+   memcpy(b.valve_gain, g_valve_gain, sizeof(b.valve_gain));
+   memcpy(b.valve_bias, g_valve_bias, sizeof(b.valve_bias));
+@@ -55,7 +51,6 @@ static void blob_from_ram(CalBlob& b) {
+ }
+ 
+ static void ram_from_blob(const CalBlob& b) {
+-  memcpy(g_servo_cubic, b.servo_cubic, sizeof(g_servo_cubic));
+   memcpy(g_servo_valve_map, b.servo_valve_map, sizeof(g_servo_valve_map));
+   memcpy(g_valve_gain, b.valve_gain, sizeof(g_valve_gain));
+   memcpy(g_valve_bias, b.valve_bias, sizeof(g_valve_bias));
+@@ -72,12 +67,32 @@ void cal_load() {
+   File f = LittleFS.open(CAL_PATH, "r");
+   if (!f) { Serial.println(F("[cal] no /cal.bin -> compiled defaults")); return; }
+ 
++  size_t fsz = f.size();
++  if (fsz == sizeof(CalBlobV2)) {
++    // Old "CAL2" record (had per-servo cubics). Keep its map, gain/bias and zero
++    // offsets; the cubics are ignored (curves are compiled now). Not rewritten
++    // here -- a flash write stalls both cores -- so 'save' once to convert it.
++    CalBlobV2 o;
++    bool rd = f.read((uint8_t*)&o, sizeof(o)) == (int)sizeof(o);
++    f.close();
++    uint32_t want2 = crc32_calc((const uint8_t*)&o, sizeof(CalBlobV2) - sizeof(uint32_t));
++    if (!rd || o.magic != CAL_MAGIC_V2 || o.crc32 != want2) {
++      Serial.println(F("[cal] old-format /cal.bin unreadable -> compiled defaults"));
++      return;
++    }
++    memcpy(g_servo_valve_map, o.servo_valve_map, sizeof(g_servo_valve_map));
++    memcpy(g_valve_gain, o.valve_gain, sizeof(g_valve_gain));
++    memcpy(g_valve_bias, o.valve_bias, sizeof(g_valve_bias));
++    memcpy(g_dp_zero, o.dp_zero, sizeof(g_dp_zero));
++    g_cal_from_flash = true;
++    Serial.println(F("[cal] migrated CAL2 /cal.bin (map, gain/bias, zero kept; old cubics ignored) -- 'save' to rewrite as CAL3"));
++    return;
++  }
+   CalBlob b;
+   if (f.read((uint8_t*)&b, sizeof(b)) != (int)sizeof(b)) {
+     f.close(); Serial.println(F("[cal] short read -> compiled defaults")); return;
+   }
+   f.close();
+-
+   uint32_t want = crc32_calc((const uint8_t*)&b, sizeof(CalBlob) - sizeof(uint32_t));
+   if (b.magic != CAL_MAGIC || b.crc32 != want) {
+     Serial.println(F("[cal] bad magic/CRC -> compiled defaults"));
+diff --git a/rp2350_valve_node/console.ino b/rp2350_valve_node/console.ino
+index a5f86dc..f470a7e 100644
+--- a/rp2350_valve_node/console.ino
++++ b/rp2350_valve_node/console.ino
+@@ -75,7 +75,7 @@ static void print_help() {
+     "  map                     print servo -> valve map (servo s = board s/4, channel s%4)\n"
+     "  map S V                 assign servo S (0..11) to valve V (0..5); 'save' to keep (I13)\n"
+     "  zero                    capture no-flow dp offset per valve, then save\n"
+-    "  calshow                 show calibration source + servo0 coeffs + dp_zero\n"
++    "  calshow                 calibration: all 12 servo fits (checked), gain/bias, dp_zero\n"
+     "  vhealth                 per-venturi validity reason + per-sensor read/fault counters\n"
+     "  air                     air-delivery severity, causes and the inputs behind them"));
+ #if BENCH_HOOKS
+@@ -374,10 +374,11 @@ static void dispatch(char* line) {
+     Serial.printf("[zero] captured %d valve(s); save %s\n", n, ok ? "OK" : "FAILED");
+   }
+   else if (eq(tok[0], "calshow")) {
+-    Serial.printf("[cal] source=%s servo0 c=[%.1f %.1f %.1f %.1f] map0=%u gain0=%.2f\n",
+-      g_cal_from_flash?"flash":"default",
+-      (double)g_servo_cubic[0][0],(double)g_servo_cubic[0][1],(double)g_servo_cubic[0][2],(double)g_servo_cubic[0][3],
+-      g_servo_valve_map[0], (double)g_valve_gain[0]);
++    Serial.printf("[cal] /cal.bin (map, gain/bias, zero): %s\n", g_cal_from_flash ? "loaded from flash" : "compiled defaults");
++    servo_cal_report(true);
++    Serial.print("[cal] valve gain/bias =");
++    for (int v = 0; v < VALVE_COUNT; ++v) Serial.printf(" %.2f/%+.2f", (double)g_valve_gain[v], (double)g_valve_bias[v]);
++    Serial.println();
+     Serial.print("[cal] dp_zero =");
+     for (int v = 0; v < VALVE_COUNT; ++v) Serial.printf(" %.2f", (double)g_dp_zero[v]);
+     Serial.println(" mbar");
+diff --git a/rp2350_valve_node/framing.ino b/rp2350_valve_node/framing.ino
+index 58c5c32..84e4dab 100644
+--- a/rp2350_valve_node/framing.ino
++++ b/rp2350_valve_node/framing.ino
+@@ -171,7 +171,7 @@ void tlm_service(uint32_t now) {
+     uint8_t flags2 = ((g_sbus_failsafe || g_sbus_framelost) ? 0x01 : 0)   // bit0 SBUS failsafe/frame-lost
+                    | (g_sbus_in.valid        ? 0x02 : 0)                  // bit1 SBUS clean frames arriving
+                    | (BENCH_HOOKS            ? 0x04 : 0)                  // bit2 bench-hook build (not flight)
+-                   | (g_cal_from_flash       ? 0x08 : 0)                  // bit3 calibration loaded from flash
++                   | ((g_cal_from_flash && servo_cal_complete()) ? 0x08 : 0) // bit3 calibration complete: flash cal loaded AND real servo fits compiled
+                    | (USE_REAL_I2C     ? 0 : 0x10)                        // bit4 SIMULATED sensors/servos
+                    | (USE_REAL_SBUS    ? 0 : 0x20)                        // bit5 SIMULATED SBUS
+                    | (USE_REAL_PRIMARY ? 0 : 0x40);                       // bit6 SIMULATED primary (Pi) input
+diff --git a/rp2350_valve_node/rp2350_valve_node.ino b/rp2350_valve_node/rp2350_valve_node.ino
+index 0d9bc84..88c04f4 100644
+--- a/rp2350_valve_node/rp2350_valve_node.ino
++++ b/rp2350_valve_node/rp2350_valve_node.ino
+@@ -88,7 +88,6 @@ volatile bool g_fault_valve[VALVE_COUNT] = { false };
+ volatile bool g_fault_aggregate = false;
+ 
+ // Curve-fit calibration (loaded by cal_littlefs; consumed by servos).
+-float   g_servo_cubic[SERVO_COUNT][4];      // per-servo c0..c3 (us = c0 + c1 x + c2 x^2 + c3 x^3)
+ uint8_t g_servo_valve_map[SERVO_COUNT];     // which valve drives each servo
+ float   g_valve_gain[VALVE_COUNT];          // per-valve gain schedule
+ float   g_valve_bias[VALVE_COUNT];          // per-valve bias schedule
+diff --git a/rp2350_valve_node/servo_cal.h b/rp2350_valve_node/servo_cal.h
+new file mode 100644
+index 0000000..b938045
+--- /dev/null
++++ b/rp2350_valve_node/servo_cal.h
+@@ -0,0 +1,56 @@
++// =============================================================================
++//  servo_cal.h  --  compiled servo calibration: one 4th-order fit per servo
++//
++//      us = c0 + c1*x + c2*x^2 + c3*x^3 + c4*x^4
++//
++//  x   = the valve command in [-1, 1] (after the per-valve gain/bias, default
++//        1 and 0), i.e. standard control logic.
++//  us  = the PWM pulse the servo needs, 1000..2000. The fit already carries the
++//        servo's own midpoint and endpoints (e.g. mid 1450, end 1920).
++//
++//  Servo s is PCA9685 board 'A'+s/4, channel s%4; which VALVE drives it is the
++//  runtime map ('map' on the console, saved to flash). Surfaces are separate
++//  (SURF_* in config.h).
++//
++//  These are one-time coanda-valve calibrations, compiled in on purpose: they are
++//  NOT stored in or overridden by /cal.bin (which keeps only the servo->valve
++//  map, per-valve gain/bias and the venturi zero offsets).
++//
++//  Checks on the console ('calshow') and at boot ('health'): each fit evaluated at
++//  x = -1, 0, +1, its min/max over [-1, 1] against SERVO_US_LIMITS, and whether it
++//  is monotonic (a linearizing fit should be).
++// =============================================================================
++#pragma once
++
++// 1 = the table below is still the linear placeholder. While set, the node
++// reports its calibration as incomplete (CTRL_TLM flags2 bit3 clear: dashboard
++// CAL DEFAULT, afc_preflight FAIL). Set to 0 when the real fits are in.
++#define SERVO_CAL_PLACEHOLDER 1
++
++//                       c0 (us)    c1        c2        c3        c4
++#define SERVO_QUARTIC { \
++  /* s0  A ch0 */ {  1500.0f,  500.0f,    0.0f,    0.0f,    0.0f }, \
++  /* s1  A ch1 */ {  1500.0f,  500.0f,    0.0f,    0.0f,    0.0f }, \
++  /* s2  A ch2 */ {  1500.0f,  500.0f,    0.0f,    0.0f,    0.0f }, \
++  /* s3  A ch3 */ {  1500.0f,  500.0f,    0.0f,    0.0f,    0.0f }, \
++  /* s4  B ch0 */ {  1500.0f,  500.0f,    0.0f,    0.0f,    0.0f }, \
++  /* s5  B ch1 */ {  1500.0f,  500.0f,    0.0f,    0.0f,    0.0f }, \
++  /* s6  B ch2 */ {  1500.0f,  500.0f,    0.0f,    0.0f,    0.0f }, \
++  /* s7  B ch3 */ {  1500.0f,  500.0f,    0.0f,    0.0f,    0.0f }, \
++  /* s8  C ch0 */ {  1500.0f,  500.0f,    0.0f,    0.0f,    0.0f }, \
++  /* s9  C ch1 */ {  1500.0f,  500.0f,    0.0f,    0.0f,    0.0f }, \
++  /* s10 C ch2 */ {  1500.0f,  500.0f,    0.0f,    0.0f,    0.0f }, \
++  /* s11 C ch3 */ {  1500.0f,  500.0f,    0.0f,    0.0f,    0.0f }, \
++}
++
++// Per-servo hard clamp, us: set to the calibrated endpoints (the fit's range at
++// x = -1 and +1, plus a few us). A fit that overshoots between its data points,
++// or a gain/bias that pushes x past 1, can then never drive a servo past its
++// measured endpoint. Always also clamped to SERVO_US_MIN..SERVO_US_MAX.
++//                     min    max
++#define SERVO_US_LIMITS { \
++  /* s0  */ { 1000, 2000 }, /* s1  */ { 1000, 2000 }, /* s2  */ { 1000, 2000 }, \
++  /* s3  */ { 1000, 2000 }, /* s4  */ { 1000, 2000 }, /* s5  */ { 1000, 2000 }, \
++  /* s6  */ { 1000, 2000 }, /* s7  */ { 1000, 2000 }, /* s8  */ { 1000, 2000 }, \
++  /* s9  */ { 1000, 2000 }, /* s10 */ { 1000, 2000 }, /* s11 */ { 1000, 2000 }, \
++}
+diff --git a/rp2350_valve_node/servos.ino b/rp2350_valve_node/servos.ino
+index d05938b..f3385ad 100644
+--- a/rp2350_valve_node/servos.ino
++++ b/rp2350_valve_node/servos.ino
+@@ -20,6 +20,7 @@
+ //  (hold-last) until the watchdog reset re-establishes the pose.
+ // =============================================================================
+ #include "config.h"
++#include "servo_cal.h"
+ #include "types.h"
+ #include <Wire.h>
+ 
+@@ -144,19 +145,73 @@ void servos_health_print() {
+ #else
+   Serial.println(F("[health] PCA9685: simulated (USE_REAL_I2C=0, not probed)"));
+ #endif
++  int bad = servo_cal_report(false);                   // prints only problem servos
++  Serial.printf("[health] servo curves: %s, %d of %d with problems ('calshow' for all)\n",
++                SERVO_CAL_PLACEHOLDER ? "PLACEHOLDER" : "compiled quartics", bad, SERVO_COUNT);
+ }
+ 
+-// Evaluate one servo's cubic for a normalized, gain/bias-shaped valve position.
++// ---------------------------------------------------------------------------
++//  Servo curves: compiled per-servo quartics (servo_cal.h), per-servo clamp.
++// ---------------------------------------------------------------------------
++static const float   SERVO_Q[SERVO_COUNT][5]   = SERVO_QUARTIC;
++static const int16_t SERVO_LIM[SERVO_COUNT][2] = SERVO_US_LIMITS;
++
++static inline float quartic(int s, float x) {          // Horner
++  const float* c = SERVO_Q[s];
++  return c[0] + x * (c[1] + x * (c[2] + x * (c[3] + x * c[4])));
++}
++
++bool servo_cal_complete() { return !SERVO_CAL_PLACEHOLDER; }
++
++// Evaluate one servo's fit for a normalized, gain/bias-shaped valve position.
+ static uint16_t curve_us(int servo, float x_norm) {
+   int vv = g_servo_valve_map[servo];
+   float xg = g_valve_gain[vv] * x_norm + g_valve_bias[vv];
+-  const float* c = g_servo_cubic[servo];
+-  float us = c[0] + c[1]*xg + c[2]*xg*xg + c[3]*xg*xg*xg;
+-  if (us < SERVO_US_MIN) us = SERVO_US_MIN;
+-  if (us > SERVO_US_MAX) us = SERVO_US_MAX;
++  if (xg < -1.0f) xg = -1.0f;                          // the fit is only valid on [-1, 1]
++  if (xg >  1.0f) xg =  1.0f;
++  float us = quartic(servo, xg);
++  float lo = SERVO_LIM[servo][0], hi = SERVO_LIM[servo][1];
++  if (lo < SERVO_US_MIN) lo = SERVO_US_MIN;
++  if (hi > SERVO_US_MAX) hi = SERVO_US_MAX;
++  if (us < lo) us = lo;
++  if (us > hi) us = hi;
+   return (uint16_t)lroundf(us);
+ }
+ 
++// Per-servo sanity of the compiled fits over x in [-1, 1]: range vs the clamp,
++// and monotonicity (a linearizing fit should be). Returns the number of servos
++// with a problem; prints one line per servo when 'full', else only problems.
++int servo_cal_report(bool full) {
++  int bad = 0;
++  if (SERVO_CAL_PLACEHOLDER)
++    Serial.println(F("[servo cal] PLACEHOLDER linear fits (servo_cal.h): NOT calibrated"));
++  for (int s = 0; s < SERVO_COUNT; ++s) {
++    float mn = 1e9f, mx = -1e9f, prev = 0.0f; int up = 0, dn = 0;
++    for (int i = 0; i <= 40; ++i) {
++      float x = -1.0f + i * 0.05f, u = quartic(s, x);
++      if (u < mn) mn = u;
++      if (u > mx) mx = u;
++      if (i) { if (u > prev + 0.01f) up++; else if (u < prev - 0.01f) dn++; }
++      prev = u;
++    }
++    bool mono = (up == 0 || dn == 0);
++    bool inlim = mn >= SERVO_LIM[s][0] - 0.5f && mx <= SERVO_LIM[s][1] + 0.5f &&
++                 SERVO_LIM[s][0] >= SERVO_US_MIN && SERVO_LIM[s][1] <= SERVO_US_MAX;
++    bool ok = mono && inlim;
++    if (!ok) bad++;
++    if (full || !ok)
++      Serial.printf("[servo cal] s%-2d %c ch%d -> valve %d | c=[%.2f %.3f %.3f %.3f %.3f] | "
++                    "x=-1:%.0f 0:%.0f +1:%.0f | range %.0f..%.0f, clamp %d..%d%s%s\n",
++                    s, 'A' + s / VALVE_SERVOS_PER_PCA, s % VALVE_SERVOS_PER_PCA, g_servo_valve_map[s] + 1,
++                    (double)SERVO_Q[s][0], (double)SERVO_Q[s][1], (double)SERVO_Q[s][2],
++                    (double)SERVO_Q[s][3], (double)SERVO_Q[s][4],
++                    (double)quartic(s, -1.0f), (double)quartic(s, 0.0f), (double)quartic(s, 1.0f),
++                    (double)mn, (double)mx, SERVO_LIM[s][0], SERVO_LIM[s][1],
++                    mono ? "" : "  NOT MONOTONIC", inlim ? "" : "  EXCEEDS CLAMP (will be clipped)");
++  }
++  return bad;
++}
++
+ void servos_service(uint32_t tick) {
+   // ---- manual bring-up override (bench): drive one posted channel ----
+   if (g_servo_manual) {
+diff --git a/rp2350_valve_node/types.h b/rp2350_valve_node/types.h
+index 9ea4498..e82e4c9 100644
+--- a/rp2350_valve_node/types.h
++++ b/rp2350_valve_node/types.h
+@@ -138,15 +138,25 @@ struct SensorSlot {
+ // Calibration blob persisted to LittleFS (see cal_littlefs.ino). Defined here,
+ // not in the tab, so Arduino's hoisted prototypes for the helpers that take it
+ // by reference can see the type.
+-struct CalBlob {
++struct CalBlob {                   // "CAL3": servo curves are compiled (servo_cal.h), not stored
+   uint32_t magic;
+-  float    servo_cubic[SERVO_COUNT][4];
+   uint8_t  servo_valve_map[SERVO_COUNT];
+   float    valve_gain[VALVE_COUNT];
+   float    valve_bias[VALVE_COUNT];
+   float    dp_zero[VALVE_COUNT];   // per-valve no-flow (p_up - p_lo) offset, mbar
+   uint32_t crc32;                  // over all preceding bytes
+ };
++// Previous layout ("CAL2", with per-servo cubics): read once to migrate the
++// map, gain/bias and zero offsets; its cubics are ignored.
++struct CalBlobV2 {
++  uint32_t magic;
++  float    servo_cubic[SERVO_COUNT][4];
++  uint8_t  servo_valve_map[SERVO_COUNT];
++  float    valve_gain[VALVE_COUNT];
++  float    valve_bias[VALVE_COUNT];
++  float    dp_zero[VALVE_COUNT];
++  uint32_t crc32;
++};
+ 
+ // -----------------------------------------------------------------------------
+ //  age_ms -- age of a millis() stamp, safe against stamps "from the future".
+diff --git a/rpi_ros2/tools/afc_dashboard.html b/rpi_ros2/tools/afc_dashboard.html
+index aa6381d..b15aada 100644
+--- a/rpi_ros2/tools/afc_dashboard.html
++++ b/rpi_ros2/tools/afc_dashboard.html
+@@ -513,7 +513,7 @@ const RULES = [
+   {id:"emu", g:"Configuration", cls:"C", label:"ESC EMUL",
+    when:S=>now()-S.err12_t<1500, msg:"TEENSY IS AN ESC-EMULATION BUILD - telemetry is fake; reflash before any real ESC"},
+   {id:"cal", g:"Configuration", cls:"A", label:"CAL DEFAULT",
+-   when:S=>S.f2 && !S.cal_flash, msg:"Tiny calibration from compiled defaults (no flash cal loaded)"},
++   when:S=>S.f2 && !S.cal_flash, msg:"Tiny calibration incomplete: no /cal.bin (zero/map) or placeholder servo fits (servo_cal.h)"},
+   // ---- links -------------------------------------------------------------
+   {id:"data", g:"Links", cls:"C", label:"DASH DATA", noStale:true,
+    when:S=>!S.ros_up || STALE.ctrl, msg:S=>S.ros_up?"Dashboard data stale (no vehicle telemetry for >"+(CFG.staleEnterMs/1000)+" s)":"Dashboard disconnected from rosbridge"},
+diff --git a/rpi_ros2/tools/afc_preflight.py b/rpi_ros2/tools/afc_preflight.py
+index 9f2f2d5..9a21655 100755
+--- a/rpi_ros2/tools/afc_preflight.py
++++ b/rpi_ros2/tools/afc_preflight.py
+@@ -148,7 +148,8 @@ def evaluate(obs: Dict[str, TopicObs], t0: float, t1: float, sysinfo: Dict[str,
+             add(_lvl(bench) if m.bench_build else PASS, "Tiny build",
+                 "BENCH_HOOKS build (not a flight build)" if m.bench_build else "flight build (no bench hooks)")
+             add(PASS if m.cal_flash else _lvl(bench), "calibration",
+-                "loaded from flash" if m.cal_flash else "compiled DEFAULTS (no flash calibration)")
++                "complete: /cal.bin loaded and servo fits compiled" if m.cal_flash else
++                "INCOMPLETE: no /cal.bin (zero/map) or placeholder servo fits (servo_cal.h)")
+             # RC reversion must be available before flight
+             if m.sbus_ok and not m.sbus_lost:
+                 add(PASS, "RC", "clean SBUS frames: reversion available")
