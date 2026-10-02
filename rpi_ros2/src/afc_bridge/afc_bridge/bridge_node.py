@@ -357,6 +357,9 @@ class BridgeNode(Node):
         for k in ("flags2_valid", "sbus_lost", "sbus_ok", "bench_build", "cal_flash",
                   "sim_sensors", "sim_sbus", "sim_primary"):
             setattr(m, k, bool(d[k]))
+        m.sbus_stats_valid = bool(d["sbus_stats_valid"])
+        for k in ("sbus_n_frames", "sbus_n_lost", "sbus_n_fs", "sbus_n_bad", "sbus_gap_ms"):
+            setattr(m, k, int(d[k]))
         self._ctrl_pub.publish(m)
         self._qgc_alert(d["air_sev"], d["air_causes"], d["armed"])
         self._ctrl_count += 1

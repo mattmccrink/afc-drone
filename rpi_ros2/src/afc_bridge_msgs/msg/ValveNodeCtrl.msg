@@ -61,3 +61,17 @@ bool sim_primary            # tiny built with SIMULATED primary input (USE_REAL_
 
 # ---- node clock (CTRL_TLM ext5, 2026-09-29) ----
 uint32 node_stamp_ms        # RP2350 millis() when the frame was built; 0 = older firmware
+
+# ---- RC link quality (CTRL_TLM ext6, 2026-10-01) ----
+# SBUS carries no RSSI. These are the Tiny decoder's counters, cumulative since its
+# boot (u32, wrap): take differences over a window. Futaba sends ~71 frames/s
+# (normal) or ~143/s (high speed); a frame-lost flag means the receiver missed that
+# RF packet and repeated the previous data.
+bool sbus_stats_valid       # false on older firmware (fields below then 0)
+uint32 sbus_n_frames        # SBUS frames decoded (footer valid)
+uint32 sbus_n_lost          # ...of which flagged frame-lost by the receiver
+uint32 sbus_n_fs            # ...of which flagged failsafe by the receiver
+uint32 sbus_n_bad           # frames rejected on the wire (bad footer / desync): wiring, not RF
+uint16 sbus_gap_ms          # longest gap between clean frames over the last two CTRL_TLM periods
+                            # (~80 ms, overlapping, so one dropped message hides nothing),
+                            # including a gap still in progress (saturates at 65535)

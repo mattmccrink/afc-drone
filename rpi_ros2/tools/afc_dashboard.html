@@ -175,6 +175,7 @@
     </div>
     <h2 class="sec">Link quality (last 10 s, as received here)</h2>
     <table class="lq" id="lq"></table>
+    <table class="lq" id="rcq" style="margin-top:6px"></table>
   </div>
 
   <!-- RIGHT: the air supply -- compressor, upstream pressure, mass flow -->
@@ -448,6 +449,7 @@ const S = {                   // latest state, filled by the topic handlers belo
   t_ctrl:0, t_health:0, t_comp:0, t_sensor:0, ros_up:false,
   why:null, rpm:null, f2:false, sbus_lost:false, sbus_ok:false, bench:false, cal_flash:true,
   sim_sensors:false, sim_sbus:false, sim_primary:false,
+  rcq:null,                   // RC (SBUS) link quality over linkWindowMs, from rcStats()
 };
 const VH = ["OK","UNMAPPED","NOPROM","NODATA","STALE","FROZEN","LOSSY","RANGE","DPNEG","RECOVER","INJECTED"];
 const vhName = w => w===255 ? "?" : (VH[w]||("#"+w));
@@ -499,11 +501,14 @@ const RULES = [
    when:S=>S.desat_rp<0.99||S.desat_yaw<0.99, msg:S=>`AFC authority saturated (roll/pitch x${S.desat_rp.toFixed(2)}, yaw x${S.desat_yaw.toFixed(2)})`},
   {id:"rc", g:"Command & arm", cls:"C", label:"RC LINK", armed:true, holdMs:500,
    when:S=>S.f2 && S.sbus_lost, msg:"RC (SBUS) link lost - last-resort reversion unavailable"},
+  {id:"rcD", g:"Command & arm", cls:"A", label:"RC DEGR", holdMs:1000,
+   when:S=>S.rcq && S.rcq.n>0 && !S.sbus_lost && (S.rcq.lost>=RC_LOST_WARN || S.rcq.gap>=RC_GAP_WARN),
+   msg:S=>`RC (SBUS) link degraded - ${S.rcq.lost.toFixed(1)} % of frames lost, worst gap ${S.rcq.gap} ms (last ${CFG.linkWindowMs/1000} s)`},
   {id:"mode", g:"Command & arm", cls:"S", label:"MODE", val:S=>S.mode===null?"--":(MODES[S.mode]||S.mode)},
   {id:"src",  g:"Command & arm", cls:"S", label:"SOURCE", val:S=>S.source===null?"--":(SRC[S.source]||S.source)},
   {id:"arm",  g:"Command & arm", cls:"S", label:"ARM", val:S=>S.armed?"ARMED":"disarmed"},
   {id:"surf", g:"Command & arm", cls:"S", label:"SURFACES", val:S=>S.surf?"ENGAGED":(S.surf_sw?"sw on/idle":"off")},
-  {id:"rcS",  g:"Command & arm", cls:"S", label:"RC", val:S=>!S.f2?"n/a":(S.sbus_lost?"LOST":(S.sbus_ok?"ok":"--"))},
+  {id:"rcS",  g:"Command & arm", cls:"S", label:"RC", val:S=>!S.f2?"n/a":(S.sbus_lost?"LOST":(S.sbus_ok?("ok"+(S.rcq&&S.rcq.n?" "+S.rcq.lost.toFixed(1)+"%":"")):"--"))},
   // ---- configuration notices (build / calibration) -------------------------
   {id:"bench", g:"Configuration", cls:"C", label:"BENCH BUILD",
    when:S=>S.f2 && S.bench, msg:"TINY IS A BENCH_HOOKS BUILD - not a flight build; reflash with BENCH_HOOKS 0"},
@@ -630,6 +635,12 @@ function onCtrl(m){
     f2:!!m.flags2_valid, sbus_lost:!!m.sbus_lost, sbus_ok:!!m.sbus_ok, bench:!!m.bench_build,
     cal_flash:(m.flags2_valid?!!m.cal_flash:true), sim_sensors:!!m.sim_sensors,
     sim_sbus:!!m.sim_sbus, sim_primary:!!m.sim_primary});
+  if(m.sbus_stats_valid){
+    const t=TSRC.ctrl;
+    RCW.push({t, n:m.sbus_n_frames, l:m.sbus_n_lost, f:m.sbus_n_fs, b:m.sbus_n_bad, g:m.sbus_gap_ms});
+    if(RCW.length>1 && RCW[RCW.length-1].n < RCW[RCW.length-2].n) RCW.splice(0, RCW.length-1);  // Tiny rebooted: counters reset
+    while(RCW.length && t-RCW[0].t > CFG.linkWindowMs) RCW.shift();
+  }
   for(let i=0;i<6;i++){ setValve(i, m.valve[i], lastValid[i]); setBiBar(i, m.valve[i], lastValid[i]); }
   document.getElementById("servoRow").textContent = Array.from(m.servo_us).join("  ");
   lastRpmTarget = m.armed ? m.rpm_target : 0;
@@ -688,6 +699,38 @@ function renderLQ(){
   document.getElementById("lq").innerHTML=h;
 }
 setInterval(renderLQ,1000);
+// ---- RC (SBUS) link quality: the Tiny's cumulative decoder counters (CTRL_TLM ext6) ----
+// SBUS has no RSSI; the receiver's frame-lost flag (an RF packet missed, data repeated)
+// is its own per-frame verdict. Gap = longest time between clean frames: the Tiny drops
+// SBUS as a source after SBUS_LOSS_HOLD_MS (100 ms) without one.
+const RC_LOST_WARN = 2, RC_LOST_BAD = 10;     // % of frames flagged lost
+const RC_GAP_WARN = 100, RC_GAP_BAD = 500;    // ms between clean frames
+const RCW = [];                               // {t,n,l,f,b,g} per CTRL message, last linkWindowMs
+function rcStats(){
+  if(RCW.length < 2) return null;
+  const a=RCW[0], z=RCW[RCW.length-1], dt=(z.t-a.t)/1000;
+  if(dt < 0.5) return null;
+  const n=z.n-a.n;
+  let g=0; for(let i=1;i<RCW.length;i++) g=Math.max(g, RCW[i].g);
+  return {n, rate:n/dt, lost:n ? 100*(z.l-a.l)/n : 0, fs:z.f-a.f, bad:z.b-a.b, gap:g};
+}
+function renderRC(){
+  const r=rcStats(); S.rcq=r;
+  const pill=(v,cls)=>cls?`<span class="pill ${cls}">${v}</span>`:v;
+  let h='<tr><th>RC (SBUS)</th><th>frames/s</th><th>lost</th><th>worst gap</th><th>failsafe</th><th>wire err</th></tr>';
+  if(!r){
+    const why = !S.f2 ? "--" : (S.sim_sbus ? "simulated SBUS" : (RCW.length ? "--" : "n/a (Tiny firmware predates RC stats)"));
+    h+=`<tr><td>Tiny receiver</td><td colspan="5">${why}</td></tr>`;
+  } else {
+    const lc = r.lost>=RC_LOST_BAD?"bad":r.lost>=RC_LOST_WARN?"warn":"";
+    const gc = r.gap>=RC_GAP_BAD?"bad":r.gap>=RC_GAP_WARN?"warn":"";
+    h+=`<tr class="${STALE.ctrl?"stale":""}"><td>Tiny receiver</td><td>${r.rate.toFixed(1)}</td>`+
+       `<td>${pill(r.n?r.lost.toFixed(1)+" %":"--", r.n?lc:"bad")}</td><td>${pill(r.gap>=65535?">65 s":r.gap+" ms", gc)}</td>`+
+       `<td>${pill(r.fs, r.fs?"bad":"")}</td><td>${pill(r.bad, r.bad?"warn":"")}</td></tr>`;
+  }
+  document.getElementById("rcq").innerHTML=h;
+}
+setInterval(renderRC,1000);
 function onComp(m){
   seen("comp"); lastCompT=TSRC.comp; S.rpm=m.rpm;
   Object.assign(S, {t_comp:lastCompT, esc_err:m.err, esc_tlm_ok:!!m.tlm_ok,

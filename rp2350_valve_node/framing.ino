@@ -10,8 +10,11 @@
 //  mode switch any more (the old 'tlm on' handshake / g_binary_tlm are gone).
 //
 //  Telemetry payloads (all APPENDED fields keep earlier offsets unchanged):
-//    CTRL_TLM   0x81  61 B = 43 base + 4 fault-tree ext + 8 surfaces (4x i16)
+//    CTRL_TLM   0x81  79 B = 43 base + 4 fault-tree ext + 8 surfaces (4x i16)
 //                     + 1 air_causes + 1 flags2 + 4 node_stamp_ms (u32 millis)
+//                     + 18 RC link quality: u32 SBUS frames, u32 frame-lost flagged,
+//                       u32 failsafe flagged, u32 wire-rejected (cumulative), u16 worst
+//                       clean-frame gap (ms) over the last two CTRL_TLM periods
 //                     flags: bit0 terminated, bit1 FC arm eligible (token live),
 //                            bit2 SBUS arm eligible, bit3 SBUS arm sw,
 //                            bit4 surfaces active (allocated), bit5 surface switch on
@@ -38,6 +41,8 @@ static inline void fput_i16(uint8_t* b, int& i, int16_t v){ fput_u16(b,i,(uint16
 static inline void fput_u32(uint8_t* b, int& i, uint32_t v){ b[i++]=v; b[i++]=v>>8; b[i++]=v>>16; b[i++]=v>>24; }
 static inline int16_t fget_i16(const uint8_t* p){ return (int16_t)(p[0] | (p[1]<<8)); }
 static inline uint32_t fget_u32(const uint8_t* p){ return (uint32_t)p[0] | ((uint32_t)p[1]<<8) | ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24); }
+
+uint16_t sbus_take_gap_ms(uint32_t now);    // sbus_real.ino (stub returns 0 with simulated SBUS)
 
 // ---- outbound frame writer ----
 static void send_frame(uint8_t type, const uint8_t* payload, uint8_t len) {
@@ -178,7 +183,13 @@ void tlm_service(uint32_t now) {
     fput_u8(pl, i, flags2);
     // ---- node clock (APPENDED 2026-09-29): same millis() as SENSOR_TLM / COMP_TLM ----
     fput_u32(pl, i, now);
-    send_frame(FT_CTRL_TLM, pl, (uint8_t)i);   // i == 61
+    // ---- RC link quality (APPENDED 2026-10-01): cumulative SBUS counters + worst gap ----
+    fput_u32(pl, i, g_sbus_n_frames);
+    fput_u32(pl, i, g_sbus_n_lost);
+    fput_u32(pl, i, g_sbus_n_fs);
+    fput_u32(pl, i, g_sbus_n_bad);
+    fput_u16(pl, i, sbus_take_gap_ms(now));
+    send_frame(FT_CTRL_TLM, pl, (uint8_t)i);   // i == 79
   } else {
     i = 0;
     for (int v = 0; v < VALVE_COUNT; ++v) fput_i16(pl, i, (int16_t)lroundf((got?fr.p_up[v]:0)  * 10.0f));

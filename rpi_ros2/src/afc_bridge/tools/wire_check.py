@@ -331,6 +331,28 @@ def test_ctrl_node_stamp():
           d57["node_stamp_ms"] == 0 and d57["flags2_valid"])
 
 
+def test_ctrl_rc_stats():
+    print("CTRL_TLM RC link quality (79 B)")
+    valve = [0] * 6; servo = [1500] * 12; surf = [0, 0, 0, 0]
+    pl = struct.pack("<BBBBHB", 0, 1, 3, 1, 30000, 5)
+    pl += struct.pack("<6h", *valve) + struct.pack("<12H", *servo)
+    pl += struct.pack("<BBBB", 1, 0x02, 100, 100) + struct.pack("<4h", *surf)
+    pl += bytes([0x00, 0x02])                             # air_causes, flags2 (sbus_ok)
+    pl += struct.pack("<I", 123456)                       # node_stamp_ms
+    n, lost, fs, bad, gap = 0xF0000001, 4321, 7, 2, 65535  # n > 2^31: catches a signed unpack
+    pl += struct.pack("<IIIIH", n, lost, fs, bad, gap)
+    got = list(F.FrameReader().feed(F.build_frame(F.FT_CTRL_TLM, pl)))
+    check("one 79-byte CTRL frame", len(got) == 1 and len(got[0].payload) == F.CTRL_TLM_LEN_EXT6)
+    d = F.decode_ctrl_tlm(got[0].payload)
+    check("RC stats round-trip", d["sbus_stats_valid"] and d["sbus_n_frames"] == n
+          and d["sbus_n_lost"] == lost and d["sbus_n_fs"] == fs and d["sbus_n_bad"] == bad
+          and d["sbus_gap_ms"] == gap)
+    check("earlier fields unaffected", d["node_stamp_ms"] == 123456 and d["sbus_ok"] and d["mode"] == 1)
+    d61 = F.decode_ctrl_tlm(got[0].payload[:61])
+    check("61-byte (older) frame: RC stats invalid and zero, node clock still decoded",
+          not d61["sbus_stats_valid"] and d61["sbus_n_frames"] == 0 and d61["node_stamp_ms"] == 123456)
+
+
 def test_setpoint_gate():
     print("CMD gate: both torque and thrust must be fresh")
     w = 0.1
@@ -368,7 +390,8 @@ def test_qgc_alerter():
 
 def main():
     for fn in [test_cmd_and_resync, test_ctrl_tlm, test_ctrl_tlm_ext, test_ctrl_tlm_air,
-               test_flags2_and_venturi_reason, test_ctrl_node_stamp, test_setpoint_gate,
+               test_flags2_and_venturi_reason, test_ctrl_node_stamp, test_ctrl_rc_stats,
+               test_setpoint_gate,
                test_qgc_alerter, test_comp_tlm,
                test_sensor_tlm, test_arm_token]:
         fn()

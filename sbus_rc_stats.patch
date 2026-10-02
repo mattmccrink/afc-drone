@@ -1,0 +1,364 @@
+diff --git a/rp2350_valve_node/framing.ino b/rp2350_valve_node/framing.ino
+index 84e4dab..74eb2d5 100644
+--- a/rp2350_valve_node/framing.ino
++++ b/rp2350_valve_node/framing.ino
+@@ -10,8 +10,11 @@
+ //  mode switch any more (the old 'tlm on' handshake / g_binary_tlm are gone).
+ //
+ //  Telemetry payloads (all APPENDED fields keep earlier offsets unchanged):
+-//    CTRL_TLM   0x81  61 B = 43 base + 4 fault-tree ext + 8 surfaces (4x i16)
++//    CTRL_TLM   0x81  79 B = 43 base + 4 fault-tree ext + 8 surfaces (4x i16)
+ //                     + 1 air_causes + 1 flags2 + 4 node_stamp_ms (u32 millis)
++//                     + 18 RC link quality: u32 SBUS frames, u32 frame-lost flagged,
++//                       u32 failsafe flagged, u32 wire-rejected (cumulative), u16 worst
++//                       clean-frame gap (ms) over the last two CTRL_TLM periods
+ //                     flags: bit0 terminated, bit1 FC arm eligible (token live),
+ //                            bit2 SBUS arm eligible, bit3 SBUS arm sw,
+ //                            bit4 surfaces active (allocated), bit5 surface switch on
+@@ -39,6 +42,8 @@ static inline void fput_u32(uint8_t* b, int& i, uint32_t v){ b[i++]=v; b[i++]=v>
+ static inline int16_t fget_i16(const uint8_t* p){ return (int16_t)(p[0] | (p[1]<<8)); }
+ static inline uint32_t fget_u32(const uint8_t* p){ return (uint32_t)p[0] | ((uint32_t)p[1]<<8) | ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24); }
+ 
++uint16_t sbus_take_gap_ms(uint32_t now);    // sbus_real.ino (stub returns 0 with simulated SBUS)
++
+ // ---- outbound frame writer ----
+ static void send_frame(uint8_t type, const uint8_t* payload, uint8_t len) {
+   uint8_t hdr[6];
+@@ -178,7 +183,13 @@ void tlm_service(uint32_t now) {
+     fput_u8(pl, i, flags2);
+     // ---- node clock (APPENDED 2026-09-29): same millis() as SENSOR_TLM / COMP_TLM ----
+     fput_u32(pl, i, now);
+-    send_frame(FT_CTRL_TLM, pl, (uint8_t)i);   // i == 61
++    // ---- RC link quality (APPENDED 2026-10-01): cumulative SBUS counters + worst gap ----
++    fput_u32(pl, i, g_sbus_n_frames);
++    fput_u32(pl, i, g_sbus_n_lost);
++    fput_u32(pl, i, g_sbus_n_fs);
++    fput_u32(pl, i, g_sbus_n_bad);
++    fput_u16(pl, i, sbus_take_gap_ms(now));
++    send_frame(FT_CTRL_TLM, pl, (uint8_t)i);   // i == 79
+   } else {
+     i = 0;
+     for (int v = 0; v < VALVE_COUNT; ++v) fput_i16(pl, i, (int16_t)lroundf((got?fr.p_up[v]:0)  * 10.0f));
+diff --git a/rp2350_valve_node/rp2350_valve_node.ino b/rp2350_valve_node/rp2350_valve_node.ino
+index 88c04f4..410c828 100644
+--- a/rp2350_valve_node/rp2350_valve_node.ino
++++ b/rp2350_valve_node/rp2350_valve_node.ino
+@@ -78,6 +78,13 @@ bool g_sbus_arm       = false;         // SBUS arm-switch state (clean-frame gat
+ bool g_sbus_arm_seen_disarmed = false; // per-source boot latch: seen a clean disarmed SBUS frame once
+ bool g_sbus_surf_sw   = false;         // SBUS surface switch (clean-frame gated; holds on dropout)
+ int8_t g_surf_force   = -1;            // console 'surf': -1 follow SBUS, 0 force off, 1 force on (bench)
++// SBUS link quality, cumulative since boot (sbus_real.ino; all 0 with simulated SBUS). Core 0 only.
++// Reported in CTRL_TLM so the dashboard can show RC link health remotely (SBUS carries no RSSI;
++// the receiver's per-frame frame-lost flag is its own verdict on each RF packet).
++uint32_t g_sbus_n_frames = 0;          // footer-valid frames decoded
++uint32_t g_sbus_n_lost   = 0;          // ...flagged frame-lost by the receiver (RF packet missed, data held)
++uint32_t g_sbus_n_fs     = 0;          // ...flagged failsafe by the receiver
++uint32_t g_sbus_n_bad    = 0;          // frames rejected on the wire (bad footer / desync): wiring, not RF
+ int16_t g_surf_dbg[SURF_COUNT] = {0};  // last published surface commands (core-0 console/tlm)
+ int16_t g_valve_dbg[VALVE_COUNT] = {0}; // last published valve poses (core-0 console/debug)
+ float   g_alloc_s_rp  = 1.0f;          // last roll/pitch desaturation scale (1.0 = no clip)
+diff --git a/rp2350_valve_node/sbus_real.ino b/rp2350_valve_node/sbus_real.ino
+index f4941c4..cf10a17 100644
+--- a/rp2350_valve_node/sbus_real.ino
++++ b/rp2350_valve_node/sbus_real.ino
+@@ -65,8 +65,8 @@ static uint8_t  s_frame[SBUS_FRAME_LEN];          // frame assembly buffer
+ static int      s_idx;                            // 0 = hunting for header
+ 
+ static uint16_t s_ch[16];        // last decoded raw channels (172..1811)
+-static uint32_t s_frames_ok;     // footer-valid frames decoded
+-static uint32_t s_frames_bad;    // footer-rejected frames
++static uint32_t s_gap_max_ms;    // longest gap between clean frames since the last sbus_take_gap_ms()
++// Frame counters live in g_sbus_n_* (rp2350_valve_node.ino) so CTRL_TLM can report them.
+ 
+ static inline float norm_sym(uint16_t v) {        // -> [-1, 1]
+     float f = ((float)v - SBUS_RAW_MID) / 819.0f;
+@@ -99,11 +99,13 @@ static void sbus_decode(const uint8_t* f) {
+     ch[15] = (uint16_t)((d[20] >> 5 | d[21] << 3)               & 0x07FF);
+     
+     for (int i = 0; i < 16; ++i) s_ch[i] = ch[i];
+-    s_frames_ok++;
++    g_sbus_n_frames++;
+ 
+     uint8_t flags = f[23];
+     bool failsafe  = (flags & 0x08) != 0;         // bit3
+     bool framelost = (flags & 0x04) != 0;         // bit2
++    if (framelost) g_sbus_n_lost++;               // receiver missed this RF packet (repeats old data)
++    if (failsafe)  g_sbus_n_fs++;
+ 
+     // Publish the flags every valid frame (arbitration trusts these directly).
+     g_sbus_failsafe  = failsafe;
+@@ -116,9 +118,12 @@ static void sbus_decode(const uint8_t* f) {
+         g_sbus_in.pitch    = norm_sym(ch[SBUS_CH_PITCH]);
+         g_sbus_in.yaw      = norm_sym(ch[SBUS_CH_YAW]);
+         g_sbus_in.throttle = norm_uni(ch[SBUS_CH_THROTTLE]);
++        uint32_t t = millis();
++        uint32_t gap = age_ms(t, s_last_good_ms);  // time since the previous clean frame
++        if (gap > s_gap_max_ms) s_gap_max_ms = gap;
+         g_sbus_in.valid    = true;
+-        g_sbus_in.stamp_ms = millis();
+-        s_last_good_ms     = millis();
++        g_sbus_in.stamp_ms = t;
++        s_last_good_ms     = t;
+ 
+         // Arm switch (2-position): high = arm intent. Trusted only on clean frames
+         // (same gate as the sticks above). The "seen disarmed once" latch is
+@@ -149,13 +154,14 @@ static void sbus_feed(uint8_t b) {
+         uint8_t foot = s_frame[24];
+         uint8_t lo   = foot & 0x0F;
+         if (lo == 0x00 || lo == 0x04) sbus_decode(s_frame);
+-        // else: bad frame -> drop, re-hunt for header (self-resyncs)
++        else g_sbus_n_bad++;                      // bad frame -> drop, re-hunt for header (self-resyncs)
+     }
+ }
+ 
+ void sbus_real_print() {
+-    Serial.printf("[sbus] ok=%lu bad=%lu | fs=%d lost=%d valid=%d age=%lums\n",
+-        (unsigned long)s_frames_ok, (unsigned long)s_frames_bad,
++    Serial.printf("[sbus] frames=%lu (lost-flag %lu, failsafe-flag %lu) wire-bad=%lu | fs=%d lost=%d valid=%d age=%lums\n",
++        (unsigned long)g_sbus_n_frames, (unsigned long)g_sbus_n_lost, (unsigned long)g_sbus_n_fs,
++        (unsigned long)g_sbus_n_bad,
+         g_sbus_failsafe, g_sbus_framelost, g_sbus_in.valid,
+         (unsigned long)(millis() - g_sbus_in.stamp_ms));
+     Serial.printf("[sbus] raw:");
+@@ -193,6 +199,7 @@ void sbus_real_setup() {
+     s_tail         = 0;
+     s_idx          = 0;
+     s_last_good_ms = millis();
++    s_gap_max_ms   = 0;
+     g_sbus_failsafe  = true;      // start untrusted until a good frame arrives
+     g_sbus_framelost = true;
+     g_sbus_in.valid  = false;
+@@ -220,4 +227,21 @@ void sbus_real_update(uint32_t now) {
+         g_sbus_in.valid  = false;
+     }
+ }
++
++// Longest gap between clean frames over the last two calls' windows, including a
++// gap still in progress (no clean frame yet), saturated to u16. Called once per
++// CTRL_TLM (~40 ms). Each report overlaps the previous one, so a CTRL_TLM dropped
++// downstream (rosbridge throttles the dashboard to one per 50 ms) cannot hide a gap.
++static uint32_t s_gap_prev_ms;
++uint16_t sbus_take_gap_ms(uint32_t now) {
++    uint32_t g   = s_gap_max_ms;
++    uint32_t cur = age_ms(now, s_last_good_ms);
++    if (cur > g) g = cur;
++    uint32_t out = g > s_gap_prev_ms ? g : s_gap_prev_ms;
++    s_gap_prev_ms = g;
++    s_gap_max_ms  = 0;
++    return out > 65535u ? (uint16_t)65535u : (uint16_t)out;
++}
++#else
++uint16_t sbus_take_gap_ms(uint32_t) { return 0; }   // simulated SBUS: no RF link to measure
+ #endif // USE_REAL_SBUS
+diff --git a/rpi_ros2/src/afc_bridge/afc_bridge/bridge_node.py b/rpi_ros2/src/afc_bridge/afc_bridge/bridge_node.py
+index 9586e83..b59d3ac 100644
+--- a/rpi_ros2/src/afc_bridge/afc_bridge/bridge_node.py
++++ b/rpi_ros2/src/afc_bridge/afc_bridge/bridge_node.py
+@@ -357,6 +357,9 @@ class BridgeNode(Node):
+         for k in ("flags2_valid", "sbus_lost", "sbus_ok", "bench_build", "cal_flash",
+                   "sim_sensors", "sim_sbus", "sim_primary"):
+             setattr(m, k, bool(d[k]))
++        m.sbus_stats_valid = bool(d["sbus_stats_valid"])
++        for k in ("sbus_n_frames", "sbus_n_lost", "sbus_n_fs", "sbus_n_bad", "sbus_gap_ms"):
++            setattr(m, k, int(d[k]))
+         self._ctrl_pub.publish(m)
+         self._qgc_alert(d["air_sev"], d["air_causes"], d["armed"])
+         self._ctrl_count += 1
+diff --git a/rpi_ros2/src/afc_bridge/afc_bridge/framing.py b/rpi_ros2/src/afc_bridge/afc_bridge/framing.py
+index 1dd4ce7..359c435 100644
+--- a/rpi_ros2/src/afc_bridge/afc_bridge/framing.py
++++ b/rpi_ros2/src/afc_bridge/afc_bridge/framing.py
+@@ -181,6 +181,9 @@ SURF_COUNT = 4
+ #   CTRL_TLM  (+1 B ext4, 57 total): B flags2 (SBUS link + build configuration)
+ #   CTRL_TLM  (+4 B ext5, 61 total): I node_stamp_ms (tiny millis() at frame build,
+ #                      same clock as SENSOR_TLM / COMP_TLM node_stamp_ms)
++#   CTRL_TLM (+18 B ext6, 79 total): 4I SBUS frames / frame-lost flagged / failsafe
++#                      flagged / wire-rejected (cumulative since boot, u32 wrap),
++#                      H worst clean-frame gap ms over the last two CTRL_TLM periods
+ #   SENSOR_TLM (56 B): 6h p_up*10, 6h p_lo*10, 6h t_die*100, 6h mdot*10,
+ #                      1h mdot_total*10, H valid_mask, I node_stamp_ms
+ #   COMP_TLM   (13 B): H volt*100, H amp*100, h rpm/10, B temp_c, b err, B ok,
+@@ -193,6 +196,7 @@ CTRL_TLM_LEN_EXT2 = 55
+ CTRL_TLM_LEN_EXT3 = 56          # + air_causes byte (air-delivery severity rides flags bits 6-7)
+ CTRL_TLM_LEN_EXT4 = 57          # + flags2 (SBUS link + build-configuration notices)
+ CTRL_TLM_LEN_EXT5 = 61          # + node_stamp_ms (u32), 2026-09-29
++CTRL_TLM_LEN_EXT6 = 79          # + RC link quality (SBUS counters + worst gap), 2026-10-01
+ SENSOR_TLM_LEN_EXT = 62         # + per-venturi validity reason (6 x u8, VentHealth)
+ 
+ # Tiny VentHealth reasons (types.h) -- why a venturi is (in)valid
+@@ -227,7 +231,10 @@ def decode_ctrl_tlm(payload: bytes) -> dict:
+              sbus_lost=False, sbus_ok=False, bench_build=False, cal_flash=False,
+              sim_sensors=False, sim_sbus=False, sim_primary=False, flags2_valid=False,
+              # node clock (pre-2026-09-29 firmware): 0 = not reported
+-             node_stamp_ms=0)
++             node_stamp_ms=0,
++             # RC link quality (pre-2026-10-01 firmware): not reported
++             sbus_stats_valid=False, sbus_n_frames=0, sbus_n_lost=0, sbus_n_fs=0,
++             sbus_n_bad=0, sbus_gap_ms=0)
+     if len(payload) >= CTRL_TLM_LEN_EXT:
+         mode, flags, drp, dyaw = struct.unpack_from("<BBBB", payload, 43)
+         d.update(mode=mode, terminated=bool(flags & 0x01),
+@@ -248,6 +255,10 @@ def decode_ctrl_tlm(payload: bytes) -> dict:
+                  sim_primary=bool(f2 & 0x40), flags2_valid=True)
+     if len(payload) >= CTRL_TLM_LEN_EXT5:
+         d.update(node_stamp_ms=struct.unpack_from("<I", payload, 57)[0])
++    if len(payload) >= CTRL_TLM_LEN_EXT6:
++        n, lost, fs, bad, gap = struct.unpack_from("<IIIIH", payload, 61)
++        d.update(sbus_stats_valid=True, sbus_n_frames=n, sbus_n_lost=lost, sbus_n_fs=fs,
++                 sbus_n_bad=bad, sbus_gap_ms=gap)
+     return d
+ 
+ 
+diff --git a/rpi_ros2/src/afc_bridge/tools/wire_check.py b/rpi_ros2/src/afc_bridge/tools/wire_check.py
+index 659ea32..f4e8a52 100644
+--- a/rpi_ros2/src/afc_bridge/tools/wire_check.py
++++ b/rpi_ros2/src/afc_bridge/tools/wire_check.py
+@@ -331,6 +331,28 @@ def test_ctrl_node_stamp():
+           d57["node_stamp_ms"] == 0 and d57["flags2_valid"])
+ 
+ 
++def test_ctrl_rc_stats():
++    print("CTRL_TLM RC link quality (79 B)")
++    valve = [0] * 6; servo = [1500] * 12; surf = [0, 0, 0, 0]
++    pl = struct.pack("<BBBBHB", 0, 1, 3, 1, 30000, 5)
++    pl += struct.pack("<6h", *valve) + struct.pack("<12H", *servo)
++    pl += struct.pack("<BBBB", 1, 0x02, 100, 100) + struct.pack("<4h", *surf)
++    pl += bytes([0x00, 0x02])                             # air_causes, flags2 (sbus_ok)
++    pl += struct.pack("<I", 123456)                       # node_stamp_ms
++    n, lost, fs, bad, gap = 0xF0000001, 4321, 7, 2, 65535  # n > 2^31: catches a signed unpack
++    pl += struct.pack("<IIIIH", n, lost, fs, bad, gap)
++    got = list(F.FrameReader().feed(F.build_frame(F.FT_CTRL_TLM, pl)))
++    check("one 79-byte CTRL frame", len(got) == 1 and len(got[0].payload) == F.CTRL_TLM_LEN_EXT6)
++    d = F.decode_ctrl_tlm(got[0].payload)
++    check("RC stats round-trip", d["sbus_stats_valid"] and d["sbus_n_frames"] == n
++          and d["sbus_n_lost"] == lost and d["sbus_n_fs"] == fs and d["sbus_n_bad"] == bad
++          and d["sbus_gap_ms"] == gap)
++    check("earlier fields unaffected", d["node_stamp_ms"] == 123456 and d["sbus_ok"] and d["mode"] == 1)
++    d61 = F.decode_ctrl_tlm(got[0].payload[:61])
++    check("61-byte (older) frame: RC stats invalid and zero, node clock still decoded",
++          not d61["sbus_stats_valid"] and d61["sbus_n_frames"] == 0 and d61["node_stamp_ms"] == 123456)
++
++
+ def test_setpoint_gate():
+     print("CMD gate: both torque and thrust must be fresh")
+     w = 0.1
+@@ -368,7 +390,8 @@ def test_qgc_alerter():
+ 
+ def main():
+     for fn in [test_cmd_and_resync, test_ctrl_tlm, test_ctrl_tlm_ext, test_ctrl_tlm_air,
+-               test_flags2_and_venturi_reason, test_ctrl_node_stamp, test_setpoint_gate,
++               test_flags2_and_venturi_reason, test_ctrl_node_stamp, test_ctrl_rc_stats,
++               test_setpoint_gate,
+                test_qgc_alerter, test_comp_tlm,
+                test_sensor_tlm, test_arm_token]:
+         fn()
+diff --git a/rpi_ros2/src/afc_bridge_msgs/msg/ValveNodeCtrl.msg b/rpi_ros2/src/afc_bridge_msgs/msg/ValveNodeCtrl.msg
+index 04553b4..b19d415 100644
+--- a/rpi_ros2/src/afc_bridge_msgs/msg/ValveNodeCtrl.msg
++++ b/rpi_ros2/src/afc_bridge_msgs/msg/ValveNodeCtrl.msg
+@@ -61,3 +61,17 @@ bool sim_primary            # tiny built with SIMULATED primary input (USE_REAL_
+ 
+ # ---- node clock (CTRL_TLM ext5, 2026-09-29) ----
+ uint32 node_stamp_ms        # RP2350 millis() when the frame was built; 0 = older firmware
++
++# ---- RC link quality (CTRL_TLM ext6, 2026-10-01) ----
++# SBUS carries no RSSI. These are the Tiny decoder's counters, cumulative since its
++# boot (u32, wrap): take differences over a window. Futaba sends ~71 frames/s
++# (normal) or ~143/s (high speed); a frame-lost flag means the receiver missed that
++# RF packet and repeated the previous data.
++bool sbus_stats_valid       # false on older firmware (fields below then 0)
++uint32 sbus_n_frames        # SBUS frames decoded (footer valid)
++uint32 sbus_n_lost          # ...of which flagged frame-lost by the receiver
++uint32 sbus_n_fs            # ...of which flagged failsafe by the receiver
++uint32 sbus_n_bad           # frames rejected on the wire (bad footer / desync): wiring, not RF
++uint16 sbus_gap_ms          # longest gap between clean frames over the last two CTRL_TLM periods
++                            # (~80 ms, overlapping, so one dropped message hides nothing),
++                            # including a gap still in progress (saturates at 65535)
+diff --git a/rpi_ros2/tools/afc_dashboard.html b/rpi_ros2/tools/afc_dashboard.html
+index b15aada..e6b5ada 100644
+--- a/rpi_ros2/tools/afc_dashboard.html
++++ b/rpi_ros2/tools/afc_dashboard.html
+@@ -175,6 +175,7 @@
+     </div>
+     <h2 class="sec">Link quality (last 10 s, as received here)</h2>
+     <table class="lq" id="lq"></table>
++    <table class="lq" id="rcq" style="margin-top:6px"></table>
+   </div>
+ 
+   <!-- RIGHT: the air supply -- compressor, upstream pressure, mass flow -->
+@@ -448,6 +449,7 @@ const S = {                   // latest state, filled by the topic handlers belo
+   t_ctrl:0, t_health:0, t_comp:0, t_sensor:0, ros_up:false,
+   why:null, rpm:null, f2:false, sbus_lost:false, sbus_ok:false, bench:false, cal_flash:true,
+   sim_sensors:false, sim_sbus:false, sim_primary:false,
++  rcq:null,                   // RC (SBUS) link quality over linkWindowMs, from rcStats()
+ };
+ const VH = ["OK","UNMAPPED","NOPROM","NODATA","STALE","FROZEN","LOSSY","RANGE","DPNEG","RECOVER","INJECTED"];
+ const vhName = w => w===255 ? "?" : (VH[w]||("#"+w));
+@@ -499,11 +501,14 @@ const RULES = [
+    when:S=>S.desat_rp<0.99||S.desat_yaw<0.99, msg:S=>`AFC authority saturated (roll/pitch x${S.desat_rp.toFixed(2)}, yaw x${S.desat_yaw.toFixed(2)})`},
+   {id:"rc", g:"Command & arm", cls:"C", label:"RC LINK", armed:true, holdMs:500,
+    when:S=>S.f2 && S.sbus_lost, msg:"RC (SBUS) link lost - last-resort reversion unavailable"},
++  {id:"rcD", g:"Command & arm", cls:"A", label:"RC DEGR", holdMs:1000,
++   when:S=>S.rcq && S.rcq.n>0 && !S.sbus_lost && (S.rcq.lost>=RC_LOST_WARN || S.rcq.gap>=RC_GAP_WARN),
++   msg:S=>`RC (SBUS) link degraded - ${S.rcq.lost.toFixed(1)} % of frames lost, worst gap ${S.rcq.gap} ms (last ${CFG.linkWindowMs/1000} s)`},
+   {id:"mode", g:"Command & arm", cls:"S", label:"MODE", val:S=>S.mode===null?"--":(MODES[S.mode]||S.mode)},
+   {id:"src",  g:"Command & arm", cls:"S", label:"SOURCE", val:S=>S.source===null?"--":(SRC[S.source]||S.source)},
+   {id:"arm",  g:"Command & arm", cls:"S", label:"ARM", val:S=>S.armed?"ARMED":"disarmed"},
+   {id:"surf", g:"Command & arm", cls:"S", label:"SURFACES", val:S=>S.surf?"ENGAGED":(S.surf_sw?"sw on/idle":"off")},
+-  {id:"rcS",  g:"Command & arm", cls:"S", label:"RC", val:S=>!S.f2?"n/a":(S.sbus_lost?"LOST":(S.sbus_ok?"ok":"--"))},
++  {id:"rcS",  g:"Command & arm", cls:"S", label:"RC", val:S=>!S.f2?"n/a":(S.sbus_lost?"LOST":(S.sbus_ok?("ok"+(S.rcq&&S.rcq.n?" "+S.rcq.lost.toFixed(1)+"%":"")):"--"))},
+   // ---- configuration notices (build / calibration) -------------------------
+   {id:"bench", g:"Configuration", cls:"C", label:"BENCH BUILD",
+    when:S=>S.f2 && S.bench, msg:"TINY IS A BENCH_HOOKS BUILD - not a flight build; reflash with BENCH_HOOKS 0"},
+@@ -630,6 +635,12 @@ function onCtrl(m){
+     f2:!!m.flags2_valid, sbus_lost:!!m.sbus_lost, sbus_ok:!!m.sbus_ok, bench:!!m.bench_build,
+     cal_flash:(m.flags2_valid?!!m.cal_flash:true), sim_sensors:!!m.sim_sensors,
+     sim_sbus:!!m.sim_sbus, sim_primary:!!m.sim_primary});
++  if(m.sbus_stats_valid){
++    const t=TSRC.ctrl;
++    RCW.push({t, n:m.sbus_n_frames, l:m.sbus_n_lost, f:m.sbus_n_fs, b:m.sbus_n_bad, g:m.sbus_gap_ms});
++    if(RCW.length>1 && RCW[RCW.length-1].n < RCW[RCW.length-2].n) RCW.splice(0, RCW.length-1);  // Tiny rebooted: counters reset
++    while(RCW.length && t-RCW[0].t > CFG.linkWindowMs) RCW.shift();
++  }
+   for(let i=0;i<6;i++){ setValve(i, m.valve[i], lastValid[i]); setBiBar(i, m.valve[i], lastValid[i]); }
+   document.getElementById("servoRow").textContent = Array.from(m.servo_us).join("  ");
+   lastRpmTarget = m.armed ? m.rpm_target : 0;
+@@ -688,6 +699,38 @@ function renderLQ(){
+   document.getElementById("lq").innerHTML=h;
+ }
+ setInterval(renderLQ,1000);
++// ---- RC (SBUS) link quality: the Tiny's cumulative decoder counters (CTRL_TLM ext6) ----
++// SBUS has no RSSI; the receiver's frame-lost flag (an RF packet missed, data repeated)
++// is its own per-frame verdict. Gap = longest time between clean frames: the Tiny drops
++// SBUS as a source after SBUS_LOSS_HOLD_MS (100 ms) without one.
++const RC_LOST_WARN = 2, RC_LOST_BAD = 10;     // % of frames flagged lost
++const RC_GAP_WARN = 100, RC_GAP_BAD = 500;    // ms between clean frames
++const RCW = [];                               // {t,n,l,f,b,g} per CTRL message, last linkWindowMs
++function rcStats(){
++  if(RCW.length < 2) return null;
++  const a=RCW[0], z=RCW[RCW.length-1], dt=(z.t-a.t)/1000;
++  if(dt < 0.5) return null;
++  const n=z.n-a.n;
++  let g=0; for(let i=1;i<RCW.length;i++) g=Math.max(g, RCW[i].g);
++  return {n, rate:n/dt, lost:n ? 100*(z.l-a.l)/n : 0, fs:z.f-a.f, bad:z.b-a.b, gap:g};
++}
++function renderRC(){
++  const r=rcStats(); S.rcq=r;
++  const pill=(v,cls)=>cls?`<span class="pill ${cls}">${v}</span>`:v;
++  let h='<tr><th>RC (SBUS)</th><th>frames/s</th><th>lost</th><th>worst gap</th><th>failsafe</th><th>wire err</th></tr>';
++  if(!r){
++    const why = !S.f2 ? "--" : (S.sim_sbus ? "simulated SBUS" : (RCW.length ? "--" : "n/a (Tiny firmware predates RC stats)"));
++    h+=`<tr><td>Tiny receiver</td><td colspan="5">${why}</td></tr>`;
++  } else {
++    const lc = r.lost>=RC_LOST_BAD?"bad":r.lost>=RC_LOST_WARN?"warn":"";
++    const gc = r.gap>=RC_GAP_BAD?"bad":r.gap>=RC_GAP_WARN?"warn":"";
++    h+=`<tr class="${STALE.ctrl?"stale":""}"><td>Tiny receiver</td><td>${r.rate.toFixed(1)}</td>`+
++       `<td>${pill(r.n?r.lost.toFixed(1)+" %":"--", r.n?lc:"bad")}</td><td>${pill(r.gap>=65535?">65 s":r.gap+" ms", gc)}</td>`+
++       `<td>${pill(r.fs, r.fs?"bad":"")}</td><td>${pill(r.bad, r.bad?"warn":"")}</td></tr>`;
++  }
++  document.getElementById("rcq").innerHTML=h;
++}
++setInterval(renderRC,1000);
+ function onComp(m){
+   seen("comp"); lastCompT=TSRC.comp; S.rpm=m.rpm;
+   Object.assign(S, {t_comp:lastCompT, esc_err:m.err, esc_tlm_ok:!!m.tlm_ok,

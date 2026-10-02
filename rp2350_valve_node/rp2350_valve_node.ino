@@ -78,6 +78,13 @@ bool g_sbus_arm       = false;         // SBUS arm-switch state (clean-frame gat
 bool g_sbus_arm_seen_disarmed = false; // per-source boot latch: seen a clean disarmed SBUS frame once
 bool g_sbus_surf_sw   = false;         // SBUS surface switch (clean-frame gated; holds on dropout)
 int8_t g_surf_force   = -1;            // console 'surf': -1 follow SBUS, 0 force off, 1 force on (bench)
+// SBUS link quality, cumulative since boot (sbus_real.ino; all 0 with simulated SBUS). Core 0 only.
+// Reported in CTRL_TLM so the dashboard can show RC link health remotely (SBUS carries no RSSI;
+// the receiver's per-frame frame-lost flag is its own verdict on each RF packet).
+uint32_t g_sbus_n_frames = 0;          // footer-valid frames decoded
+uint32_t g_sbus_n_lost   = 0;          // ...flagged frame-lost by the receiver (RF packet missed, data held)
+uint32_t g_sbus_n_fs     = 0;          // ...flagged failsafe by the receiver
+uint32_t g_sbus_n_bad    = 0;          // frames rejected on the wire (bad footer / desync): wiring, not RF
 int16_t g_surf_dbg[SURF_COUNT] = {0};  // last published surface commands (core-0 console/tlm)
 int16_t g_valve_dbg[VALVE_COUNT] = {0}; // last published valve poses (core-0 console/debug)
 float   g_alloc_s_rp  = 1.0f;          // last roll/pitch desaturation scale (1.0 = no clip)

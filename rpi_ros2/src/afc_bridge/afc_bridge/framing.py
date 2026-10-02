@@ -181,6 +181,9 @@ SURF_COUNT = 4
 #   CTRL_TLM  (+1 B ext4, 57 total): B flags2 (SBUS link + build configuration)
 #   CTRL_TLM  (+4 B ext5, 61 total): I node_stamp_ms (tiny millis() at frame build,
 #                      same clock as SENSOR_TLM / COMP_TLM node_stamp_ms)
+#   CTRL_TLM (+18 B ext6, 79 total): 4I SBUS frames / frame-lost flagged / failsafe
+#                      flagged / wire-rejected (cumulative since boot, u32 wrap),
+#                      H worst clean-frame gap ms over the last two CTRL_TLM periods
 #   SENSOR_TLM (56 B): 6h p_up*10, 6h p_lo*10, 6h t_die*100, 6h mdot*10,
 #                      1h mdot_total*10, H valid_mask, I node_stamp_ms
 #   COMP_TLM   (13 B): H volt*100, H amp*100, h rpm/10, B temp_c, b err, B ok,
@@ -193,6 +196,7 @@ CTRL_TLM_LEN_EXT2 = 55
 CTRL_TLM_LEN_EXT3 = 56          # + air_causes byte (air-delivery severity rides flags bits 6-7)
 CTRL_TLM_LEN_EXT4 = 57          # + flags2 (SBUS link + build-configuration notices)
 CTRL_TLM_LEN_EXT5 = 61          # + node_stamp_ms (u32), 2026-09-29
+CTRL_TLM_LEN_EXT6 = 79          # + RC link quality (SBUS counters + worst gap), 2026-10-01
 SENSOR_TLM_LEN_EXT = 62         # + per-venturi validity reason (6 x u8, VentHealth)
 
 # Tiny VentHealth reasons (types.h) -- why a venturi is (in)valid
@@ -227,7 +231,10 @@ def decode_ctrl_tlm(payload: bytes) -> dict:
              sbus_lost=False, sbus_ok=False, bench_build=False, cal_flash=False,
              sim_sensors=False, sim_sbus=False, sim_primary=False, flags2_valid=False,
              # node clock (pre-2026-09-29 firmware): 0 = not reported
-             node_stamp_ms=0)
+             node_stamp_ms=0,
+             # RC link quality (pre-2026-10-01 firmware): not reported
+             sbus_stats_valid=False, sbus_n_frames=0, sbus_n_lost=0, sbus_n_fs=0,
+             sbus_n_bad=0, sbus_gap_ms=0)
     if len(payload) >= CTRL_TLM_LEN_EXT:
         mode, flags, drp, dyaw = struct.unpack_from("<BBBB", payload, 43)
         d.update(mode=mode, terminated=bool(flags & 0x01),
@@ -248,6 +255,10 @@ def decode_ctrl_tlm(payload: bytes) -> dict:
                  sim_primary=bool(f2 & 0x40), flags2_valid=True)
     if len(payload) >= CTRL_TLM_LEN_EXT5:
         d.update(node_stamp_ms=struct.unpack_from("<I", payload, 57)[0])
+    if len(payload) >= CTRL_TLM_LEN_EXT6:
+        n, lost, fs, bad, gap = struct.unpack_from("<IIIIH", payload, 61)
+        d.update(sbus_stats_valid=True, sbus_n_frames=n, sbus_n_lost=lost, sbus_n_fs=fs,
+                 sbus_n_bad=bad, sbus_gap_ms=gap)
     return d
 
 

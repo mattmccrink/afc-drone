@@ -65,8 +65,8 @@ static uint8_t  s_frame[SBUS_FRAME_LEN];          // frame assembly buffer
 static int      s_idx;                            // 0 = hunting for header
 
 static uint16_t s_ch[16];        // last decoded raw channels (172..1811)
-static uint32_t s_frames_ok;     // footer-valid frames decoded
-static uint32_t s_frames_bad;    // footer-rejected frames
+static uint32_t s_gap_max_ms;    // longest gap between clean frames since the last sbus_take_gap_ms()
+// Frame counters live in g_sbus_n_* (rp2350_valve_node.ino) so CTRL_TLM can report them.
 
 static inline float norm_sym(uint16_t v) {        // -> [-1, 1]
     float f = ((float)v - SBUS_RAW_MID) / 819.0f;
@@ -99,11 +99,13 @@ static void sbus_decode(const uint8_t* f) {
     ch[15] = (uint16_t)((d[20] >> 5 | d[21] << 3)               & 0x07FF);
     
     for (int i = 0; i < 16; ++i) s_ch[i] = ch[i];
-    s_frames_ok++;
+    g_sbus_n_frames++;
 
     uint8_t flags = f[23];
     bool failsafe  = (flags & 0x08) != 0;         // bit3
     bool framelost = (flags & 0x04) != 0;         // bit2
+    if (framelost) g_sbus_n_lost++;               // receiver missed this RF packet (repeats old data)
+    if (failsafe)  g_sbus_n_fs++;
 
     // Publish the flags every valid frame (arbitration trusts these directly).
     g_sbus_failsafe  = failsafe;
@@ -116,9 +118,12 @@ static void sbus_decode(const uint8_t* f) {
         g_sbus_in.pitch    = norm_sym(ch[SBUS_CH_PITCH]);
         g_sbus_in.yaw      = norm_sym(ch[SBUS_CH_YAW]);
         g_sbus_in.throttle = norm_uni(ch[SBUS_CH_THROTTLE]);
+        uint32_t t = millis();
+        uint32_t gap = age_ms(t, s_last_good_ms);  // time since the previous clean frame
+        if (gap > s_gap_max_ms) s_gap_max_ms = gap;
         g_sbus_in.valid    = true;
-        g_sbus_in.stamp_ms = millis();
-        s_last_good_ms     = millis();
+        g_sbus_in.stamp_ms = t;
+        s_last_good_ms     = t;
 
         // Arm switch (2-position): high = arm intent. Trusted only on clean frames
         // (same gate as the sticks above). The "seen disarmed once" latch is
@@ -149,13 +154,14 @@ static void sbus_feed(uint8_t b) {
         uint8_t foot = s_frame[24];
         uint8_t lo   = foot & 0x0F;
         if (lo == 0x00 || lo == 0x04) sbus_decode(s_frame);
-        // else: bad frame -> drop, re-hunt for header (self-resyncs)
+        else g_sbus_n_bad++;                      // bad frame -> drop, re-hunt for header (self-resyncs)
     }
 }
 
 void sbus_real_print() {
-    Serial.printf("[sbus] ok=%lu bad=%lu | fs=%d lost=%d valid=%d age=%lums\n",
-        (unsigned long)s_frames_ok, (unsigned long)s_frames_bad,
+    Serial.printf("[sbus] frames=%lu (lost-flag %lu, failsafe-flag %lu) wire-bad=%lu | fs=%d lost=%d valid=%d age=%lums\n",
+        (unsigned long)g_sbus_n_frames, (unsigned long)g_sbus_n_lost, (unsigned long)g_sbus_n_fs,
+        (unsigned long)g_sbus_n_bad,
         g_sbus_failsafe, g_sbus_framelost, g_sbus_in.valid,
         (unsigned long)(millis() - g_sbus_in.stamp_ms));
     Serial.printf("[sbus] raw:");
@@ -193,6 +199,7 @@ void sbus_real_setup() {
     s_tail         = 0;
     s_idx          = 0;
     s_last_good_ms = millis();
+    s_gap_max_ms   = 0;
     g_sbus_failsafe  = true;      // start untrusted until a good frame arrives
     g_sbus_framelost = true;
     g_sbus_in.valid  = false;
@@ -220,4 +227,21 @@ void sbus_real_update(uint32_t now) {
         g_sbus_in.valid  = false;
     }
 }
+
+// Longest gap between clean frames over the last two calls' windows, including a
+// gap still in progress (no clean frame yet), saturated to u16. Called once per
+// CTRL_TLM (~40 ms). Each report overlaps the previous one, so a CTRL_TLM dropped
+// downstream (rosbridge throttles the dashboard to one per 50 ms) cannot hide a gap.
+static uint32_t s_gap_prev_ms;
+uint16_t sbus_take_gap_ms(uint32_t now) {
+    uint32_t g   = s_gap_max_ms;
+    uint32_t cur = age_ms(now, s_last_good_ms);
+    if (cur > g) g = cur;
+    uint32_t out = g > s_gap_prev_ms ? g : s_gap_prev_ms;
+    s_gap_prev_ms = g;
+    s_gap_max_ms  = 0;
+    return out > 65535u ? (uint16_t)65535u : (uint16_t)out;
+}
+#else
+uint16_t sbus_take_gap_ms(uint32_t) { return 0; }   // simulated SBUS: no RF link to measure
 #endif // USE_REAL_SBUS
